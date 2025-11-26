@@ -487,6 +487,10 @@ where
         download_start: Instant,
         chunk_size: usize,
     ) {
+        let stream_content_length = stream.content_length();
+        if stream_content_length != self.content_length {
+            self.content_length = stream_content_length;
+        }
         self.report_progress(
             stream,
             StreamState {
