@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI: URL [--mode auto|manual] [--variant N]
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut master_playlist_url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
-    let mut start_mode = "manual".to_string();
+    let mut start_mode = "auto".to_string();
     let mut manual_index: Option<usize> = None;
 
     let mut i = 0usize;
@@ -143,68 +143,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting playback loop: piping segments to mpv stdin...");
 
-    // Attempt to write init segment if present (for fMP4)
-    let init_url_opt: Option<String> = {
-        let inner = stream.inner_stream();
-        if let Some(playlist) = inner.current_media_playlist() {
-            if let Some(init) = &playlist.init_segment {
-                // Resolve media playlist URL using the currently selected variant URI
-                let variants = stream.variants();
-                let current = stream.current_variant_id();
-                let selected = current.and_then(|id| variants.iter().find(|v| v.id == id));
-                if let Some(v) = selected.or_else(|| variants.get(0)) {
-                    let variant_uri = &v.uri;
-                    let media_url = if variant_uri.starts_with("http") {
-                        variant_uri.clone()
-                    } else {
-                        Url::parse(&master_playlist_url)
-                            .and_then(|u| u.join(variant_uri))
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|_| variant_uri.clone())
-                    };
-                    let init_url = if init.uri.starts_with("http") {
-                        init.uri.clone()
-                    } else {
-                        Url::parse(&media_url)
-                            .and_then(|u| u.join(&init.uri))
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|_| init.uri.clone())
-                    };
-                    Some(init_url)
-                } else {
-                    None
-                }
-            } else {
-                None
+    // Attempt to write init segment if present (for fMP4) using HlsManager
+    match stream.inner_stream_mut().download_init_segment().await {
+        Ok(Some(bytes)) => {
+            info!("Writing init segment ({} bytes)", bytes.len());
+            if let Err(e) = stdin.write_all(&bytes) {
+                warn!("Failed to write init segment to mpv stdin: {e}");
             }
-        } else {
-            None
+            if let Err(e) = stdin.flush() {
+                warn!("Failed to flush init segment to mpv stdin: {e}");
+            }
         }
-    };
-    if let Some(init_url) = init_url_opt {
-        match stream
-            .inner_stream()
-            .downloader()
-            .download_bytes(&init_url, None)
-            .await
-        {
-            Ok(bytes) => {
-                info!("Writing init segment ({} bytes)", bytes.len());
-                if let Err(e) = stdin.write_all(&bytes) {
-                    warn!("Failed to write init segment to mpv stdin: {e}");
-                }
-                if let Err(e) = stdin.flush() {
-                    warn!("Failed to flush init segment to mpv stdin: {e}");
-                }
-            }
-            Err(e) => {
-                warn!("Failed to download init segment: {e}");
-            }
+        Ok(None) => { /* no init segment present */ }
+        Err(e) => {
+            warn!("Failed to download init segment: {e}");
         }
     }
 
     // 4) Main loop: fetch segments and write them to mpv's stdin.
     let mut seg_count: u64 = 0;
+    // Track current variant to resend init segment on variant switch (AUTO mode)
+    let mut prev_variant_id: Option<usize> = stream.current_variant_id().map(|id| id.0);
     loop {
         match stream.next_segment().await {
             Ok(Some(seg)) => {
@@ -223,6 +182,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if len == 0 {
                     warn!("Received empty segment; skipping write");
                     continue;
+                }
+
+                // If variant changed, send init segment first (for fMP4)
+                let current_variant = seg.variant_id.0;
+                if prev_variant_id != Some(current_variant) {
+                    info!(
+                        "Variant switched to id={} -> sending init segment",
+                        current_variant
+                    );
+                    match stream.inner_stream_mut().download_init_segment().await {
+                        Ok(Some(bytes)) => {
+                            info!("Writing init segment after switch ({} bytes)", bytes.len());
+                            if let Err(e) = stdin.write_all(&bytes) {
+                                warn!("Failed to write init segment after switch: {e}");
+                            }
+                            if let Err(e) = stdin.flush() {
+                                warn!("Failed to flush init segment after switch: {e}");
+                            }
+                        }
+                        Ok(None) => { /* no init segment present */ }
+                        Err(e) => warn!("Failed to download init segment after switch: {e}"),
+                    }
+                    prev_variant_id = Some(current_variant);
                 }
 
                 // Blocking write to mpv stdin (simple and reliable for an example)

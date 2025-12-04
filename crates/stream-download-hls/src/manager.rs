@@ -328,6 +328,92 @@ impl HlsManager {
 
         Ok(data.to_vec())
     }
+
+    /// Download the initialization segment (EXT-X-MAP) for the current variant, if present.
+    ///
+    /// The bytes are decrypted if the init segment is encrypted with AES-128 and a key is available.
+    /// Returns:
+    /// - Ok(Some(Vec<u8>)) when an init segment exists and was fetched (decrypted if necessary)
+    /// - Ok(None) when no init segment is present in the current media playlist
+    pub async fn download_init_segment(&mut self) -> HlsResult<Option<Vec<u8>>> {
+        use crate::model::EncryptionMethod;
+
+        let playlist = match &self.current_media_playlist {
+            Some(p) => p,
+            None => {
+                return Err(HlsError::Message(
+                    "no media playlist loaded; call select_variant first".to_string(),
+                ));
+            }
+        };
+
+        let init = match &playlist.init_segment {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        // Resolve init segment URL relative to the media playlist URL (or master as fallback)
+        let init_url = self.resolve_url(&init.uri)?;
+        let mut data = self.downloader.download_bytes(&init_url, None).await?;
+
+        // If the init segment has encryption info, handle AES-128 decryption
+        if let Some(seg_key) = &init.key {
+            if matches!(seg_key.method, EncryptionMethod::Aes128) {
+                if let Some(ref key_info) = seg_key.key_info {
+                    if let Some(ref key_uri) = key_info.uri {
+                        // Resolve key URL relative to media playlist URL
+                        let abs_key_url = self.resolve_url(key_uri)?;
+
+                        // Apply optional query params from config
+                        let final_key_url = if let Some(params) = &self.config.key_query_params {
+                            let mut url = url::Url::parse(&abs_key_url)
+                                .map_err(|e| HlsError::Io(e.to_string()))?;
+                            {
+                                let mut qp = url.query_pairs_mut();
+                                for (k, v) in params {
+                                    qp.append_pair(k, v);
+                                }
+                            }
+                            url.to_string()
+                        } else {
+                            abs_key_url
+                        };
+
+                        // Fetch or reuse cached key bytes
+                        let key_bytes = if let Some(cached) = self.key_cache.get(&final_key_url) {
+                            cached.clone()
+                        } else {
+                            let mut kb =
+                                self.downloader.download_bytes(&final_key_url, None).await?;
+                            if let Some(cb) = &self.config.key_processor_cb {
+                                kb = (cb)(kb);
+                            }
+                            if kb.len() != 16 {
+                                return Err(HlsError::Message(format!(
+                                    "invalid AES-128 key length: expected 16, got {}",
+                                    kb.len()
+                                )));
+                            }
+                            self.key_cache.insert(final_key_url.clone(), kb.clone());
+                            kb
+                        };
+
+                        // Compute IV: use explicit IV if provided; otherwise, use zero IV for init segments
+                        let iv = if let Some(iv) = key_info.iv {
+                            iv
+                        } else {
+                            [0u8; 16]
+                        };
+
+                        data =
+                            crate::crypto::decrypt_aes128_cbc_full(key_bytes.as_ref(), &iv, data)?;
+                    }
+                }
+            }
+        }
+
+        Ok(Some(data.to_vec()))
+    }
 }
 
 #[async_trait]
