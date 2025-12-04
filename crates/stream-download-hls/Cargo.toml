@@ -1,0 +1,18 @@
+[package]
+name = "stream-download-hls"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "HLS (HTTP Live Streaming) extension for the stream-download crate"
+repository = "https://github.com/aschey/stream-download-rs"
+authors = ["Austin Schey <aschey13@gmail.com>"]
+
+[dependencies]
+# Core workspace dependencies
+stream-download = { path = "../stream-download" }
+thiserror = "2.0.3"
+hls_m3u8 = "0.4"
+
+[features]
+# Enable Tokio-based async helpers in this crate using the workspace Tokio dependency.
+tokio-runtime = ["tokio"]
