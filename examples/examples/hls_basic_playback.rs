@@ -16,8 +16,8 @@
 use std::time::Duration;
 
 use stream_download_hls::{
-    AbrConfig, AbrController, DownloaderConfig, ResourceDownloader,
-    HlsConfig, HlsManager, HlsResult, MediaStream,
+    AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, HlsResult, MediaStream,
+    ResourceDownloader,
 };
 use tracing::{info, warn};
 
@@ -42,7 +42,13 @@ async fn main() -> HlsResult<()> {
     let abr_config = AbrConfig::default();
     // For this example, we'll start with the first variant found.
     let initial_variant_index = 0;
-    let abr_controller = AbrController::new(manager, abr_config, initial_variant_index);
+    let initial_bandwidth = 1_000_000.0; // 1 Mbps
+    let abr_controller = AbrController::new(
+        manager,
+        abr_config,
+        initial_variant_index,
+        initial_bandwidth,
+    );
 
     // The player interacts with the `MediaStream` trait. `AbrController` also
     // implements `MediaStream`, adding its logic on top of the underlying stream.

@@ -242,6 +242,7 @@ mod tests {
         let old = MediaPlaylist {
             segments: Vec::new(),
             target_duration: None,
+            current_key: None,
             media_sequence: 1,
             end_list: false,
         };
@@ -250,16 +251,21 @@ mod tests {
             segments: vec![
                 MediaSegment {
                     sequence: 1,
+                    variant_id: VariantId(0),
                     uri: "seg1.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
                 MediaSegment {
                     sequence: 2,
+                    variant_id: VariantId(0),
                     uri: "seg2.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
             ],
             target_duration: None,
+            current_key: None,
             media_sequence: 1,
             end_list: false,
         };
@@ -276,41 +282,53 @@ mod tests {
             segments: vec![
                 MediaSegment {
                     sequence: 5,
+                    variant_id: VariantId(0),
                     uri: "seg5.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
                 MediaSegment {
                     sequence: 6,
+                    variant_id: VariantId(0),
                     uri: "seg6.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
             ],
             target_duration: None,
             media_sequence: 5,
             end_list: false,
+            current_key: None,
         };
 
         let new = MediaPlaylist {
             segments: vec![
                 MediaSegment {
                     sequence: 6,
+                    variant_id: VariantId(0),
                     uri: "seg6.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
                 MediaSegment {
                     sequence: 7,
+                    variant_id: VariantId(0),
                     uri: "seg7.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
                 MediaSegment {
                     sequence: 8,
+                    variant_id: VariantId(0),
                     uri: "seg8.ts".into(),
                     duration: Duration::from_secs(4),
+                    key: None,
                 },
             ],
             target_duration: None,
             media_sequence: 6,
             end_list: false,
+            current_key: None,
         };
 
         let diff = diff_playlists(&old, &new);

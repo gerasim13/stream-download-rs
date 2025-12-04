@@ -17,8 +17,13 @@
 
 use async_trait::async_trait;
 
+use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
 use crate::{HlsError, HlsResult, MediaStream, SegmentData};
+use std::time::Instant;
+
+mod bandwidth_estimator;
+mod ewma;
 
 /// Basic playback / network metrics used for ABR decisions.
 ///
@@ -74,6 +79,7 @@ impl Default for AbrConfig {
 pub struct AbrController<S: MediaStream> {
     stream: S,
     config: AbrConfig,
+    bandwidth_estimator: BandwidthEstimator,
     /// The variant that the controller is currently targeting.
     current_variant_id: Option<VariantId>,
     initial_variant_index: usize,
@@ -89,10 +95,17 @@ impl<S: MediaStream> AbrController<S> {
     /// * `stream`: The underlying `MediaStream` (e.g., an `HlsManager`).
     /// * `config`: Configuration for the ABR algorithm.
     /// * `initial_variant_index`: The index of the variant to start with.
-    pub fn new(stream: S, config: AbrConfig, initial_variant_index: usize) -> Self {
+    /// * `initial_bandwidth`: The initial bandwidth estimate to use.
+    pub fn new(
+        stream: S,
+        config: AbrConfig,
+        initial_variant_index: usize,
+        initial_bandwidth: f64,
+    ) -> Self {
         Self {
             stream,
             config,
+            bandwidth_estimator: BandwidthEstimator::new(initial_bandwidth),
             current_variant_id: None,
             initial_variant_index,
         }
@@ -113,6 +126,13 @@ impl<S: MediaStream> AbrController<S> {
         self.current_variant_id
     }
 
+    /// Resets the bandwidth estimator, clearing all historical data.
+    ///
+    /// This is useful after a network change or a long pause.
+    pub fn reset(&mut self) {
+        self.bandwidth_estimator.reset();
+    }
+
     /// Potentially switch to a different variant based on the provided
     /// `metrics`.
     ///
@@ -126,9 +146,39 @@ impl<S: MediaStream> AbrController<S> {
     /// - Choose a new variant ID.
     /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
     pub async fn maybe_switch(&mut self, _metrics: &PlaybackMetrics) -> HlsResult<()> {
-        // Stub implementation:
-        // - Do nothing and keep the current variant.
-        // - Return Ok so the control flow can be tested by callers.
+        let variants = self.stream.variants();
+        if variants.len() <= 1 {
+            return Ok(());
+        }
+
+        let estimated_bandwidth = self.bandwidth_estimator.get_estimate();
+        let adjusted_bandwidth = estimated_bandwidth * self.config.throughput_safety_factor as f64;
+
+        // Find the best variant ID without holding onto the `variants` slice.
+        let new_variant_id = {
+            let best_variant = variants
+                .iter()
+                .filter(|v| v.bandwidth.unwrap_or(0) as f64 <= adjusted_bandwidth)
+                .max_by_key(|v| v.bandwidth);
+
+            if let Some(best_variant) = best_variant {
+                Some(best_variant.id)
+            }
+            // If no variant is suitable, find the one with the lowest bandwidth.
+            else {
+                variants.iter().min_by_key(|v| v.bandwidth).map(|v| v.id)
+            }
+        };
+
+        // Now that the `variants` slice is no longer borrowed, we can safely
+        // get a mutable borrow on `self.stream`.
+        if let Some(new_id) = new_variant_id {
+            if Some(new_id) != self.current_variant_id {
+                self.stream.select_variant(new_id).await?;
+                self.current_variant_id = Some(new_id);
+            }
+        }
+
         Ok(())
     }
 }
@@ -175,19 +225,27 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
     }
 
     async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
-        // In a real player, metrics would be collected from the playback loop
-        // (buffer level, download speed, etc.) and passed here.
+        // In a real player, we would get real metrics here.
         let metrics = PlaybackMetrics {
-            throughput_bps: 5_000_000,
-            buffer_seconds: 30.0,
-            dropped_frames: 0,
+            throughput_bps: self.bandwidth_estimator.get_estimate() as u64,
+            buffer_seconds: 30.0, // Placeholder
+            dropped_frames: 0,    // Placeholder
         };
 
         // 1. Run the ABR logic to decide if we should switch streams.
-        // The `maybe_switch` method will internally call `self.stream.select_variant()`.
         self.maybe_switch(&metrics).await?;
 
-        // 2. Fetch the next segment from the underlying stream.
-        self.stream.next_segment().await
+        // 2. Fetch the next segment, measuring the time it takes.
+        let start_time = Instant::now();
+        let result = self.stream.next_segment().await;
+        let duration = start_time.elapsed();
+
+        if let Ok(Some(segment_data)) = &result {
+            // 3. Feed the measurement to the bandwidth estimator.
+            self.bandwidth_estimator
+                .add_sample(duration.as_millis() as f64, segment_data.data.len() as u32);
+        }
+
+        result
     }
 }
