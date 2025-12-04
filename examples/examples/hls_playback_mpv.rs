@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use reqwest::Url;
 use stream_download_hls::{
-    DownloaderConfig, HlsConfig, HlsManager, MediaStream, ResourceDownloader,
+    AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
+    ResourceDownloader,
 };
 use tracing::{info, metadata::LevelFilter, warn};
 use tracing_subscriber::EnvFilter;
@@ -36,30 +37,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         live_refresh_interval: Some(Duration::from_secs(5)),
         ..Default::default()
     };
-    let mut manager = HlsManager::new(&master_playlist_url, hls_config, downloader);
+    let manager = HlsManager::new(master_playlist_url.clone(), hls_config, downloader);
 
-    // Using HlsManager directly for playback; selecting the first variant after init
+    // Wrap in ABR controller (AUTO mode)
+    let abr_config = AbrConfig::default();
+    let mut stream = AbrController::new(manager, abr_config, 0, 2_000_000.0);
+    stream.set_auto();
 
-    // 2) Init the stream (loads master)
-    if let Err(e) = manager.init().await {
+    // 2) Init the stream via ABR (loads master and selects initial variant)
+    if let Err(e) = stream.init().await {
         warn!("Stream initialization failed: {e}");
         return Ok(());
     }
 
-    // Select the first variant
-    let initial_variant_id = manager.variants().get(0).map(|v| v.id);
-    if let Some(_) = initial_variant_id {
-        if let Err(e) = manager.select_variant(0).await {
-            warn!("Failed to select initial variant: {e}");
-            return Ok(());
-        }
-    } else {
+    // Log variants
+    let variants = stream.variants();
+    if variants.is_empty() {
         warn!("No variants found in master playlist");
         return Ok(());
     }
-
-    // Log variants
-    let variants = manager.variants();
     info!("Found {} variants", variants.len());
     for v in variants {
         info!("  - id={}, bandwidth={:?}", v.id.0, v.bandwidth);
@@ -103,40 +99,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting playback loop: piping segments to mpv stdin...");
 
     // Attempt to write init segment if present (for fMP4)
-    if let Some(playlist) = manager.current_media_playlist() {
-        if let Some(init) = &playlist.init_segment {
-            // Resolve media playlist URL using the first variant URI
-            let variants = manager.variants();
-            if let Some(v) = variants.get(0) {
-                let variant_uri = &v.uri;
-                let media_url = if variant_uri.starts_with("http") {
-                    variant_uri.clone()
+    let init_url_opt: Option<String> = {
+        let inner = stream.inner_stream();
+        if let Some(playlist) = inner.current_media_playlist() {
+            if let Some(init) = &playlist.init_segment {
+                // Resolve media playlist URL using the first variant URI
+                let variants = stream.variants();
+                if let Some(v) = variants.get(0) {
+                    let variant_uri = &v.uri;
+                    let media_url = if variant_uri.starts_with("http") {
+                        variant_uri.clone()
+                    } else {
+                        Url::parse(&master_playlist_url)
+                            .and_then(|u| u.join(variant_uri))
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| variant_uri.clone())
+                    };
+                    let init_url = if init.uri.starts_with("http") {
+                        init.uri.clone()
+                    } else {
+                        Url::parse(&media_url)
+                            .and_then(|u| u.join(&init.uri))
+                            .map(|u| u.to_string())
+                            .unwrap_or_else(|_| init.uri.clone())
+                    };
+                    Some(init_url)
                 } else {
-                    Url::parse(&master_playlist_url)
-                        .and_then(|u| u.join(variant_uri))
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| variant_uri.clone())
-                };
-                let init_url = if init.uri.starts_with("http") {
-                    init.uri.clone()
-                } else {
-                    Url::parse(&media_url)
-                        .and_then(|u| u.join(&init.uri))
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|_| init.uri.clone())
-                };
-                match manager.downloader().download_bytes(&init_url, None).await {
-                    Ok(bytes) => {
-                        info!("Writing init segment ({} bytes)", bytes.len());
-                        if let Err(e) = stdin.write_all(&bytes) {
-                            warn!("Failed to write init segment to mpv stdin: {e}");
-                        }
-                        let _ = stdin.flush();
-                    }
-                    Err(e) => {
-                        warn!("Failed to download init segment: {e}");
-                    }
+                    None
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(init_url) = init_url_opt {
+        match stream
+            .inner_stream()
+            .downloader()
+            .download_bytes(&init_url, None)
+            .await
+        {
+            Ok(bytes) => {
+                info!("Writing init segment ({} bytes)", bytes.len());
+                if let Err(e) = stdin.write_all(&bytes) {
+                    warn!("Failed to write init segment to mpv stdin: {e}");
+                }
+                let _ = stdin.flush();
+            }
+            Err(e) => {
+                warn!("Failed to download init segment: {e}");
             }
         }
     }
@@ -144,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4) Main loop: fetch segments and write them to mpv's stdin.
     let mut seg_count: u64 = 0;
     loop {
-        match manager.next_segment().await {
+        match stream.next_segment().await {
             Ok(Some(seg)) => {
                 seg_count += 1;
                 let len = seg.data.len();

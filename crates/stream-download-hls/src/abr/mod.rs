@@ -20,10 +20,19 @@ use async_trait::async_trait;
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
 use crate::{HlsError, HlsResult, MediaStream, SegmentData};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tracing::{debug, info};
 
 mod bandwidth_estimator;
 mod ewma;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    /// ABR automatically selects the most suitable variant based on metrics.
+    Auto,
+    /// Manual mode locks the stream to a specific variant chosen by the user.
+    Manual,
+}
 
 /// Basic playback / network metrics used for ABR decisions.
 ///
@@ -47,20 +56,31 @@ pub struct PlaybackMetrics {
 /// for experimentation in the PoC without committing to a complex API.
 #[derive(Debug, Clone)]
 pub struct AbrConfig {
-    /// Minimum buffer (in seconds) below which the controller will be
-    /// more aggressive in down-switching.
+    /// Minimum buffer (in seconds) above which the controller allows up-switching.
     pub min_buffer_for_up_switch: f32,
+    /// Buffer (in seconds) below which the controller will be aggressive in down-switching.
+    pub down_switch_buffer: f32,
     /// Safety factor applied to throughput when selecting a variant.
     /// For example, if set to 0.8, and throughput is 5 Mbps, ABR will
     /// try to select a variant with bandwidth <= 4 Mbps.
     pub throughput_safety_factor: f32,
+    /// Hysteresis ratio applied for up-switch decisions (e.g., 0.15 = +15% headroom).
+    pub up_hysteresis_ratio: f32,
+    /// Hysteresis ratio applied for down-switch decisions (e.g., 0.05 = -5% margin).
+    pub down_hysteresis_ratio: f32,
+    /// Minimal interval between consecutive switches to avoid oscillations.
+    pub min_switch_interval: Duration,
 }
 
 impl Default for AbrConfig {
     fn default() -> Self {
         Self {
-            min_buffer_for_up_switch: 10.0,
+            min_buffer_for_up_switch: 0.0,
+            down_switch_buffer: 3.0,
             throughput_safety_factor: 0.8,
+            up_hysteresis_ratio: 0.15,
+            down_hysteresis_ratio: 0.05,
+            min_switch_interval: Duration::from_secs(4),
         }
     }
 }
@@ -83,6 +103,18 @@ pub struct AbrController<S: MediaStream> {
     /// The variant that the controller is currently targeting.
     current_variant_id: Option<VariantId>,
     initial_variant_index: usize,
+
+    /// Current selection mode: Auto (ABR) or Manual (user-forced).
+    selection_mode: SelectionMode,
+    /// When in Manual mode, this holds the target variant ID.
+    manual_variant_id: Option<VariantId>,
+
+    /// Simple wall-clock based buffer estimate (seconds).
+    buffer_seconds_estimate: f32,
+    /// Last time the buffer estimate was updated.
+    last_buffer_update: Instant,
+    /// Backoff timer to avoid too frequent switches.
+    last_switch_instant: Option<Instant>,
 }
 
 impl<S: MediaStream> AbrController<S> {
@@ -108,6 +140,11 @@ impl<S: MediaStream> AbrController<S> {
             bandwidth_estimator: BandwidthEstimator::new(initial_bandwidth),
             current_variant_id: None,
             initial_variant_index,
+            selection_mode: SelectionMode::Auto,
+            manual_variant_id: None,
+            buffer_seconds_estimate: 0.0,
+            last_buffer_update: Instant::now(),
+            last_switch_instant: None,
         }
     }
 
@@ -133,6 +170,25 @@ impl<S: MediaStream> AbrController<S> {
         self.bandwidth_estimator.reset();
     }
 
+    /// Get current selection mode.
+    pub fn selection_mode(&self) -> SelectionMode {
+        self.selection_mode
+    }
+
+    /// Switch to AUTO mode (ABR).
+    pub fn set_auto(&mut self) {
+        self.selection_mode = SelectionMode::Auto;
+        self.manual_variant_id = None;
+    }
+
+    /// Switch to MANUAL mode and lock to the given variant.
+    pub async fn set_manual(&mut self, variant_id: VariantId) -> HlsResult<()> {
+        self.selection_mode = SelectionMode::Manual;
+        self.manual_variant_id = Some(variant_id);
+        self.current_variant_id = Some(variant_id);
+        self.stream.select_variant(variant_id).await
+    }
+
     /// Potentially switch to a different variant based on the provided
     /// `metrics`.
     ///
@@ -145,38 +201,139 @@ impl<S: MediaStream> AbrController<S> {
     /// - Inspect `self.stream.variants()` and `metrics`.
     /// - Choose a new variant ID.
     /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
-    pub async fn maybe_switch(&mut self, _metrics: &PlaybackMetrics) -> HlsResult<()> {
+    pub async fn maybe_switch(&mut self, metrics: &PlaybackMetrics) -> HlsResult<()> {
+        // If manual mode is active, ensure we are locked to the manual target and skip ABR.
+        if let SelectionMode::Manual = self.selection_mode {
+            if let Some(target) = self.manual_variant_id {
+                if Some(target) != self.current_variant_id {
+                    self.stream.select_variant(target).await?;
+                    self.current_variant_id = Some(target);
+                }
+            }
+            return Ok(());
+        }
+
         let variants = self.stream.variants();
         if variants.len() <= 1 {
             return Ok(());
         }
 
+        // Current variant bandwidth (bps) if known
+        let current_bw = self
+            .current_variant_id
+            .and_then(|id| variants.iter().find(|v| v.id == id))
+            .and_then(|v| v.bandwidth)
+            .unwrap_or(0) as f64;
+
+        // Estimated available throughput after applying safety factor
         let estimated_bandwidth = self.bandwidth_estimator.get_estimate();
         let adjusted_bandwidth = estimated_bandwidth * self.config.throughput_safety_factor as f64;
 
-        // Find the best variant ID without holding onto the `variants` slice.
-        let new_variant_id = {
-            let best_variant = variants
+        // Choose the best candidate under adjusted throughput; if none, choose the lowest bandwidth.
+        let (candidate_id, candidate_bw) = {
+            let best_under: Option<&VariantStream> = variants
                 .iter()
                 .filter(|v| v.bandwidth.unwrap_or(0) as f64 <= adjusted_bandwidth)
                 .max_by_key(|v| v.bandwidth);
 
-            if let Some(best_variant) = best_variant {
-                Some(best_variant.id)
-            }
-            // If no variant is suitable, find the one with the lowest bandwidth.
-            else {
-                variants.iter().min_by_key(|v| v.bandwidth).map(|v| v.id)
+            if let Some(v) = best_under {
+                (Some(v.id), v.bandwidth.unwrap_or(0) as f64)
+            } else {
+                let min_v = variants.iter().min_by_key(|v| v.bandwidth);
+                if let Some(v) = min_v {
+                    (Some(v.id), v.bandwidth.unwrap_or(0) as f64)
+                } else {
+                    (None, 0.0)
+                }
             }
         };
 
-        // Now that the `variants` slice is no longer borrowed, we can safely
-        // get a mutable borrow on `self.stream`.
-        if let Some(new_id) = new_variant_id {
-            if Some(new_id) != self.current_variant_id {
-                self.stream.select_variant(new_id).await?;
-                self.current_variant_id = Some(new_id);
-            }
+        info!(
+            "ABR: current_bw={:.0}bps, est={:.0}bps, adj={:.0}bps, buffer={:.2}s, candidate_bw={:.0}bps, candidate_id={:?}",
+            current_bw,
+            estimated_bandwidth,
+            adjusted_bandwidth,
+            metrics.buffer_seconds,
+            candidate_bw,
+            candidate_id
+        );
+
+        // Backoff to avoid oscillations
+        let now = Instant::now();
+        let can_switch_time = self
+            .last_switch_instant
+            .map(|t| now.duration_since(t) >= self.config.min_switch_interval)
+            .unwrap_or(true);
+
+        // Buffer driven down-switch urgency
+        let urgent_down = metrics.buffer_seconds < self.config.down_switch_buffer;
+
+        if let Some(new_id) = candidate_id {
+            if candidate_bw > current_bw {
+                // Consider up-switch only if buffer is healthy (or gating disabled), we have enough headroom,
+                // and we are past the switch backoff interval.
+                let buffer_ok = self.config.min_buffer_for_up_switch <= 0.0
+                    || metrics.buffer_seconds >= self.config.min_buffer_for_up_switch;
+                let headroom_ok = adjusted_bandwidth
+                    >= current_bw * (1.0 + self.config.up_hysteresis_ratio as f64);
+                let up_allowed = buffer_ok && headroom_ok && can_switch_time;
+
+                if up_allowed && Some(new_id) != self.current_variant_id {
+                    info!(
+                        "ABR: switching UP {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2})",
+                        self.current_variant_id,
+                        new_id,
+                        current_bw,
+                        candidate_bw,
+                        adjusted_bandwidth,
+                        metrics.buffer_seconds
+                    );
+                    self.stream.select_variant(new_id).await?;
+                    self.current_variant_id = Some(new_id);
+                    self.last_switch_instant = Some(now);
+                } else {
+                    debug!(
+                        "ABR: skip UP (buffer_ok={}, headroom_ok={}, can_switch_time={}, same_variant={})",
+                        buffer_ok,
+                        headroom_ok,
+                        can_switch_time,
+                        Some(new_id) == self.current_variant_id
+                    );
+                }
+            } else if candidate_bw < current_bw {
+                // Consider down-switch if buffer is low (urgent) or bandwidth margin suggests it,
+                // respecting backoff unless it's urgent.
+                let margin_ok = adjusted_bandwidth
+                    <= current_bw * (1.0 - self.config.down_hysteresis_ratio as f64);
+                let down_allowed = urgent_down || margin_ok;
+
+                if down_allowed
+                    && (can_switch_time || urgent_down)
+                    && Some(new_id) != self.current_variant_id
+                {
+                    info!(
+                        "ABR: switching DOWN {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2}, urgent={})",
+                        self.current_variant_id,
+                        new_id,
+                        current_bw,
+                        candidate_bw,
+                        adjusted_bandwidth,
+                        metrics.buffer_seconds,
+                        urgent_down
+                    );
+                    self.stream.select_variant(new_id).await?;
+                    self.current_variant_id = Some(new_id);
+                    self.last_switch_instant = Some(now);
+                } else {
+                    debug!(
+                        "ABR: skip DOWN (margin_ok={}, urgent_down={}, can_switch_time={}, same_variant={})",
+                        margin_ok,
+                        urgent_down,
+                        can_switch_time,
+                        Some(new_id) == self.current_variant_id
+                    );
+                }
+            } // else equal bandwidth: do nothing
         }
 
         Ok(())
@@ -219,17 +376,27 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
     }
 
     async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
-        // an ABR controller should allow manual override of the variant.
+        // Treat direct select_variant calls as manual override, as in typical players.
+        self.selection_mode = SelectionMode::Manual;
+        self.manual_variant_id = Some(variant_id);
         self.current_variant_id = Some(variant_id);
         self.stream.select_variant(variant_id).await
     }
 
     async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
-        // In a real player, we would get real metrics here.
+        // Update simple buffer estimate by accounting for wall-clock elapsed time
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_buffer_update).as_secs_f32();
+        if elapsed > 0.0 {
+            self.buffer_seconds_estimate = (self.buffer_seconds_estimate - elapsed).max(0.0);
+            self.last_buffer_update = now;
+        }
+
+        // Build metrics for ABR
         let metrics = PlaybackMetrics {
             throughput_bps: self.bandwidth_estimator.get_estimate() as u64,
-            buffer_seconds: 30.0, // Placeholder
-            dropped_frames: 0,    // Placeholder
+            buffer_seconds: self.buffer_seconds_estimate,
+            dropped_frames: 0,
         };
 
         // 1. Run the ABR logic to decide if we should switch streams.
@@ -244,6 +411,10 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
             // 3. Feed the measurement to the bandwidth estimator.
             self.bandwidth_estimator
                 .add_sample(duration.as_millis() as f64, segment_data.data.len() as u32);
+
+            // 4. Increase buffer estimate by the segment duration.
+            self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
+            self.last_buffer_update = Instant::now();
         }
 
         result

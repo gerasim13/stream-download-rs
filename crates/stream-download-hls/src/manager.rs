@@ -221,14 +221,26 @@ impl HlsManager {
     ///
     /// For now this is a stub that returns an error.
     pub async fn refresh_media_playlist(&mut self) -> HlsResult<&MediaPlaylist> {
-        let _ = (
-            &self.downloader,
-            &self.current_variant_index,
-            &parse_media_playlist,
-        );
-        Err(HlsError::Message(
-            "HlsManager::refresh_media_playlist is not implemented yet".to_string(),
-        ))
+        // Ensure we have a selected variant and a media playlist URL to refresh
+        let media_url = self.media_playlist_url.clone().ok_or_else(|| {
+            HlsError::Message("no media playlist URL; call select_variant first".to_string())
+        })?;
+        let variant_id = self
+            .current_variant_index
+            .and_then(|idx| {
+                self.master
+                    .as_ref()
+                    .and_then(|m| m.variants.get(idx))
+                    .map(|v| v.id)
+            })
+            .ok_or_else(|| HlsError::Message("no variant selected".to_string()))?;
+
+        // Download and parse the latest media playlist
+        let data = self.downloader.download_bytes(&media_url, None).await?;
+        let media_playlist = parse_media_playlist(&data, variant_id)?;
+        self.current_media_playlist = Some(media_playlist);
+
+        Ok(self.current_media_playlist.as_ref().unwrap())
     }
 
     /// Download the bytes for a specific segment.
@@ -239,65 +251,24 @@ impl HlsManager {
     ///   caching),
     /// - return the raw bytes to the caller for decoding.
     ///
-    /// For now this is a stub that always returns an error.
-    pub async fn download_segment(&self, segment: &MediaSegment) -> HlsResult<Vec<u8>> {
-        let _ = (&self.downloader, segment);
-        Err(HlsError::Message(
-            "HlsManager::download_segment is not implemented yet".to_string(),
-        ))
-    }
-}
-
-#[async_trait]
-impl MediaStream for HlsManager {
-    async fn init(&mut self) -> HlsResult<()> {
-        self.load_master().await?;
-        Ok(())
-    }
-
-    fn variants(&self) -> &[VariantStream] {
-        self.master()
-            .map(|m| m.variants.as_slice())
-            .unwrap_or_default()
-    }
-
-    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
-        self.select_variant(variant_id.0).await
-    }
-
-    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
+    /// Download the bytes for a specific segment.
+    ///
+    /// This will:
+    /// - resolve the segment URI relative to the media playlist URL if needed,
+    /// - use `ResourceDownloader` to fetch the segment bytes (possibly with
+    ///   caching),
+    /// - handle AES-128 decryption when applicable,
+    /// - return the raw bytes to the caller.
+    pub async fn download_segment(&mut self, segment: &MediaSegment) -> HlsResult<Vec<u8>> {
         use crate::model::EncryptionMethod;
 
-        let playlist = match &self.current_media_playlist {
-            Some(p) => p,
-            None => {
-                return Err(HlsError::Message(
-                    "no media playlist loaded; call select_variant first".to_string(),
-                ));
-            }
-        };
-
-        // End-of-stream handling for VOD
-        if self.next_segment_index >= playlist.segments.len() {
-            if playlist.end_list {
-                return Ok(None);
-            } else {
-                return Err(HlsError::Message(
-                    "live playlists not implemented yet".to_string(),
-                ));
-            }
-        }
-
-        let seg = &playlist.segments[self.next_segment_index];
-
         // Resolve segment URL relative to media playlist
-        let seg_url = self.resolve_url(&seg.uri)?;
-
+        let seg_url = self.resolve_url(&segment.uri)?;
         // Download segment bytes
         let mut data = self.downloader.download_bytes(&seg_url, None).await?;
 
         // If encrypted with AES-128 and key URI is present, fetch key and (optionally) decrypt.
-        if let Some(seg_key) = &seg.key {
+        if let Some(seg_key) = &segment.key {
             if matches!(seg_key.method, EncryptionMethod::Aes128) {
                 if let Some(ref key_info) = seg_key.key_info {
                     if let Some(ref key_uri) = key_info.uri {
@@ -344,7 +315,7 @@ impl MediaStream for HlsManager {
                             iv
                         } else {
                             let mut iv = [0u8; 16];
-                            iv[8..].copy_from_slice(&seg.sequence.to_be_bytes());
+                            iv[8..].copy_from_slice(&segment.sequence.to_be_bytes());
                             iv
                         };
 
@@ -355,28 +326,104 @@ impl MediaStream for HlsManager {
             }
         }
 
-        // Prepare codec info from the selected variant
-        let codec_info = self
-            .master
-            .as_ref()
-            .and_then(|m| {
-                self.current_variant_index
-                    .and_then(|idx| m.variants.get(idx))
-            })
-            .and_then(|v| v.codec.clone());
+        Ok(data.to_vec())
+    }
+}
 
-        let segment_data = SegmentData {
-            data,
-            variant_id: seg.variant_id,
-            codec_info,
-            key: seg.key.clone(),
-            sequence: seg.sequence,
-            duration: seg.duration,
-        };
+#[async_trait]
+impl MediaStream for HlsManager {
+    async fn init(&mut self) -> HlsResult<()> {
+        self.load_master().await?;
+        Ok(())
+    }
 
-        // Advance to the next segment
-        self.next_segment_index += 1;
+    fn variants(&self) -> &[VariantStream] {
+        self.master()
+            .map(|m| m.variants.as_slice())
+            .unwrap_or_default()
+    }
 
-        Ok(Some(segment_data))
+    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
+        self.select_variant(variant_id.0).await
+    }
+
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
+        loop {
+            // Ensure media playlist is loaded
+            let playlist = match &self.current_media_playlist {
+                Some(p) => p,
+                None => {
+                    return Err(HlsError::Message(
+                        "no media playlist loaded; call select_variant first".to_string(),
+                    ));
+                }
+            };
+
+            // If we have a segment ready in the current playlist, fetch it
+            if self.next_segment_index < playlist.segments.len() {
+                let seg = playlist.segments[self.next_segment_index].clone();
+
+                // Download segment bytes (handles decryption if needed)
+                let data = Bytes::from(self.download_segment(&seg).await?);
+
+                // Prepare codec info from the selected variant
+                let codec_info = self
+                    .master
+                    .as_ref()
+                    .and_then(|m| {
+                        self.current_variant_index
+                            .and_then(|idx| m.variants.get(idx))
+                    })
+                    .and_then(|v| v.codec.clone());
+
+                let segment_data = SegmentData {
+                    data,
+                    variant_id: seg.variant_id,
+                    codec_info,
+                    key: seg.key.clone(),
+                    sequence: seg.sequence,
+                    duration: seg.duration,
+                };
+
+                // Advance to the next segment
+                self.next_segment_index += 1;
+
+                return Ok(Some(segment_data));
+            }
+
+            // VOD end-of-stream
+            if playlist.end_list {
+                return Ok(None);
+            }
+
+            // LIVE: need to refresh until new segments appear
+            let last_seq = playlist
+                .segments
+                .last()
+                .map(|s| s.sequence)
+                .unwrap_or_else(|| playlist.media_sequence.saturating_sub(1));
+
+            // Refresh immediately
+            self.refresh_media_playlist().await?;
+            let new_pl = self
+                .current_media_playlist
+                .as_ref()
+                .expect("playlist just refreshed");
+
+            // Try to find the first truly new segment (sequence greater than last_seq)
+            if let Some(idx) = new_pl.segments.iter().position(|s| s.sequence > last_seq) {
+                self.next_segment_index = idx;
+                // Loop will try again and fetch this segment
+                continue;
+            }
+
+            // No new segments yet; wait and try again
+            let interval = self
+                .config
+                .live_refresh_interval
+                .or(new_pl.target_duration)
+                .unwrap_or(std::time::Duration::from_secs(2));
+            tokio::time::sleep(interval).await;
+        }
     }
 }

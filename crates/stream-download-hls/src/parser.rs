@@ -8,11 +8,10 @@ use hls_m3u8::MasterPlaylist as HlsMasterPlaylist;
 use hls_m3u8::MediaPlaylist as HlsMediaPlaylist;
 use hls_m3u8::tags::VariantStream as HlsVariantStreamTag;
 use hls_m3u8::types::PlaylistType;
-use std::time::Duration;
 
 use crate::model::{
-    EncryptionMethod, HlsError, HlsResult, InitSegment, KeyInfo, MasterPlaylist, MediaPlaylist,
-    MediaSegment, SegmentKey, VariantId, VariantStream,
+    CodecInfo, EncryptionMethod, HlsError, HlsResult, InitSegment, KeyInfo, MasterPlaylist,
+    MediaPlaylist, MediaSegment, SegmentKey, VariantId, VariantStream,
 };
 
 /// Parse a master playlist (M3U8) into a [`MasterPlaylist`].
@@ -28,17 +27,33 @@ pub fn parse_master_playlist(data: &[u8]) -> HlsResult<MasterPlaylist> {
         .iter()
         .enumerate()
         .map(|(index, vs)| {
-            let uri = match vs {
-                HlsVariantStreamTag::ExtXStreamInf { uri, .. } => uri.to_string(),
-                HlsVariantStreamTag::ExtXIFrame { uri, .. } => uri.to_string(),
+            let (uri, bandwidth, codecs_str) = match vs {
+                HlsVariantStreamTag::ExtXStreamInf {
+                    uri, stream_data, ..
+                } => {
+                    let bw = stream_data.bandwidth();
+                    let codecs = stream_data.codecs().map(|c| c.to_string());
+                    (uri.to_string(), Some(bw), codecs)
+                }
+                HlsVariantStreamTag::ExtXIFrame { uri, stream_data } => {
+                    let bw = stream_data.bandwidth();
+                    let codecs = stream_data.codecs().map(|c| c.to_string());
+                    (uri.to_string(), Some(bw), codecs)
+                }
             };
+
+            let codec = codecs_str.map(|c| CodecInfo {
+                codecs: Some(c),
+                audio_codec: None,
+                container: None,
+            });
 
             VariantStream {
                 id: VariantId(index),
                 uri,
-                bandwidth: None,
+                bandwidth,
                 name: None,
-                codec: None,
+                codec,
             }
         })
         .collect();
@@ -86,7 +101,7 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
                 sequence: media_sequence + index as u64,
                 variant_id,
                 uri: seg.uri().to_string(),
-                duration: Duration::from_secs(0),
+                duration: seg.duration.duration(),
                 key: seg_key,
             }
         })

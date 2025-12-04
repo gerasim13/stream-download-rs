@@ -53,7 +53,14 @@ required-features = ["opendal"]
 name = "hls_basic_playback"
 required-features = ["hls"]
 
-# A new example that pipes decrypted TS segments to mpv stdin for basic playback
+[[example]]
+name = "hls_live_probe"
+required-features = ["hls"]
+
 [[example]]
 name = "hls_playback_mpv"
 required-features = ["hls", "mpv"]
+
+[[example]]
+name = "hls_live_abr"
+required-features = ["hls"]
