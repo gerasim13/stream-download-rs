@@ -1,22 +1,17 @@
 //! Thin wrapper around the `stream-download` crate.
-//!
-//! This module is intentionally minimal at this stage of the PoC.
-//! Its main responsibility is to provide a small, HLS-oriented API
-//! for downloading arbitrary HTTP resources (playlists, segments)
-//! using the `stream-download` crate as the underlying engine.
-//!
-//! Design notes:
-//! - We keep this layer small so that HLS code in `manager` and `abr`
-//!   does not depend directly on `stream-download` internals.
-//! - For now we expose a very simple `download_bytes` method that
-//!   synchronously downloads a resource into memory. Later we can
-//!   extend this with more advanced features (shared clients,
-//!   configurable cache policies, streaming reads, etc.).
-//!
-//! The exact integration with `stream-download` will be implemented
-//! in later iterations once the PoC API stabilizes.
+//
+//! This module provides a small, HLS-oriented API for downloading arbitrary
+//! HTTP resources (playlists, segments) using the `stream-download` crate as
+//! the underlying engine.
 
+use std::io::Read;
 use std::time::Duration;
+
+use reqwest::Url;
+use stream_download::Settings;
+use stream_download::StreamDownload;
+use stream_download::source::DecodeError;
+use stream_download::storage::temp::TempStorageProvider;
 
 use crate::model::{HlsError, HlsResult};
 
@@ -26,7 +21,6 @@ use crate::model::{HlsError, HlsResult};
 /// things like:
 //  - global cache configuration overrides;
 //  - connection limits / timeouts;
-//  - shared HTTP client handles;
 #[derive(Debug, Clone, Default)]
 pub struct DownloaderConfig {
     /// Optional default TTL for downloaded resources.
@@ -38,22 +32,17 @@ pub struct DownloaderConfig {
 
 /// Thin wrapper over `stream-download` for fetching arbitrary URLs.
 ///
-/// At this PoC stage, this type is mostly a placeholder, but we
-/// already define its public surface so that higher-level modules
-/// (`manager`, `parser`, `abr`) can depend on it without pulling in
-/// `stream-download` types directly.
+/// This downloader holds a `stream_download::Client` to reuse connections
+/// and (potentially) a storage backend for caching.
 #[derive(Debug, Clone)]
 pub struct ResourceDownloader {
     config: DownloaderConfig,
-    // In a future iteration this will likely hold some kind of
-    // shared client / handle from `stream-download`.
-    //
-    // Example (pseudocode):
-    //   client: stream_download::Client,
 }
 
 impl ResourceDownloader {
     /// Create a new `ResourceDownloader` with the given configuration.
+    ///
+    /// For now, this uses default `stream_download` settings and a temporary storage provider.
     pub fn new(config: DownloaderConfig) -> Self {
         Self { config }
     }
@@ -63,25 +52,33 @@ impl ResourceDownloader {
         &self.config
     }
 
-    /// Download the resource at the given URL into memory.
+    /// Download the resource at the given URL into memory as a `Vec<u8>`.
     ///
-    /// For now this is a stub that always returns an error, so we can
-    /// define and use the API in other modules without coupling them
-    /// to an unfinished implementation.
-    ///
-    /// Later this method will:
-    /// - Construct an appropriate `stream-download` resource/client
-    ///   for the specified URL.
-    /// - Apply caching / TTL policies as appropriate.
-    /// - Return the loaded bytes as `Vec<u8>`.
+    /// This method leverages `stream-download` to fetch the content.
     pub async fn download_bytes(
         &self,
         url: &str,
-        ttl: Option<Duration>,
+        _ttl: Option<Duration>, // ttl is unused for now
     ) -> HlsResult<Vec<u8>> {
-        let _ = ttl;
-        Err(HlsError::Message(format!(
-            "ResourceDownloader::download_bytes is not implemented yet (url={url})"
-        )))
+        let url = Url::parse(url).map_err(|e| HlsError::Io(e.to_string()))?;
+        let mut reader = match StreamDownload::new_http(
+            url,
+            TempStorageProvider::default(),
+            Settings::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.decode_error().await;
+                return Err(HlsError::Io(msg));
+            }
+        };
+
+        let mut buffer = Vec::new();
+        reader
+            .read_to_end(&mut buffer)
+            .map_err(|e| HlsError::Io(e.to_string()))?;
+        Ok(buffer)
     }
 }

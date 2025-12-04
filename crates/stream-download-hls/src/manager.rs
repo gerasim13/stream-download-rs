@@ -105,6 +105,25 @@ impl HlsManager {
         &mut self.downloader
     }
 
+    fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
+        let base_url = if let Some(media_playlist) = &self.current_media_playlist {
+            // If we have a media playlist, resolve relative to that.
+            // This is a simplification; a correct implementation would need to
+            // know the URL of the media playlist itself.
+            // For now, we'll assume it's relative to the master URL.
+            self.master_url.as_str()
+        } else {
+            // Otherwise, resolve relative to the master playlist URL.
+            self.master_url.as_str()
+        };
+
+        let base = url::Url::parse(base_url)
+            .map_err(|e| HlsError::Io(format!("Failed to parse base URL: {}", e)))?;
+        base.join(relative_url)
+            .map(|u| u.into())
+            .map_err(|e| HlsError::Io(format!("Failed to join URL: {}", e)))
+    }
+
     /// Return the currently cached master playlist, if any.
     pub fn master(&self) -> Option<&MasterPlaylist> {
         self.master.as_ref()
@@ -129,10 +148,13 @@ impl HlsManager {
     ///
     /// For now this is a stub that always returns an error.
     pub async fn load_master(&mut self) -> HlsResult<&MasterPlaylist> {
-        let _ = (&self.downloader, &self.master_url, &self.config, &parse_master_playlist);
-        Err(HlsError::Message(
-            "HlsManager::load_master is not implemented yet".to_string(),
-        ))
+        let data = self
+            .downloader
+            .download_bytes(&self.master_url, None)
+            .await?;
+        let master_playlist = parse_master_playlist(&data)?;
+        self.master = Some(master_playlist);
+        Ok(self.master.as_ref().unwrap())
     }
 
     /// Select a variant by index.
@@ -150,22 +172,26 @@ impl HlsManager {
     /// For now this is a stub that only validates input against a cached
     /// master playlist (if any) and otherwise returns an error.
     pub async fn select_variant(&mut self, index: usize) -> HlsResult<()> {
-        if let Some(master) = &self.master {
-            if index >= master.variants.len() {
-                return Err(HlsError::Message(format!(
-                    "variant index {} out of range ({} variants)",
-                    index,
-                    master.variants.len()
-                )));
-            }
-            // For now just store the index; media playlist handling will be added later.
-            self.current_variant_index = Some(index);
-            Ok(())
-        } else {
-            Err(HlsError::Message(
-                "master playlist not loaded; call load_master() first".to_string(),
-            ))
-        }
+        let variant = self
+            .master
+            .as_ref()
+            .and_then(|m| m.variants.get(index))
+            .ok_or_else(|| {
+                HlsError::Message("variant index out of bounds or master not loaded".to_string())
+            })?
+            .clone(); // Clone to avoid borrowing issues
+
+        let media_playlist_url = self.resolve_url(&variant.uri)?;
+        let data = self
+            .downloader
+            .download_bytes(&media_playlist_url, None)
+            .await?;
+
+        let media_playlist = parse_media_playlist(&data, variant.id)?;
+        self.current_media_playlist = Some(media_playlist);
+        self.current_variant_index = Some(index);
+
+        Ok(())
     }
 
     /// Switch to another variant (wrapper around `select_variant`).
@@ -186,7 +212,11 @@ impl HlsManager {
     ///
     /// For now this is a stub that returns an error.
     pub async fn refresh_media_playlist(&mut self) -> HlsResult<&MediaPlaylist> {
-        let _ = (&self.downloader, &self.current_variant_index, &parse_media_playlist);
+        let _ = (
+            &self.downloader,
+            &self.current_variant_index,
+            &parse_media_playlist,
+        );
         Err(HlsError::Message(
             "HlsManager::refresh_media_playlist is not implemented yet".to_string(),
         ))
@@ -212,16 +242,18 @@ impl HlsManager {
 #[async_trait]
 impl MediaStream for HlsManager {
     async fn init(&mut self) -> HlsResult<()> {
-        todo!("Will be implemented by calling self.load_master()");
+        self.load_master().await?;
+        Ok(())
     }
 
     fn variants(&self) -> &[VariantStream] {
-        todo!("Will be implemented by returning from self.master()");
+        self.master()
+            .map(|m| m.variants.as_slice())
+            .unwrap_or_default()
     }
 
     async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
-        let _ = variant_id; // avoid unused variable warning
-        todo!("Will be implemented by calling self.select_variant(variant_id.0)");
+        self.select_variant(variant_id.0).await
     }
 
     async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {

@@ -14,11 +14,14 @@ categories.workspace = true
 keywords.workspace = true
 
 [dependencies]
-stream-download = { version = "0.22.9", path = "../stream-download", default-features = false }
+stream-download = { version = "0.22.9", path = "../stream-download" }
 tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+url = { workspace = true }
+futures-util = { workspace = true }
 hls_m3u8 = "0.4"
+reqwest = { workspace = true }
 
 [lints]
 workspace = true
