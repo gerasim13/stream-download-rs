@@ -47,4 +47,13 @@ pub use bytes::Bytes;
 
 // Temporary re-export of Duration while it's actively used in public types.
 // This may be removed later if the types are better encapsulated.
+#[cfg(feature = "adaptive-audio")]
+mod audio;
+
+#[cfg(feature = "adaptive-audio")]
+pub use crate::audio::{
+    AdaptiveHlsAudio, AdaptiveHlsAudioOptions, AudioSpec, FloatSampleSource, PlayerEvent,
+    VariantMode,
+};
+
 pub use std::time::Duration;

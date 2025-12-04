@@ -13,7 +13,7 @@ stream-download = { path = "../crates/stream-download", features = [
   "registry",
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal", optional = true }
-stream-download-hls = { path = "../crates/stream-download-hls", optional = true, features = ["aes-decrypt"] }
+stream-download-hls = { path = "../crates/stream-download-hls", optional = true, features = ["aes-decrypt", "adaptive-audio"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 rodio = { workspace = true }
@@ -50,17 +50,5 @@ name = "s3"
 required-features = ["opendal"]
 
 [[example]]
-name = "hls_basic_playback"
-required-features = ["hls"]
-
-[[example]]
-name = "hls_live_probe"
-required-features = ["hls"]
-
-[[example]]
-name = "hls_playback_mpv"
-required-features = ["hls", "mpv"]
-
-[[example]]
-name = "hls_live_abr"
+name = "rodio_adaptive"
 required-features = ["hls"]
