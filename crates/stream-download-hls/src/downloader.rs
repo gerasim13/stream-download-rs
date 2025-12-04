@@ -1,4 +1,3 @@
-/stream-download-rs/crates/stream-download-hls/src/downloader.rs#L1-200
 //! Thin wrapper around the `stream-download` crate.
 //!
 //! This module is intentionally minimal at this stage of the PoC.

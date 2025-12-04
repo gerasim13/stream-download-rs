@@ -1,4 +1,3 @@
-/stream-download-rs/crates/stream-download-hls/src/parser.rs#L1-200
 //! Playlist parser module (stub).
 //!
 //! This module will eventually contain the logic for parsing HLS master and

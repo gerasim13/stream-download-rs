@@ -1,4 +1,3 @@
-/stream-download-rs/crates/stream-download-hls/src/model.rs#L1-260
 //! Core data models and error types used by the `stream-download-hls` crate.
 //!
 //! This module is intentionally focused on *pure* types, with no networking
@@ -52,6 +51,74 @@ impl From<std::io::Error> for HlsError {
     }
 }
 
+/// Uniquely identifies a variant within a master playlist.
+///
+/// In most cases, the index in the `variants` vector is sufficient, but a dedicated
+/// type makes the API clearer and more type-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariantId(pub usize);
+
+/// Supported container formats for a variant or segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerFormat {
+    /// MPEG-2 Transport Stream.
+    Ts,
+    /// Fragmented MP4.
+    Fmp4,
+    /// Any other format we don't explicitly handle yet.
+    Other,
+}
+
+/// Basic codec and format information extracted from playlist attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecInfo {
+    /// The raw `CODECS="..."` string from the playlist.
+    /// Can be used by the player to get detailed information.
+    pub codecs: Option<String>,
+    /// A best-effort guess at the audio codec.
+    pub audio_codec: Option<String>,
+    /// A best-effort guess at the container format.
+    pub container: Option<ContainerFormat>,
+}
+
+/// Supported HLS encryption methods.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptionMethod {
+    /// No encryption (`METHOD=NONE`).
+    None,
+    /// AES-128 CBC encryption of the whole segment.
+    Aes128,
+    /// Sample-based AES encryption.
+    SampleAes,
+    /// Any other method, stored as a raw string for forward compatibility.
+    Other(String),
+}
+
+/// Represents a single `#EXT-X-KEY` entry from a media playlist.
+#[derive(Debug, Clone)]
+pub struct KeyInfo {
+    /// The encryption method to be used.
+    pub method: EncryptionMethod,
+    /// The URI of the encryption key. Can be relative to the playlist.
+    pub uri: Option<String>,
+    /// The initialization vector (IV), if specified.
+    pub iv: Option<[u8; 16]>,
+    /// The key format, e.g., "identity".
+    pub key_format: Option<String>,
+    /// The key format version(s).
+    pub key_format_versions: Option<String>,
+}
+
+/// The effective encryption key applicable to a specific segment.
+#[derive(Debug, Clone)]
+pub struct SegmentKey {
+    /// The encryption method that applies to this segment.
+    pub method: EncryptionMethod,
+    /// A reference to the full key information. This allows the player to
+    /// fetch the key from the URI if needed.
+    pub key_info: Option<KeyInfo>,
+}
+
 /// Basic representation of a master playlist.
 ///
 /// This intentionally captures only a small subset of HLS metadata needed
@@ -65,19 +132,22 @@ pub struct MasterPlaylist {
 /// One `#EXT-X-STREAM-INF` entry in the master playlist.
 #[derive(Debug, Clone)]
 pub struct VariantStream {
+    /// A unique identifier for this variant within the context of its master playlist.
+    pub id: VariantId,
     /// Absolute or relative URL of the media playlist for this variant.
     pub uri: String,
     /// Optional advertised bandwidth in bits per second.
     pub bandwidth: Option<u64>,
     /// Optional human-readable name (e.g., "720p", "audio-en").
     pub name: Option<String>,
+    /// Codec and format information for this variant.
+    pub codec: Option<CodecInfo>,
 }
 
 /// Basic representation of a media playlist (VOD or live).
 ///
 /// This is intentionally simplified for the PoC:
 /// - `EXT-X-DISCONTINUITY` and other advanced tags are ignored for now.
-/// - `EXT-X-KEY` / encryption are not modeled yet.
 /// - Only enough information to sequence segments and detect new ones.
 #[derive(Debug, Clone)]
 pub struct MediaPlaylist {
@@ -89,6 +159,9 @@ pub struct MediaPlaylist {
     pub media_sequence: u64,
     /// Whether the playlist is finished (VOD or live that ended).
     pub end_list: bool,
+    /// The last seen `#EXT-X-KEY` for this playlist. This applies to all
+    /// subsequent segments until a new key tag is encountered.
+    pub current_key: Option<KeyInfo>,
 }
 
 /// One `#EXTINF` (media segment) entry.
@@ -96,10 +169,15 @@ pub struct MediaPlaylist {
 pub struct MediaSegment {
     /// Sequence number of the segment (media-sequence + index in playlist).
     pub sequence: u64,
+    /// The variant this segment belongs to. This is crucial for the player
+    /// to manage decoders.
+    pub variant_id: VariantId,
     /// URL of the segment (absolute or relative to playlist URI).
     pub uri: String,
     /// Duration of the segment if known.
     pub duration: Duration,
+    /// Optional encryption information effective for this segment.
+    pub key: Option<SegmentKey>,
 }
 
 /// Represents a newly discovered segment when comparing two media playlists.

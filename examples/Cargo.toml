@@ -13,6 +13,7 @@ stream-download = { path = "../crates/stream-download", features = [
   "registry",
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal", optional = true }
+stream-download-hls = { path = "../crates/stream-download-hls", optional = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 rodio = { workspace = true }
@@ -32,6 +33,7 @@ aws-sdk-s3 = { workspace = true, optional = true }
 
 [features]
 mpv = ["dep:libmpv2"]
+hls = ["dep:stream-download-hls"]
 opendal = [
   "dep:stream-download-opendal",
   "dep:testcontainers-modules",
@@ -46,3 +48,7 @@ required-features = ["mpv"]
 [[example]]
 name = "s3"
 required-features = ["opendal"]
+
+[[example]]
+name = "hls_basic_playback"
+required-features = ["hls"]

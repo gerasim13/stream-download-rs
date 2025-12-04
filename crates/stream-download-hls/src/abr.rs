@@ -1,4 +1,3 @@
-/stream-download-rs/crates/stream-download-hls/src/abr.rs#L1-200
 //! Adaptive Bitrate (ABR) controller.
 //!
 //! This module provides a simple abstraction around variant selection for HLS

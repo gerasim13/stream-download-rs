@@ -12,22 +12,24 @@
 //!   caching to `stream-download`.
 //! - Start simple: single rendition, basic live support, no DRM/keys.
 //!
-//! This crate будет состоять из нескольких модулей:
-//! - `model` — базовые структуры данных (плейлисты, сегменты, ошибки).
-//! - `parser` — парсинг master/media плейлистов из M3U8.
-//! - `manager` — HlsManager и логика работы с одним HLS-потоком.
-//! - `abr` — базовый контроллер адаптивного выбора варианта (ABR).
-//! - `downloader` — тонкая обёртка над `stream-download` для скачивания ресурсов.
+//! This crate is composed of several modules:
+//! - `model`: Core data structures (playlists, segments, errors).
+//! - `parser`: Parsing of master/media M3U8 playlists.
+//! - `manager`: `HlsManager` and the logic for handling a single HLS stream.
+//! - `abr`: A basic adaptive bitrate (ABR) controller.
+//! - `downloader`: A thin wrapper around `stream-download` for fetching resources.
+//! - `traits`: High-level traits for abstracting media stream sources.
 //!
-//! Данный файл (`lib.rs`) играет роль фасада: он реэкспортирует основные
-//! типы и функции из внутренних модулей, формируя внешний публичный API
-//! крейта `stream-download-hls`.
+//! This file (`lib.rs`) acts as a facade: it re-exports the main
+//! types and functions from the internal modules to form the public API
+//! of the `stream-download-hls` crate.
 
 mod abr;
 mod downloader;
 mod manager;
 mod model;
 mod parser;
+mod traits;
 
 pub use crate::model::{
     HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
@@ -39,7 +41,8 @@ pub use crate::downloader::ResourceDownloader;
 pub use crate::manager::HlsManager;
 pub use crate::model::diff_playlists;
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
+pub use crate::traits::{MediaStream, SegmentData};
 
-// Временный re-export Duration, пока мы активно используем его в публичных типах.
-// В дальнейшем может быть удалён, если типы будут инкапсулированы лучше.
+// Temporary re-export of Duration while it's actively used in public types.
+// This may be removed later if the types are better encapsulated.
 pub use std::time::Duration;

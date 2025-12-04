@@ -1,4 +1,3 @@
-/stream-download-rs/crates/stream-download-hls/src/manager.rs#L1-200
 //! HLS stream manager.
 //!
 //! This module provides [`HlsManager`], a high-level handle for working with a

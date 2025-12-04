@@ -1,18 +1,29 @@
 [package]
 name = "stream-download-hls"
-version = "0.0.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-description = "HLS (HTTP Live Streaming) extension for the stream-download crate"
-repository = "https://github.com/aschey/stream-download-rs"
-authors = ["Austin Schey <aschey13@gmail.com>"]
+version = "0.0.1"
+readme = "README.md"
+description = "HLS extension for stream-download"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include.workspace = true
+categories.workspace = true
+keywords.workspace = true
 
 [dependencies]
-# Core workspace dependencies
-stream-download = { path = "../stream-download" }
-thiserror = "2.0.3"
+stream-download = { version = "0.22.9", path = "../stream-download", default-features = false }
+tokio = { workspace = true, features = ["sync", "macros", "rt", "time"] }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
 hls_m3u8 = "0.4"
 
-[features]
-# Enable Tokio-based async helpers in this crate using the workspace Tokio dependency.
-tokio-runtime = ["tokio"]
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
