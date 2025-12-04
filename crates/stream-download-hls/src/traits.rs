@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::model::{CodecInfo, HlsResult, SegmentKey, VariantId, VariantStream};
 
@@ -21,7 +22,7 @@ pub struct SegmentData {
     /// Raw bytes of the media segment (e.g., a TS or fMP4 file).
     /// This data may still be encrypted if a `key` is present and the underlying
     /// implementation has not performed decryption.
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Uniquely identifies the variant (stream/rendition) this segment belongs to.
     /// A player can use this to detect when an adaptive bitrate switch has occurred.
     pub variant_id: VariantId,

@@ -10,6 +10,11 @@
 //! - A small helper (`diff_playlists`) for detecting new segments in live
 //!   playlists.
 
+use std::fmt::Debug;
+
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Result type used by this crate.
@@ -119,6 +124,10 @@ pub struct SegmentKey {
     pub key_info: Option<KeyInfo>,
 }
 
+/// Callback type used to transform raw key bytes fetched from a key server
+/// before they are used for decryption. This allows custom key wrapping/DRM flows.
+pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
+
 /// Basic representation of a master playlist.
 ///
 /// This intentionally captures only a small subset of HLS metadata needed
@@ -150,11 +159,21 @@ pub struct VariantStream {
 /// - `EXT-X-DISCONTINUITY` and other advanced tags are ignored for now.
 /// - Only enough information to sequence segments and detect new ones.
 #[derive(Debug, Clone)]
+pub struct InitSegment {
+    /// URL of the initialization segment (absolute or relative to playlist URI).
+    pub uri: String,
+    /// Optional encryption information effective for this init segment.
+    pub key: Option<SegmentKey>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MediaPlaylist {
     /// List of segments in the order they appear.
     pub segments: Vec<MediaSegment>,
     /// Target segment duration if present.
     pub target_duration: Option<Duration>,
+    /// Optional initialization segment (for fMP4 streams).
+    pub init_segment: Option<InitSegment>,
     /// Media sequence number of the first segment.
     pub media_sequence: u64,
     /// Whether the playlist is finished (VOD or live that ended).
@@ -190,17 +209,38 @@ pub struct NewSegment {
 /// Simple configuration for the PoC HLS manager.
 ///
 /// This will likely grow over time (buffer sizes, ABR knobs, etc.).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HlsConfig {
     /// Optional override for how often live playlists should be refreshed.
     /// If not set, `target_duration` from the playlist should be used.
     pub live_refresh_interval: Option<Duration>,
+
+    /// Optional callback to post-process a fetched AES key before use (e.g., unwrap DRM).
+    ///
+    /// Not Debug to keep HlsConfig debuggable without requiring function pointers to implement Debug.
+    pub key_processor_cb: Option<Arc<Box<KeyProcessorCallback>>>,
+    /// Optional query parameters appended to key fetch requests.
+    pub key_query_params: Option<HashMap<String, String>>,
+    /// Optional headers added to key fetch requests.
+    pub key_request_headers: Option<HashMap<String, String>>,
+}
+impl Debug for HlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HlsConfig")
+            .field("live_refresh_interval", &self.live_refresh_interval)
+            .field("key_query_params", &self.key_query_params)
+            .field("key_request_headers", &self.key_request_headers)
+            .finish()
+    }
 }
 
 impl Default for HlsConfig {
     fn default() -> Self {
         Self {
             live_refresh_interval: None,
+            key_processor_cb: None,
+            key_query_params: None,
+            key_request_headers: None,
         }
     }
 }
@@ -242,6 +282,7 @@ mod tests {
         let old = MediaPlaylist {
             segments: Vec::new(),
             target_duration: None,
+            init_segment: None,
             current_key: None,
             media_sequence: 1,
             end_list: false,
@@ -265,6 +306,7 @@ mod tests {
                 },
             ],
             target_duration: None,
+            init_segment: None,
             current_key: None,
             media_sequence: 1,
             end_list: false,
@@ -296,6 +338,7 @@ mod tests {
                 },
             ],
             target_duration: None,
+            init_segment: None,
             media_sequence: 5,
             end_list: false,
             current_key: None,
@@ -326,6 +369,7 @@ mod tests {
                 },
             ],
             target_duration: None,
+            init_segment: None,
             media_sequence: 6,
             end_list: false,
             current_key: None,

@@ -11,8 +11,8 @@ use hls_m3u8::types::PlaylistType;
 use std::time::Duration;
 
 use crate::model::{
-    EncryptionMethod, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
-    SegmentKey, VariantId, VariantStream,
+    EncryptionMethod, HlsError, HlsResult, InitSegment, KeyInfo, MasterPlaylist, MediaPlaylist,
+    MediaSegment, SegmentKey, VariantId, VariantStream,
 };
 
 /// Parse a master playlist (M3U8) into a [`MasterPlaylist`].
@@ -92,9 +92,33 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
         })
         .collect();
 
+    let init_segment = hls_media.segments.iter().next().and_then(|(_, seg)| {
+        seg.map.as_ref().map(|m| {
+            let map_key = m.keys().get(0).map(|k| {
+                let method = EncryptionMethod::Aes128;
+                let key_info = KeyInfo {
+                    method: method.clone(),
+                    uri: Some(k.uri().to_string()),
+                    iv: k.iv.to_slice(),
+                    key_format: k.format.as_ref().map(|s| s.to_string()),
+                    key_format_versions: k.versions.as_ref().map(|s| s.to_string()),
+                };
+                SegmentKey {
+                    method,
+                    key_info: Some(key_info),
+                }
+            });
+            InitSegment {
+                uri: m.uri().to_string(),
+                key: map_key,
+            }
+        })
+    });
+
     Ok(MediaPlaylist {
         segments,
         target_duration,
+        init_segment,
         media_sequence,
         end_list,
         current_key,

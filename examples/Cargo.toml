@@ -13,7 +13,7 @@ stream-download = { path = "../crates/stream-download", features = [
   "registry",
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal", optional = true }
-stream-download-hls = { path = "../crates/stream-download-hls", optional = true }
+stream-download-hls = { path = "../crates/stream-download-hls", optional = true, features = ["aes-decrypt"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 rodio = { workspace = true }
@@ -52,3 +52,8 @@ required-features = ["opendal"]
 [[example]]
 name = "hls_basic_playback"
 required-features = ["hls"]
+
+# A new example that pipes decrypted TS segments to mpv stdin for basic playback
+[[example]]
+name = "hls_playback_mpv"
+required-features = ["hls", "mpv"]

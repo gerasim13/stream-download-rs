@@ -1,5 +1,5 @@
 //! Thin wrapper around the `stream-download` crate.
-//
+//!
 //! This module provides a small, HLS-oriented API for downloading arbitrary
 //! HTTP resources (playlists, segments) using the `stream-download` crate as
 //! the underlying engine.
@@ -7,6 +7,7 @@
 use std::io::Read;
 use std::time::Duration;
 
+use bytes::Bytes;
 use reqwest::Url;
 use stream_download::Settings;
 use stream_download::StreamDownload;
@@ -52,14 +53,14 @@ impl ResourceDownloader {
         &self.config
     }
 
-    /// Download the resource at the given URL into memory as a `Vec<u8>`.
+    /// Download the resource at the given URL into memory as `Bytes`.
     ///
     /// This method leverages `stream-download` to fetch the content.
     pub async fn download_bytes(
         &self,
         url: &str,
         _ttl: Option<Duration>, // ttl is unused for now
-    ) -> HlsResult<Vec<u8>> {
+    ) -> HlsResult<Bytes> {
         let url = Url::parse(url).map_err(|e| HlsError::Io(e.to_string()))?;
         let mut reader = match StreamDownload::new_http(
             url,
@@ -79,6 +80,6 @@ impl ResourceDownloader {
         reader
             .read_to_end(&mut buffer)
             .map_err(|e| HlsError::Io(e.to_string()))?;
-        Ok(buffer)
+        Ok(Bytes::from(buffer))
     }
 }

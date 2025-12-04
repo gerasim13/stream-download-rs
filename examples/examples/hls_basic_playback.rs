@@ -14,17 +14,20 @@
 //! It serves as a "living specification" for the API design.
 
 use std::time::Duration;
-
 use stream_download_hls::{
     AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, HlsResult, MediaStream,
     ResourceDownloader,
 };
-use tracing::{info, warn};
+use tracing::{info, metadata::LevelFilter, warn};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> HlsResult<()> {
-    // Initialize a simple logger for tracing
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::default().add_directive(LevelFilter::INFO.into()))
+        .with_line_number(true)
+        .with_file(true)
+        .init();
 
     let master_playlist_url = "https://stream.silvercomet.top/hls/master.m3u8";
     info!("Initializing HLS stream from: {}", master_playlist_url);
@@ -59,18 +62,14 @@ async fn main() -> HlsResult<()> {
     // For AbrController, `init()` will initialize the underlying stream *and*
     // select the initial variant.
     info!("Initializing stream...");
-    if let Err(e) = stream.init().await {
-        warn!(
-            "Stream initialization failed as expected (implementation is a stub): {}",
-            e
-        );
-        // In a real scenario, we would abort here. For the sake of demonstrating
-        // the API flow, we'll continue with placeholder data.
-        // Once the implementation is ready, this warning and the following
-        // return can be removed.
-        return Ok(());
+    match stream.init().await {
+        Ok(()) => info!("Stream initialized successfully."),
+        Err(e) => {
+            // Don't exit early — continue to show variants and attempt fetching segments
+            // so the example always prints something useful.
+            warn!("Stream initialization failed: {}", e);
+        }
     }
-    info!("Stream initialized successfully.");
 
     // 3. Inspect available variants
     let variants = stream.variants();

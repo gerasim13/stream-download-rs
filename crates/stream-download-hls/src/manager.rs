@@ -21,6 +21,8 @@
 //! implementation is developed incrementally.
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use std::collections::HashMap;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{
@@ -59,6 +61,13 @@ pub struct HlsManager {
     current_variant_index: Option<usize>,
     /// Cached media playlist for the current variant.
     current_media_playlist: Option<MediaPlaylist>,
+
+    /// Cached media playlist URL for the current variant.
+    media_playlist_url: Option<String>,
+    /// Next segment index in the current media playlist.
+    next_segment_index: usize,
+    /// Cache of fetched AES-128 keys by absolute URI.
+    key_cache: HashMap<String, Bytes>,
 }
 
 impl HlsManager {
@@ -79,6 +88,9 @@ impl HlsManager {
             master: None,
             current_variant_index: None,
             current_media_playlist: None,
+            media_playlist_url: None,
+            next_segment_index: 0,
+            key_cache: HashMap::new(),
         }
     }
 
@@ -106,14 +118,9 @@ impl HlsManager {
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
-        let base_url = if let Some(media_playlist) = &self.current_media_playlist {
-            // If we have a media playlist, resolve relative to that.
-            // This is a simplification; a correct implementation would need to
-            // know the URL of the media playlist itself.
-            // For now, we'll assume it's relative to the master URL.
-            self.master_url.as_str()
+        let base_url = if let Some(ref media_playlist_url) = self.media_playlist_url {
+            media_playlist_url.as_str()
         } else {
-            // Otherwise, resolve relative to the master playlist URL.
             self.master_url.as_str()
         };
 
@@ -190,6 +197,8 @@ impl HlsManager {
         let media_playlist = parse_media_playlist(&data, variant.id)?;
         self.current_media_playlist = Some(media_playlist);
         self.current_variant_index = Some(index);
+        self.media_playlist_url = Some(media_playlist_url);
+        self.next_segment_index = 0;
 
         Ok(())
     }
@@ -257,6 +266,117 @@ impl MediaStream for HlsManager {
     }
 
     async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
-        todo!("Core media consumption loop will be implemented here");
+        use crate::model::EncryptionMethod;
+
+        let playlist = match &self.current_media_playlist {
+            Some(p) => p,
+            None => {
+                return Err(HlsError::Message(
+                    "no media playlist loaded; call select_variant first".to_string(),
+                ));
+            }
+        };
+
+        // End-of-stream handling for VOD
+        if self.next_segment_index >= playlist.segments.len() {
+            if playlist.end_list {
+                return Ok(None);
+            } else {
+                return Err(HlsError::Message(
+                    "live playlists not implemented yet".to_string(),
+                ));
+            }
+        }
+
+        let seg = &playlist.segments[self.next_segment_index];
+
+        // Resolve segment URL relative to media playlist
+        let seg_url = self.resolve_url(&seg.uri)?;
+
+        // Download segment bytes
+        let mut data = self.downloader.download_bytes(&seg_url, None).await?;
+
+        // If encrypted with AES-128 and key URI is present, fetch key and (optionally) decrypt.
+        if let Some(seg_key) = &seg.key {
+            if matches!(seg_key.method, EncryptionMethod::Aes128) {
+                if let Some(ref key_info) = seg_key.key_info {
+                    if let Some(ref key_uri) = key_info.uri {
+                        // Resolve key URL relative to media playlist URL
+                        let abs_key_url = self.resolve_url(key_uri)?;
+
+                        // Apply query params if configured
+                        let final_key_url = if let Some(params) = &self.config.key_query_params {
+                            let mut url = url::Url::parse(&abs_key_url)
+                                .map_err(|e| HlsError::Io(e.to_string()))?;
+                            {
+                                let mut qp = url.query_pairs_mut();
+                                for (k, v) in params {
+                                    qp.append_pair(k, v);
+                                }
+                            }
+                            url.to_string()
+                        } else {
+                            abs_key_url
+                        };
+
+                        // Fetch key (with cache)
+                        let key_bytes = if let Some(cached) = self.key_cache.get(&final_key_url) {
+                            cached.clone()
+                        } else {
+                            let mut kb =
+                                self.downloader.download_bytes(&final_key_url, None).await?;
+                            // Process key via callback if provided
+                            if let Some(cb) = &self.config.key_processor_cb {
+                                kb = (cb)(kb);
+                            }
+                            if kb.len() != 16 {
+                                return Err(HlsError::Message(format!(
+                                    "invalid AES-128 key length: expected 16, got {}",
+                                    kb.len()
+                                )));
+                            }
+                            self.key_cache.insert(final_key_url.clone(), kb.clone());
+                            kb
+                        };
+
+                        // Compute IV: prefer explicit IV, else derive from sequence per HLS spec
+                        let iv = if let Some(iv) = key_info.iv {
+                            iv
+                        } else {
+                            let mut iv = [0u8; 16];
+                            iv[8..].copy_from_slice(&seg.sequence.to_be_bytes());
+                            iv
+                        };
+
+                        data =
+                            crate::crypto::decrypt_aes128_cbc_full(key_bytes.as_ref(), &iv, data)?;
+                    }
+                }
+            }
+        }
+
+        // Prepare codec info from the selected variant
+        let codec_info = self
+            .master
+            .as_ref()
+            .and_then(|m| {
+                self.current_variant_index
+                    .and_then(|idx| m.variants.get(idx))
+            })
+            .and_then(|v| v.codec.clone());
+
+        let segment_data = SegmentData {
+            data,
+            variant_id: seg.variant_id,
+            codec_info,
+            key: seg.key.clone(),
+            sequence: seg.sequence,
+            duration: seg.duration,
+        };
+
+        // Advance to the next segment
+        self.next_segment_index += 1;
+
+        Ok(Some(segment_data))
     }
 }

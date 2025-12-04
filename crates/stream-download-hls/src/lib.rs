@@ -25,6 +25,7 @@
 //! of the `stream-download-hls` crate.
 
 mod abr;
+mod crypto;
 mod downloader;
 mod manager;
 mod model;
@@ -42,6 +43,7 @@ pub use crate::manager::HlsManager;
 pub use crate::model::diff_playlists;
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::traits::{MediaStream, SegmentData};
+pub use bytes::Bytes;
 
 // Temporary re-export of Duration while it's actively used in public types.
 // This may be removed later if the types are better encapsulated.
