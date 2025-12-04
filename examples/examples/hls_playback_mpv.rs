@@ -18,13 +18,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_file(true)
         .init();
 
-    // You can change this to any public HLS master playlist URL (TS or fMP4).
-    // For demo purposes we keep a default value; you can also pass a URL as the first CLI argument.
-    let master_playlist_url = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "https://stream.silvercomet.top/hls/master.m3u8".to_string());
+    // CLI: URL [--mode auto|manual] [--variant N]
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut master_playlist_url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
+    let mut start_mode = "manual".to_string();
+    let mut manual_index: Option<usize> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--mode" if i + 1 < args.len() => {
+                start_mode = args[i + 1].to_lowercase();
+                i += 2;
+            }
+            "--variant" if i + 1 < args.len() => {
+                if let Ok(idx) = args[i + 1].parse::<usize>() {
+                    manual_index = Some(idx);
+                }
+                i += 2;
+            }
+            other => {
+                if other.starts_with("http://") || other.starts_with("https://") {
+                    master_playlist_url = other.to_string();
+                }
+                i += 1;
+            }
+        }
+    }
 
     info!("Initializing HLS stream from: {master_playlist_url}");
+    if start_mode == "manual" {
+        if let Some(idx) = manual_index {
+            info!("Start mode: MANUAL (requested variant index: {})", idx);
+        } else {
+            info!("Start mode: MANUAL (no index provided; defaulting to 0)");
+        }
+    } else {
+        info!("Start mode: AUTO");
+    }
 
     // 1) Build components
     let downloader = ResourceDownloader::new(DownloaderConfig::default());
@@ -39,10 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let manager = HlsManager::new(master_playlist_url.clone(), hls_config, downloader);
 
-    // Wrap in ABR controller (AUTO mode)
+    // Wrap in ABR controller (AUTO by default; can switch to MANUAL via --mode/--variant)
     let abr_config = AbrConfig::default();
     let mut stream = AbrController::new(manager, abr_config, 0, 2_000_000.0);
-    stream.set_auto();
 
     // 2) Init the stream via ABR (loads master and selects initial variant)
     if let Err(e) = stream.init().await {
@@ -59,6 +89,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Found {} variants", variants.len());
     for v in variants {
         info!("  - id={}, bandwidth={:?}", v.id.0, v.bandwidth);
+    }
+
+    // Apply requested mode (AUTO/MANUAL)
+    if start_mode == "manual" {
+        let idx = manual_index.unwrap_or(0).min(variants.len() - 1);
+        let id = variants[idx].id;
+        info!(
+            "Switching to MANUAL mode with variant index {} (id={})",
+            idx, id.0
+        );
+        if let Err(e) = stream.set_manual(id).await {
+            warn!("Failed to switch to manual variant: {e}");
+        }
+    } else {
+        stream.set_auto();
     }
 
     // 3) Start mpv and pipe segments to its stdin.
@@ -103,9 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let inner = stream.inner_stream();
         if let Some(playlist) = inner.current_media_playlist() {
             if let Some(init) = &playlist.init_segment {
-                // Resolve media playlist URL using the first variant URI
+                // Resolve media playlist URL using the currently selected variant URI
                 let variants = stream.variants();
-                if let Some(v) = variants.get(0) {
+                let current = stream.current_variant_id();
+                let selected = current.and_then(|id| variants.iter().find(|v| v.id == id));
+                if let Some(v) = selected.or_else(|| variants.get(0)) {
                     let variant_uri = &v.uri;
                     let media_url = if variant_uri.starts_with("http") {
                         variant_uri.clone()
@@ -146,7 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Err(e) = stdin.write_all(&bytes) {
                     warn!("Failed to write init segment to mpv stdin: {e}");
                 }
-                let _ = stdin.flush();
+                if let Err(e) = stdin.flush() {
+                    warn!("Failed to flush init segment to mpv stdin: {e}");
+                }
             }
             Err(e) => {
                 warn!("Failed to download init segment: {e}");
