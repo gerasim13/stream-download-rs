@@ -20,11 +20,15 @@
 //! so that the interface compiles and can be used, while the internal
 //! implementation is developed incrementally.
 
+use async_trait::async_trait;
+
 use crate::downloader::ResourceDownloader;
 use crate::model::{
-    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment,
+    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, VariantId,
+    VariantStream,
 };
 use crate::parser::{parse_master_playlist, parse_media_playlist};
+use crate::traits::{MediaStream, SegmentData};
 
 /// High-level handle for working with a single HLS stream.
 ///
@@ -202,5 +206,25 @@ impl HlsManager {
         Err(HlsError::Message(
             "HlsManager::download_segment is not implemented yet".to_string(),
         ))
+    }
+}
+
+#[async_trait]
+impl MediaStream for HlsManager {
+    async fn init(&mut self) -> HlsResult<()> {
+        todo!("Will be implemented by calling self.load_master()");
+    }
+
+    fn variants(&self) -> &[VariantStream] {
+        todo!("Will be implemented by returning from self.master()");
+    }
+
+    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
+        let _ = variant_id; // avoid unused variable warning
+        todo!("Will be implemented by calling self.select_variant(variant_id.0)");
+    }
+
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
+        todo!("Core media consumption loop will be implemented here");
     }
 }

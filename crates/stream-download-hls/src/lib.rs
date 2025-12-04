@@ -36,8 +36,8 @@ pub use crate::model::{
     VariantStream,
 };
 
-pub use crate::abr::{AbrController, PlaybackMetrics};
-pub use crate::downloader::ResourceDownloader;
+pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
+pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
 pub use crate::manager::HlsManager;
 pub use crate::model::diff_playlists;
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};

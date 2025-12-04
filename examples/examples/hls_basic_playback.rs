@@ -16,8 +16,7 @@
 use std::time::Duration;
 
 use stream_download_hls::{
-    AbrConfig, AbrController,
-    DownloaderConfig, ResourceDownloader,
+    AbrConfig, AbrController, DownloaderConfig, ResourceDownloader,
     HlsConfig, HlsManager, HlsResult, MediaStream,
 };
 use tracing::{info, warn};
@@ -38,20 +37,21 @@ async fn main() -> HlsResult<()> {
     // The HlsManager is the core component that implements the HLS logic.
     let manager = HlsManager::new(master_playlist_url, hls_config, downloader);
 
-    // In a real application, you would likely use an AbrController to manage
-    // variant switching. For this basic example, we will interact with the
-    // manager directly, pretending to be a simple ABR.
+    // In a real application, you would wrap the HlsManager in an AbrController
+    // to enable automatic variant switching.
     let abr_config = AbrConfig::default();
-    // For this example, let's just pick the first variant.
+    // For this example, we'll start with the first variant found.
     let initial_variant_index = 0;
-    let mut abr_controller = AbrController::new(manager, abr_config, initial_variant_index);
+    let abr_controller = AbrController::new(manager, abr_config, initial_variant_index);
 
-    // The player will interact with the `MediaStream` trait, which abstracts
-    // away the HLS-specific implementation details.
-    let stream: &mut dyn MediaStream = abr_controller.manager_mut();
+    // The player interacts with the `MediaStream` trait. `AbrController` also
+    // implements `MediaStream`, adding its logic on top of the underlying stream.
+    // We use a Box to hold the trait object.
+    let mut stream: Box<dyn MediaStream> = Box::new(abr_controller);
 
     // 2. Initialize the stream
-    // This will fetch and parse the master playlist.
+    // For AbrController, `init()` will initialize the underlying stream *and*
+    // select the initial variant.
     info!("Initializing stream...");
     if let Err(e) = stream.init().await {
         warn!(
@@ -82,16 +82,13 @@ async fn main() -> HlsResult<()> {
         );
     }
 
-    // 4. Select a variant to start playback
-    // For this example, we'll just pick the first one.
-    // An ABR controller would make a more intelligent choice based on bandwidth.
-    if let Some(first_variant) = variants.first() {
-        info!("Selecting variant #{} for playback", first_variant.id.0);
-        stream.select_variant(first_variant.id).await?;
-    } else {
-        warn!("No variants found in the playlist.");
-        return Ok(());
-    }
+    // 4. Initial variant selection
+    // This step is no longer needed here, as the AbrController's `init` method
+    // has already selected the initial variant for us.
+    info!(
+        "Initial variant #{} was selected by the AbrController during init.",
+        initial_variant_index
+    );
 
     // 5. Fetch the first few segments
     info!("Fetching first 5 segments...");

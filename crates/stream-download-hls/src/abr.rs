@@ -15,7 +15,10 @@
 //! This allows consumers to start integrating the API while the internals
 //! are iterated on.
 
-use crate::{HlsError, HlsManager, HlsResult, MasterPlaylist};
+use async_trait::async_trait;
+
+use crate::model::{VariantId, VariantStream};
+use crate::{HlsError, HlsResult, MediaStream, SegmentData};
 
 /// Basic playback / network metrics used for ABR decisions.
 ///
@@ -68,68 +71,46 @@ impl Default for AbrConfig {
 /// This type does not perform any network I/O by itself: it calls into
 /// `HlsManager` for actual variant switching.
 #[derive(Debug)]
-pub struct AbrController {
-    manager: HlsManager,
+pub struct AbrController<S: MediaStream> {
+    stream: S,
     config: AbrConfig,
-    current_variant_index: usize,
+    /// The variant that the controller is currently targeting.
+    current_variant_id: Option<VariantId>,
+    initial_variant_index: usize,
 }
 
-impl AbrController {
-    /// Create a new ABR controller around an existing `HlsManager`.
+impl<S: MediaStream> AbrController<S> {
+    /// Create a new ABR controller that wraps a `MediaStream` implementation.
     ///
-    /// For now we require the caller to supply the initial variant index.
-    /// In the future we may add helpers that pick the initial index based
-    /// on advertised bandwidths in the master playlist.
-    pub fn new(manager: HlsManager, config: AbrConfig, initial_variant_index: usize) -> Self {
+    /// The controller will use the provided `stream` to fetch segments and will
+    /// add adaptive bitrate logic on top of it.
+    ///
+    /// # Arguments
+    /// * `stream`: The underlying `MediaStream` (e.g., an `HlsManager`).
+    /// * `config`: Configuration for the ABR algorithm.
+    /// * `initial_variant_index`: The index of the variant to start with.
+    pub fn new(stream: S, config: AbrConfig, initial_variant_index: usize) -> Self {
         Self {
-            manager,
+            stream,
             config,
-            current_variant_index: initial_variant_index,
+            current_variant_id: None,
+            initial_variant_index,
         }
     }
 
-    /// Get a reference to the underlying `HlsManager`.
-    pub fn manager(&self) -> &HlsManager {
-        &self.manager
+    /// Get a reference to the underlying `MediaStream`.
+    pub fn inner_stream(&self) -> &S {
+        &self.stream
     }
 
-    /// Get a mutable reference to the underlying `HlsManager`.
-    ///
-    /// This is useful for calling methods that are not directly proxied
-    /// by `AbrController`, such as low-level playlist operations.
-    pub fn manager_mut(&mut self) -> &mut HlsManager {
-        &mut self.manager
+    /// Get a mutable reference to the underlying `MediaStream`.
+    pub fn inner_stream_mut(&mut self) -> &mut S {
+        &mut self.stream
     }
 
-    /// Get the current variant index known to the controller.
-    pub fn current_variant_index(&self) -> usize {
-        self.current_variant_index
-    }
-
-    /// Initialize the controller from the master playlist.
-    ///
-    /// In a full implementation this might:
-    /// - validate `initial_variant_index` against the playlist,
-    /// - potentially adjust the initial index based on bandwidths
-    ///   and the advertised information in `MasterPlaylist`.
-    ///
-    /// For now this method simply performs basic validation.
-    pub fn validate_initial_variant(&self, master: &MasterPlaylist) -> HlsResult<()> {
-        if master.variants.is_empty() {
-            return Err(HlsError::Message(
-                "master playlist has no variants".to_string(),
-            ));
-        }
-
-        if self.current_variant_index >= master.variants.len() {
-            return Err(HlsError::Message(format!(
-                "initial variant index {} out of range ({} variants)",
-                self.current_variant_index,
-                master.variants.len()
-            )));
-        }
-
-        Ok(())
+    /// Get the ID of the variant currently targeted by the controller.
+    pub fn current_variant_id(&self) -> Option<VariantId> {
+        self.current_variant_id
     }
 
     /// Potentially switch to a different variant based on the provided
@@ -141,18 +122,72 @@ impl AbrController {
     /// under development.
     ///
     /// Expected future behavior:
-    /// - Inspect `master` and `metrics`.
-    /// - Choose a new variant index (which may be the same as the current).
-    /// - If different, call into `HlsManager` to perform the switch and
-    ///   update `current_variant_index`.
-    pub async fn maybe_switch(
-        &mut self,
-        _master: &MasterPlaylist,
-        _metrics: &PlaybackMetrics,
-    ) -> HlsResult<()> {
+    /// - Inspect `self.stream.variants()` and `metrics`.
+    /// - Choose a new variant ID.
+    /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
+    pub async fn maybe_switch(&mut self, _metrics: &PlaybackMetrics) -> HlsResult<()> {
         // Stub implementation:
         // - Do nothing and keep the current variant.
         // - Return Ok so the control flow can be tested by callers.
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
+    async fn init(&mut self) -> HlsResult<()> {
+        self.stream.init().await?;
+
+        // After init, the variants are available. Let's select the initial one.
+        // We get the id first to solve a borrow checker issue, since `select_variant`
+        // needs a mutable borrow of `self.stream` while the variant list is also
+        // being borrowed.
+        let initial_variant_id = self
+            .stream
+            .variants()
+            .get(self.initial_variant_index)
+            .map(|v| v.id);
+
+        if let Some(id) = initial_variant_id {
+            self.stream.select_variant(id).await?;
+            self.current_variant_id = Some(id);
+            Ok(())
+        } else if self.stream.variants().is_empty() {
+            // This is a valid state for master playlists with no variants.
+            Ok(())
+        } else {
+            Err(HlsError::msg(format!(
+                "initial_variant_index {} is out of bounds for {} variants",
+                self.initial_variant_index,
+                self.stream.variants().len()
+            )))
+        }
+    }
+
+    fn variants(&self) -> &[VariantStream] {
+        self.stream.variants()
+    }
+
+    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
+        // an ABR controller should allow manual override of the variant.
+        self.current_variant_id = Some(variant_id);
+        self.stream.select_variant(variant_id).await
+    }
+
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
+        // In a real player, metrics would be collected from the playback loop
+        // (buffer level, download speed, etc.) and passed here.
+        let metrics = PlaybackMetrics {
+            throughput_bps: 5_000_000,
+            buffer_seconds: 30.0,
+            dropped_frames: 0,
+        };
+
+        // 1. Run the ABR logic to decide if we should switch streams.
+        // The `maybe_switch` method will internally call `self.stream.select_variant()`.
+        self.maybe_switch(&metrics).await?;
+
+        // 2. Fetch the next segment from the underlying stream.
+        self.stream.next_segment().await
     }
 }
