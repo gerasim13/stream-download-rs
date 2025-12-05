@@ -30,7 +30,6 @@ use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::default::{get_codecs, get_probe};
-use symphonia_core::codecs::CodecParameters;
 use symphonia_core::formats::probe::Hint;
 
 /// Internal backend selector for the audio source.
@@ -139,7 +138,7 @@ impl AudioStream {
         // Spawn decoding worker on a dedicated thread.
         thread::spawn(move || {
             // Open HLS MediaSourceStream (spawns its own async producer internally).
-            tracing::debug!(
+            tracing::trace!(
                 "HLS backend: opening MediaSourceStream for URL: {}",
                 url_clone
             );
@@ -160,7 +159,7 @@ impl AudioStream {
             // Keep the HLS source controller alive for the lifetime of this decode worker.
             let mut controller = Some(controller);
 
-            tracing::debug!("HLS backend: MSS created, starting probe...");
+            tracing::trace!("HLS backend: MSS created, starting probe...");
 
             // No specific hint required; Symphonia should detect fMP4/ADTS from bytes.
             let hint = Hint::new();
@@ -181,19 +180,19 @@ impl AudioStream {
                     return;
                 }
             };
-            debug!(
+            trace!(
                 "HLS backend: probe OK, format='{}'",
                 format.format_info().short_name
             );
 
             let container_name = Some(format.format_info().short_name.to_string());
-            debug!("HLS backend: selecting default audio track...");
+            trace!("HLS backend: selecting default audio track...");
 
             // Select the default audio track.
             let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
                 Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
                     Some(ap) => {
-                        debug!(
+                        trace!(
                             "HLS backend: selected track id={} sr={:?} ch={:?}",
                             t.id,
                             ap.sample_rate,
@@ -220,7 +219,7 @@ impl AudioStream {
 
             // Build the decoder using dev-0.6 API with owned audio params.
             let dec_opts = AudioDecoderOptions::default();
-            debug!("HLS backend: creating audio decoder...");
+            trace!("HLS backend: creating audio decoder...");
             let mut decoder = match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts)
             {
                 Ok(d) => d,
@@ -232,13 +231,13 @@ impl AudioStream {
                     return;
                 }
             };
-            debug!("HLS backend: decoder created, enabling seek gate.");
+            trace!("HLS backend: decoder created, enabling seek gate.");
             if let Some(ctrl) = &controller {
                 ctrl.enable_seek();
             }
             let mut pkt_counter: u64 = 0;
             let mut total_decoded_frames: u64 = 0;
-            debug!(
+            trace!(
                 "HLS backend: seek gate enabled, entering decode loop. pkt_counter={} total_frames={}",
                 pkt_counter, total_decoded_frames
             );
@@ -252,7 +251,7 @@ impl AudioStream {
             // Decode loop: read packets, decode, convert to f32, push into ring buffer.
             loop {
                 pkt_counter = pkt_counter.saturating_add(1);
-                debug!("HLS backend: next_packet() call #{}", pkt_counter);
+                trace!("HLS backend: next_packet() call #{}", pkt_counter);
                 match format.next_packet() {
                     Ok(Some(packet)) => {
                         if packet.track_id() != track_id {
@@ -270,11 +269,10 @@ impl AudioStream {
                                 let needed = chans * frames;
                                 total_decoded_frames =
                                     total_decoded_frames.saturating_add(frames as u64);
-                                debug!(
+                                trace!(
                                     "HLS backend: decoded packet #{} -> {} frames ({} ch), total_decoded_frames={}",
                                     pkt_counter, frames, chans, total_decoded_frames
                                 );
-                                trace!("HLS backend: decoded {} frames ({} ch)", frames, chans);
 
                                 // Resize temp buffer to exact length and copy as interleaved f32.
                                 tmp.resize(needed, 0.0);
@@ -288,7 +286,7 @@ impl AudioStream {
                                         channels: ds.channels().count() as u16,
                                     };
                                     *spec_clone.lock().unwrap() = new_spec;
-                                    debug!(
+                                    trace!(
                                         "HLS backend: first audio frame -> FormatChanged rate={}Hz ch={}",
                                         new_spec.sample_rate, new_spec.channels
                                     );
@@ -482,7 +480,7 @@ impl AudioStream {
 
             rt.block_on(async move {
                 // Open a seek-gated MediaSourceStream.
-                debug!("HTTP backend: opening seek-gated MSS for URL: {}", url_clone);
+                trace!("HTTP backend: opening seek-gated MSS for URL: {}", url_clone);
                 let (mss, gate) = match open_http_seek_gated_mss(&url_clone).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -493,7 +491,7 @@ impl AudioStream {
                         return;
                     }
                 };
-                debug!("HTTP backend: MSS created, starting probe...");
+                trace!("HTTP backend: MSS created, starting probe...");
 
                 // Prepare a probe hint using the URL extension (if any).
                 let mut hint = Hint::new();
@@ -517,19 +515,19 @@ impl AudioStream {
                         return;
                     }
                 };
-                debug!(
+                trace!(
                     "HTTP backend: probe OK, format='{}'",
                     format.format_info().short_name
                 );
 
                 let container_name = Some(format.format_info().short_name.to_string());
-                debug!("HTTP backend: selecting default audio track...");
+                trace!("HTTP backend: selecting default audio track...");
 
                 // Select the default audio track.
                 let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
                     Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
                         Some(ap) => {
-                            debug!("HTTP backend: selected track id={} sr={:?} ch={:?}", t.id, ap.sample_rate, ap.channels.clone().map(|c| c.count()));
+                            trace!("HTTP backend: selected track id={} sr={:?} ch={:?}", t.id, ap.sample_rate, ap.channels.clone().map(|c| c.count()));
                             (t.id, ap)
                         }
                         None => {
@@ -551,7 +549,7 @@ impl AudioStream {
 
                 // Build the decoder using dev-0.6 API with owned audio params.
                 let dec_opts = AudioDecoderOptions::default();
-                debug!("HTTP backend: creating audio decoder...");
+                trace!("HTTP backend: creating audio decoder...");
                 let mut decoder =
                     match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts) {
                         Ok(d) => d,
@@ -563,11 +561,11 @@ impl AudioStream {
                             return;
                         }
                     };
-                debug!("HTTP backend: decoder created, enabling seek gate.");
+                trace!("HTTP backend: decoder created, enabling seek gate.");
 
                 // Enable seeking now that the decoder is initialized.
                 gate.enable_seek();
-                debug!("HTTP backend: seek gate enabled, entering decode loop.");
+                trace!("HTTP backend: seek gate enabled, entering decode loop.");
 
                 // Defer FormatChanged until after the first decoded frame to get accurate spec.
 
@@ -607,7 +605,7 @@ impl AudioStream {
                                             channels: ds.channels().count() as u16,
                                         };
                                         *spec_clone.lock().unwrap() = new_spec;
-                                        debug!(
+                                        trace!(
                                             "HTTP backend: first audio frame -> FormatChanged rate={}Hz ch={}",
                                             new_spec.sample_rate, new_spec.channels
                                         );

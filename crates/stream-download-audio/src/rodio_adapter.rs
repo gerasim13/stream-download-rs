@@ -3,7 +3,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use rodio::Source;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{AudioSpec, AudioStream, FloatSampleSource};
 
@@ -79,7 +79,7 @@ impl Iterator for RodioSourceAdapter {
                 tries += 1;
             }
             if self.cursor >= self.pending.len() {
-                debug!(
+                trace!(
                     "rodio: ring still empty after {} retries, will emit silence",
                     MAX_TRIES
                 );

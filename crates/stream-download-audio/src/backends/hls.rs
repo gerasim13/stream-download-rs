@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 
 use kanal as kchan;
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 
 use stream_download_hls::{
     DownloaderConfig, HlsConfig, HlsManager, MediaStream, ResourceDownloader, VariantStream,
@@ -49,7 +49,7 @@ impl HlsMediaSource {
                 // New chunk begins at the current absolute position.
                 self.base_pos = self.pos;
                 let len = chunk.len();
-                debug!(
+                trace!(
                     "HLSMediaSource::refill: received chunk bytes={} base_pos={} pos={}",
                     len, self.base_pos, self.pos
                 );
@@ -59,7 +59,7 @@ impl HlsMediaSource {
             Err(_) => {
                 // Producer dropped; mark EOF.
                 self.eof = true;
-                debug!(
+                trace!(
                     "HLSMediaSource::refill: channel closed -> EOF at pos={} base_pos={}",
                     self.pos, self.base_pos
                 );
@@ -150,7 +150,7 @@ impl Read for HlsMediaSource {
         let want = out.len();
         let n = self.cur.read(out)?;
         self.pos = self.base_pos + self.cur.position() as u64;
-        debug!(
+        trace!(
             "HLSMediaSource::read: requested={} returned={} pos={} base_pos={} cur_pos={}",
             want,
             n,
@@ -417,7 +417,7 @@ pub fn open_hls_media_source(
                     Ok(Some(seg)) => {
                         // Convert Bytes to Vec<u8>
                         let chunk = seg.data.to_vec();
-                        debug!(
+                        trace!(
                             "HLS: sending segment seq={} bytes={}",
                             seg.sequence,
                             chunk.len()
@@ -429,11 +429,11 @@ pub fn open_hls_media_source(
                     }
                     Ok(None) => {
                         // End of VOD playlist.
-                        debug!("HLS: end of stream reached (playlist ENDLIST or no more segments)");
+                        trace!("HLS: end of stream reached (playlist ENDLIST or no more segments)");
                         break;
                     }
                     Err(e) => {
-                        error!("HLS: next_segment error: {e:?}");
+                        trace!("HLS: next_segment error: {e:?}");
                         // Decide whether to continue or break; for now, break on errors.
                         break;
                     }
