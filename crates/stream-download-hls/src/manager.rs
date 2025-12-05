@@ -479,6 +479,12 @@ impl MediaStream for HlsManager {
 
             // VOD end-of-stream
             if playlist.end_list {
+                tracing::debug!(
+                    "HlsManager: returning None (EOF). end_list=true media_sequence={} last_seg_seq={:?} total_segments={}",
+                    playlist.media_sequence,
+                    playlist.segments.last().map(|s| s.sequence),
+                    playlist.segments.len()
+                );
                 return Ok(None);
             }
 
@@ -495,12 +501,31 @@ impl MediaStream for HlsManager {
                 .current_media_playlist
                 .as_ref()
                 .expect("playlist just refreshed");
+            tracing::debug!(
+                "HlsManager: refreshed media playlist. media_sequence={} last_seq={} total_segments={}",
+                new_pl.media_sequence,
+                last_seq,
+                new_pl.segments.len()
+            );
 
             // Try to find the first truly new segment (sequence greater than last_seq)
             if let Some(idx) = new_pl.segments.iter().position(|s| s.sequence > last_seq) {
+                tracing::debug!(
+                    "HlsManager: found new segment after refresh: last_seq={} first_new_idx={} first_new_seq={}",
+                    last_seq,
+                    idx,
+                    new_pl.segments[idx].sequence
+                );
                 self.next_segment_index = idx;
                 // Loop will try again and fetch this segment
                 continue;
+            } else {
+                tracing::debug!(
+                    "HlsManager: no new segments after refresh. last_seq={} total_segments={} end_list={}",
+                    last_seq,
+                    new_pl.segments.len(),
+                    new_pl.end_list
+                );
             }
 
             // No new segments yet; wait and try again

@@ -1,4 +1,5 @@
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -22,20 +23,31 @@ pub struct HlsMediaSource {
     rx: kchan::Receiver<Vec<u8>>,
     cur: std::io::Cursor<Vec<u8>>,
     eof: bool,
+    // Virtual absolute position from the beginning of the concatenated stream.
+    pos: u64,
+    // Absolute position at the start of the current `cur` buffer.
+    base_pos: u64,
+    // Seek gate flag to control when seeking is allowed (disabled during probe).
+    seek_enabled: Arc<AtomicBool>,
 }
 
 impl HlsMediaSource {
-    fn new(rx: kchan::Receiver<Vec<u8>>) -> Self {
+    fn new(rx: kchan::Receiver<Vec<u8>>, seek_enabled: Arc<AtomicBool>) -> Self {
         Self {
             rx,
             cur: std::io::Cursor::new(Vec::new()),
             eof: false,
+            pos: 0,
+            base_pos: 0,
+            seek_enabled,
         }
     }
 
     fn refill(&mut self) -> IoResult<()> {
         match self.rx.recv() {
             Ok(chunk) => {
+                // New chunk begins at the current absolute position.
+                self.base_pos = self.pos;
                 self.cur = std::io::Cursor::new(chunk);
                 Ok(())
             }
@@ -43,6 +55,70 @@ impl HlsMediaSource {
                 // Producer dropped; mark EOF.
                 self.eof = true;
                 Ok(())
+            }
+        }
+    }
+    /// Forward-only seek to an absolute target position.
+    ///
+    /// - If target is ahead of the current position, this will read/discard bytes
+    ///   from the current and subsequent chunks until reaching `target`, blocking
+    ///   for new chunks as needed.
+    /// - If target falls within the current chunk (including backwards within it),
+    ///   this will adjust the cursor within `cur`.
+    /// - Seeking backwards outside the current chunk, or seeking relative to End, is unsupported.
+    fn seek_to_forward_only(&mut self, target: u64) -> IoResult<u64> {
+        if target == self.pos {
+            return Ok(self.pos);
+        }
+
+        // If target lies within the current buffer (even if it's behind),
+        // adjust the local cursor position.
+        let cur_len = self.cur.get_ref().len() as u64;
+        let cur_off = self.cur.position() as u64;
+        if target >= self.base_pos && target <= self.base_pos + cur_len {
+            let new_off = target - self.base_pos;
+            self.cur.set_position(new_off);
+            self.pos = self.base_pos + new_off;
+            return Ok(self.pos);
+        }
+
+        // If target is behind and not within current buffer, we cannot seek.
+        if target < self.pos {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "backward seek not supported for HLS stream",
+            ));
+        }
+
+        // Otherwise, target is ahead; discard until we reach it.
+        loop {
+            // Consume remaining bytes in current buffer first.
+            let cur_len = self.cur.get_ref().len() as u64;
+            let cur_off = self.cur.position() as u64;
+
+            if self.pos < target {
+                if cur_off < cur_len {
+                    let rem_in_buf = cur_len - cur_off;
+                    let need = target - self.pos;
+                    let step = rem_in_buf.min(need) as u64;
+                    // Advance within buffer.
+                    self.cur.set_position(cur_off + step);
+                    self.pos += step;
+                    if self.pos == target {
+                        return Ok(self.pos);
+                    }
+                } else {
+                    // Need next chunk.
+                    self.refill()?;
+                    if self.eof {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "cannot seek forward: stream ended",
+                        ));
+                    }
+                }
+            } else {
+                return Ok(self.pos);
             }
         }
     }
@@ -62,24 +138,55 @@ impl Read for HlsMediaSource {
             }
         }
 
-        self.cur.read(out)
+        let n = self.cur.read(out)?;
+        self.pos = self.base_pos + self.cur.position() as u64;
+        Ok(n)
     }
 }
 
 impl Seek for HlsMediaSource {
-    fn seek(&mut self, _pos: SeekFrom) -> IoResult<u64> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "seek not supported for HLS stream",
-        ))
+    fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
+        // Gate seeks until decoder is initialized to avoid tail-probing during probe.
+        if !self.seek_enabled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "seek disabled during probe",
+            ));
+        }
+        match pos {
+            SeekFrom::Start(n) => self.seek_to_forward_only(n),
+            SeekFrom::Current(off) => {
+                if off >= 0 {
+                    let target = self.pos.saturating_add(off as u64);
+                    self.seek_to_forward_only(target)
+                } else {
+                    // Attempt a limited backward seek within the current buffer.
+                    let back = (-off) as u64;
+                    if back <= self.cur.position() as u64 {
+                        let new_off = self.cur.position() as u64 - back;
+                        self.cur.set_position(new_off);
+                        self.pos = self.base_pos + new_off;
+                        Ok(self.pos)
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "backward seek outside current chunk is not supported",
+                        ))
+                    }
+                }
+            }
+            SeekFrom::End(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "seek from end is not supported (unknown length)",
+            )),
+        }
     }
 }
 
 impl MediaSource for HlsMediaSource {
     fn is_seekable(&self) -> bool {
-        // Live HLS is inherently non-seekable. For VOD, seek support can be added later
-        // by implementing segment indexing and range re-fetch.
-        false
+        // Seekability is gated: disabled during probe; can be enabled after decoder init.
+        self.seek_enabled.load(Ordering::Relaxed)
     }
 
     fn byte_len(&self) -> Option<u64> {
@@ -94,9 +201,15 @@ impl MediaSource for HlsMediaSource {
 pub struct HlsSourceController {
     stop_tx: kchan::Sender<()>,
     join: Option<JoinHandle<()>>,
+    seek_flag: Arc<AtomicBool>,
 }
 
 impl HlsSourceController {
+    /// Enable seek on the underlying `HlsMediaSource` (typically after probe/decoder init).
+    pub fn enable_seek(&self) {
+        self.seek_flag.store(true, Ordering::Relaxed);
+    }
+
     /// Signal the background producer to stop and wait for it to finish.
     pub fn stop(mut self) {
         let _ = self.stop_tx.send(());
@@ -116,7 +229,7 @@ impl Drop for HlsSourceController {
 ///
 /// This function:
 /// - Spawns a background thread with a Tokio runtime,
-/// - Initializes `HlsManager`, selects a variant (either the lowest bandwidth or index 0 if unknown),
+/// - Initializes `HlsManager`, selects a variant (either the provided index or the lowest bandwidth),
 /// - Streams the init segment (if present),
 /// - Then continuously fetches media segments and sends them to the `HlsMediaSource` via a channel.
 ///
@@ -124,9 +237,14 @@ impl Drop for HlsSourceController {
 /// - The returned `MediaSourceStream` is non-seekable.
 /// - For live streams, this will run indefinitely until stopped through the controller or until EOF.
 /// - For VOD streams, EOF is naturally reached when `#EXT-X-ENDLIST` and segments end.
+///
+/// Parameters:
+/// - `initial_variant_index`: Optional index into the master playlist variants to select initially.
+///    If `None` or out of bounds, the lowest bandwidth variant is selected.
 pub fn open_hls_media_source(
     url: &str,
     hls_config: HlsConfig,
+    initial_variant_index: Option<usize>,
 ) -> IoResult<(MediaSourceStream, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::unbounded::<Vec<u8>>();
     let (stop_tx, stop_rx) = kchan::unbounded::<()>();
@@ -169,11 +287,14 @@ pub fn open_hls_media_source(
                 }
             };
 
-            let chosen_index = select_variant_index(master.variants.as_slice());
+            let chosen_index = initial_variant_index
+                .filter(|&i| i < master.variants.len())
+                .unwrap_or_else(|| select_variant_index(master.variants.as_slice()));
             info!(
-                "HLS: selecting variant index {} of {}",
+                "HLS: selecting variant index {} of {} (initial={:?})",
                 chosen_index,
-                master.variants.len()
+                master.variants.len(),
+                initial_variant_index
             );
 
             if let Err(e) = manager.select_variant(chosen_index).await {
@@ -232,7 +353,10 @@ pub fn open_hls_media_source(
         });
     });
 
-    let source = HlsMediaSource::new(data_rx);
+    // Initialize seek gate disabled; playback code can enable after decoder init.
+    let seek_flag = Arc::new(AtomicBool::new(false));
+
+    let source = HlsMediaSource::new(data_rx, seek_flag.clone());
     let mss = MediaSourceStream::new(
         Box::new(source) as Box<dyn MediaSource>,
         MediaSourceStreamOptions::default(),
@@ -243,6 +367,7 @@ pub fn open_hls_media_source(
         HlsSourceController {
             stop_tx,
             join: Some(join),
+            seek_flag,
         },
     ))
 }

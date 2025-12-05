@@ -131,6 +131,10 @@ impl AudioStream {
         let spec_clone = spec.clone();
         let producer_clone = producer.clone();
         let hls_cfg = hls_config.clone();
+        let initial_variant_idx = match opts.initial_mode {
+            crate::api::VariantMode::Manual(i) => Some(i),
+            _ => None,
+        };
 
         // Spawn decoding worker on a dedicated thread.
         thread::spawn(move || {
@@ -139,17 +143,20 @@ impl AudioStream {
                 "HLS backend: opening MediaSourceStream for URL: {}",
                 url_clone
             );
-            let (mss, controller) =
-                match crate::backends::hls::open_hls_media_source(&url_clone, hls_cfg) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("HLS backend: open failed: {e}");
-                        events_clone.send(PlayerEvent::Error {
-                            message: format!("HLS open failed: {e}"),
-                        });
-                        return;
-                    }
-                };
+            let (mss, controller) = match crate::backends::hls::open_hls_media_source(
+                &url_clone,
+                hls_cfg,
+                initial_variant_idx,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("HLS backend: open failed: {e}");
+                    events_clone.send(PlayerEvent::Error {
+                        message: format!("HLS open failed: {e}"),
+                    });
+                    return;
+                }
+            };
             // Keep the HLS source controller alive for the lifetime of this decode worker.
             let mut controller = Some(controller);
 
@@ -225,11 +232,17 @@ impl AudioStream {
                     return;
                 }
             };
-            debug!("HLS backend: decoder created, entering decode loop.");
+            debug!("HLS backend: decoder created, enabling seek gate.");
+            if let Some(ctrl) = &controller {
+                ctrl.enable_seek();
+            }
+            debug!("HLS backend: seek gate enabled, entering decode loop.");
 
             // Temporary interleaved buffer for converted f32 samples.
             let mut tmp: Vec<f32> = Vec::new();
             let mut signalled_format = false;
+            // Count consecutive unexpected EOFs to treat VOD end as graceful EOF.
+            let mut eof_retry_count: u32 = 0;
 
             // Decode loop: read packets, decode, convert to f32, push into ring buffer.
             loop {
@@ -243,6 +256,8 @@ impl AudioStream {
                             Ok(decoded) => {
                                 // Convert to a generic buffer reference and then to interleaved f32.
                                 let gab: GenericAudioBufferRef = decoded;
+                                // Reset EOF retry counter on successful decode.
+                                eof_retry_count = 0;
                                 let chans = gab.num_planes();
                                 let frames = gab.frames();
                                 let needed = chans * frames;
@@ -317,11 +332,74 @@ impl AudioStream {
                         break;
                     }
                     Err(e) => {
-                        error!("HLS backend: next_packet error: {e}");
-                        events_clone.send(PlayerEvent::Error {
-                            message: format!("next_packet error: {e}"),
-                        });
-                        break;
+                        let msg = e.to_string();
+                        // Heuristic handling for segmented fMP4 (isomp4) over streaming:
+                        // - Unexpected EOF while more data is expected: backoff and retry.
+                        // - Reset-required style errors: try to rebuild decoder from current track params.
+                        if msg.contains("unexpected end of file")
+                            || msg.contains("end of file")
+                            || msg.contains("unexpected eof")
+                        {
+                            // Allow more bytes to arrive from the producer before retrying.
+                            eof_retry_count = eof_retry_count.saturating_add(1);
+                            if eof_retry_count > 50 {
+                                // Treat repeated EOFs as graceful end-of-stream (VOD finished).
+                                info!(
+                                    "HLS backend: repeated unexpected EOFs, treating as EndOfStream"
+                                );
+                                events_clone.send(PlayerEvent::EndOfStream);
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        } else if msg.to_ascii_lowercase().contains("reset")
+                            || msg.contains("ResetRequired")
+                        {
+                            debug!(
+                                "HLS backend: packet stream signalled reset; attempting to rebuild decoder"
+                            );
+                            // Try to get fresh audio params from the current default audio track.
+                            if let Some(t) = format.default_track(TrackType::Audio) {
+                                if let Some(ap) =
+                                    t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned()
+                                {
+                                    match get_codecs().make_audio_decoder(&ap, &dec_opts) {
+                                        Ok(new_dec) => {
+                                            decoder = new_dec;
+                                            // Re-emit format on next decoded frame.
+                                            signalled_format = false;
+                                            debug!(
+                                                "HLS backend: decoder successfully rebuilt after reset"
+                                            );
+                                            continue;
+                                        }
+                                        Err(e2) => {
+                                            error!(
+                                                "HLS backend: failed to rebuild decoder after reset: {e2}"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    error!(
+                                        "HLS backend: reset indicated but no audio params on selected track"
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "HLS backend: reset indicated but no default audio track found"
+                                );
+                            }
+                            events_clone.send(PlayerEvent::Error {
+                                message: format!("decoder reset failed after error: {msg}"),
+                            });
+                            break;
+                        } else {
+                            error!("HLS backend: next_packet error: {msg}");
+                            events_clone.send(PlayerEvent::Error {
+                                message: format!("next_packet error: {msg}"),
+                            });
+                            break;
+                        }
                     }
                 }
             }
