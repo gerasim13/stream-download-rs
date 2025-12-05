@@ -102,7 +102,7 @@ impl Default for AudioOptions {
             initial_mode: VariantMode::Auto,
             target_sample_rate: 48_000,
             target_channels: 2,
-            ring_capacity_frames: 2048, // ~42.6ms @ 48kHz stereo
+            ring_capacity_frames: 8192, // ~170ms @ 48kHz
             abr_min_switch_interval: Duration::from_millis(4000),
             abr_up_hysteresis_ratio: 0.15,
         }

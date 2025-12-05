@@ -4,16 +4,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use rodio::{OutputStreamBuilder, Sink};
-
 use stream_download_audio::{AudioOptions, AudioStream, PlayerEvent, adapt_to_rodio};
+use tracing::trace;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 fn default_url() -> String {
     // Use env var to override if needed. Note that spaces in URLs should be percent-encoded.
     let raw = env::var("AUDIO_MP3_URL").unwrap_or_else(|_| {
-        // Original test URL (with spaces) from the prompt:
-        // "http://www.hyperion-records.co.uk/audiotest/14 Clementi Piano Sonata in D major, Op 25 No 6 - Movement 2 Un poco andante.MP3"
-        // We'll return a percent-encoded variant to ensure proper fetching.
-        "http://www.hyperion-records.co.uk/audiotest/14%20Clementi%20Piano%20Sonata%20in%20D%20major,%20Op%2025%20No%206%20-%20Movement%202%20Un%20poco%20andante.MP3".to_string()
+        "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3".to_string()
     });
 
     // If the env var contains spaces, encode them; otherwise return as is.
@@ -45,6 +44,12 @@ fn parse_args() -> String {
 }
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::default().add_directive(LevelFilter::DEBUG.into()))
+        .with_line_number(true)
+        .with_file(true)
+        .init();
+
     let url = parse_args();
 
     eprintln!("audio_mp3 (stream-download-audio)");
@@ -68,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     thread::spawn(move || {
         while let Ok(ev) = events_rx.recv() {
             match ev {
-                PlayerEvent::Started => eprintln!("[event] pipeline started"),
+                PlayerEvent::Started => trace!("[event] pipeline started"),
                 PlayerEvent::FormatChanged {
                     sample_rate,
                     channels,
@@ -81,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     );
                 }
                 PlayerEvent::BufferLevel { decoded_frames } => {
-                    eprintln!("[event] buffer: {} frames decoded", decoded_frames);
+                    trace!("[event] buffer: {} frames decoded", decoded_frames);
                 }
                 PlayerEvent::EndOfStream => {
                     eprintln!("[event] end-of-stream");

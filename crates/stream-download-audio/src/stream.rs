@@ -164,15 +164,16 @@ impl AudioStream {
         let spec_clone = spec.clone();
         let producer_clone = producer.clone();
 
-        // Spawn decoding worker on a dedicated thread with a single-threaded Tokio runtime.
+        // Spawn decoding worker on a dedicated thread with a Tokio runtime.
         thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    error!("failed to build tokio runtime for HTTP backend: {e}");
+                    error!("HTTP backend: tokio runtime build failed: {e}");
                     events_clone.send(PlayerEvent::Error {
                         message: format!("tokio runtime error: {e}"),
                     });
@@ -182,6 +183,7 @@ impl AudioStream {
 
             rt.block_on(async move {
                 // Open a seek-gated MediaSourceStream.
+                debug!("HTTP backend: opening seek-gated MSS for URL: {}", url_clone);
                 let (mss, gate) = match open_http_seek_gated_mss(&url_clone).await {
                     Ok(v) => v,
                     Err(e) => {
@@ -192,6 +194,7 @@ impl AudioStream {
                         return;
                     }
                 };
+                debug!("HTTP backend: MSS created, starting probe...");
 
                 // Prepare a probe hint using the URL extension (if any).
                 let mut hint = Hint::new();
@@ -215,13 +218,21 @@ impl AudioStream {
                         return;
                     }
                 };
+                debug!(
+                    "HTTP backend: probe OK, format='{}'",
+                    format.format_info().short_name
+                );
 
                 let container_name = Some(format.format_info().short_name.to_string());
+                debug!("HTTP backend: selecting default audio track...");
 
                 // Select the default audio track.
                 let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
                     Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
-                        Some(ap) => (t.id, ap),
+                        Some(ap) => {
+                            debug!("HTTP backend: selected track id={} sr={:?} ch={:?}", t.id, ap.sample_rate, ap.channels.clone().map(|c| c.count()));
+                            (t.id, ap)
+                        }
                         None => {
                             error!("HTTP backend: selected track is not audio");
                             events_clone.send(PlayerEvent::Error {
@@ -241,6 +252,7 @@ impl AudioStream {
 
                 // Build the decoder using dev-0.6 API with owned audio params.
                 let dec_opts = AudioDecoderOptions::default();
+                debug!("HTTP backend: creating audio decoder...");
                 let mut decoder =
                     match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts) {
                         Ok(d) => d,
@@ -252,9 +264,11 @@ impl AudioStream {
                             return;
                         }
                     };
+                debug!("HTTP backend: decoder created, enabling seek gate.");
 
                 // Enable seeking now that the decoder is initialized.
                 gate.enable_seek();
+                debug!("HTTP backend: seek gate enabled, entering decode loop.");
 
                 // Defer FormatChanged until after the first decoded frame to get accurate spec.
 
@@ -277,12 +291,14 @@ impl AudioStream {
                                     let chans = gab.num_planes();
                                     let frames = gab.frames();
                                     let needed = chans * frames;
+                                    trace!(
+                                        "HTTP backend: decoded {} frames ({} ch)",
+                                        frames, chans
+                                    );
 
-                                    // Resize temp buffer and copy as interleaved f32.
-                                    if tmp.len() < needed {
-                                        tmp.resize(needed, 0.0);
-                                    }
-                                    gab.copy_to_slice_interleaved::<f32, _>(tmp.as_mut_slice());
+                                    // Resize temp buffer to exact length and copy as interleaved f32.
+                                    tmp.resize(needed, 0.0);
+                                    gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
 
                                     // Emit format on first decoded frame.
                                     if !signalled_format {
@@ -292,6 +308,10 @@ impl AudioStream {
                                             channels: ds.channels().count() as u16,
                                         };
                                         *spec_clone.lock().unwrap() = new_spec;
+                                        debug!(
+                                            "HTTP backend: first audio frame -> FormatChanged rate={}Hz ch={}",
+                                            new_spec.sample_rate, new_spec.channels
+                                        );
                                         events_clone.send(PlayerEvent::FormatChanged {
                                             sample_rate: new_spec.sample_rate,
                                             channels: new_spec.channels,
@@ -304,18 +324,23 @@ impl AudioStream {
 
                                     // Push into the ring buffer without blocking.
                                     let mut pushed = 0usize;
-                                    if let Ok(mut prod) = producer_clone.lock() {
-                                        for &s in &tmp[..needed] {
-                                            if prod.try_push(s).is_ok() {
-                                                pushed += 1;
-                                            } else {
-                                                // Ring full; stop early to avoid blocking.
-                                                break;
+                                    if needed > 0 {
+                                        if let Ok(mut prod) = producer_clone.lock() {
+                                            let mut i = 0usize;
+                                            while i < needed {
+                                                if prod.try_push(tmp[i]).is_ok() {
+                                                    pushed += 1;
+                                                    i += 1;
+                                                } else {
+                                                    // Ring full: wait for consumer to drain a bit instead of dropping samples.
+                                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                                }
                                             }
                                         }
                                     }
 
                                     if pushed > 0 {
+                                        trace!("HTTP backend: pushed {} samples to ring (~{} frames)", pushed, pushed / chans);
                                         events_clone.send(PlayerEvent::BufferLevel {
                                             decoded_frames: pushed / chans,
                                         });
@@ -334,9 +359,10 @@ impl AudioStream {
                             break;
                         }
                         Err(e) => {
-                            // Assume end-of-stream or fatal error.
-                            info!("HTTP backend: stream end or error: {e}");
-                            events_clone.send(PlayerEvent::EndOfStream);
+                            error!("HTTP backend: next_packet error: {e}");
+                            events_clone.send(PlayerEvent::Error {
+                                message: format!("next_packet error: {e}"),
+                            });
                             break;
                         }
                     }
