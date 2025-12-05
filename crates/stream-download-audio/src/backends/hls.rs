@@ -292,13 +292,13 @@ impl Drop for HlsSourceController {
 /// - `initial_variant_index`: Optional index into the master playlist variants to select initially.
 ///    If `None` or out of bounds, the lowest bandwidth variant is selected.
 pub async fn open_hls_media_source_async(
-    url: &str,
+    url: String,
     hls_config: HlsConfig,
     initial_variant_index: Option<usize>,
-) -> IoResult<(MediaSourceStream, HlsSourceController)> {
+) -> IoResult<(MediaSourceStream<'static>, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
 
-    let url_str = url.to_string();
+    let url_str = url;
     let cancel = CancellationToken::new();
     let cancel_child = cancel.child_token();
 

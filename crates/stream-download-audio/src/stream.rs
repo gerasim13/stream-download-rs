@@ -134,32 +134,43 @@ impl AudioStream {
             _ => None,
         };
 
-        // Spawn decoding worker task on Tokio.
-        tokio::spawn(async move {
-            // Open HLS MediaSourceStream (spawns its own async producer internally).
-            tracing::trace!(
-                "HLS backend: opening MediaSourceStream for URL: {}",
-                url_clone
-            );
-            let (mss, controller) = match crate::backends::hls::open_hls_media_source_async(
-                &url_clone,
-                hls_cfg,
-                initial_variant_idx,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("HLS backend: open failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("HLS open failed: {e}"),
-                    });
-                    return;
-                }
-            };
-            // Keep the HLS source controller alive for the lifetime of this decode worker.
-            let mut controller = Some(controller);
+        // Open HLS MediaSourceStream (spawns its own async producer internally).
+        tracing::trace!(
+            "HLS backend: opening MediaSourceStream for URL: {}",
+            url_clone
+        );
+        let (mss, controller) = match crate::backends::hls::open_hls_media_source_async(
+            url_clone.clone(),
+            hls_cfg,
+            initial_variant_idx,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("HLS backend: open failed: {e}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("HLS open failed: {e}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Hls {
+                        url,
+                        hls_config,
+                        abr_config,
+                    },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
+            }
+        };
 
+        // Spawn blocking decode worker so we don't block the async runtime.
+        tokio::task::spawn_blocking(move || {
+            // Use owned clone of URL inside blocking task to satisfy 'static lifetime.
+            let _url_for_logs = url_clone.clone();
             tracing::trace!("HLS backend: MSS created, starting probe...");
 
             // No specific hint required; Symphonia should detect fMP4/ADTS from bytes.
@@ -233,9 +244,8 @@ impl AudioStream {
                 }
             };
             trace!("HLS backend: decoder created, enabling seek gate.");
-            if let Some(ctrl) = &controller {
-                ctrl.enable_seek();
-            }
+            controller.enable_seek();
+
             let mut pkt_counter: u64 = 0;
             let mut total_decoded_frames: u64 = 0;
             trace!(
@@ -416,10 +426,7 @@ impl AudioStream {
                     }
                 }
             }
-            // Explicitly stop HLS producer after decode loop exits.
-            if let Some(ctrl) = controller.take() {
-                ctrl.stop().await;
-            }
+            // Note: we don't explicitly stop the HLS producer here; it will end on EOF or cancellation.
         });
 
         Self {
@@ -457,33 +464,47 @@ impl AudioStream {
         let producer = Arc::new(Mutex::new(prod));
 
         // Clone state for background decoding worker.
-        let url_clone = url.clone();
         let events_clone = events.clone();
         let spec_clone = spec.clone();
         let producer_clone = producer.clone();
 
-        // Spawn decoding worker on a dedicated thread with a Tokio runtime.
-        tokio::spawn(async move {
+        // Limit scope of borrowed URL so it doesn't live across the spawn_blocking move.
+        let (mss, gate, url_for_logs_owned) = {
+            let url_for_open: String = url.clone();
+            let url_for_logs_owned = url.clone();
+
             // Open a seek-gated MediaSourceStream.
             trace!(
                 "HTTP backend: opening seek-gated MSS for URL: {}",
-                url_clone
+                url_for_open
             );
-            let (mss, gate) = match open_http_seek_gated_mss(&url_clone).await {
+            let (mss, gate) = match open_http_seek_gated_mss(&url_for_open).await {
                 Ok(v) => v,
                 Err(e) => {
                     error!("HTTP backend: open failed: {e}");
                     events_clone.send(PlayerEvent::Error {
                         message: format!("open failed: {e}"),
                     });
-                    return;
+                    return Self {
+                        spec,
+                        producer,
+                        consumer: cons,
+                        events,
+                        backend: Backend::Http { url },
+                        processors: Arc::new(Mutex::new(Vec::new())),
+                    };
                 }
             };
+            (mss, gate, url_for_logs_owned)
+        };
+
+        // Spawn blocking decode worker so we don't block the async runtime.
+        tokio::task::spawn_blocking(move || {
             trace!("HTTP backend: MSS created, starting probe...");
 
             // Prepare a probe hint using the URL extension (if any).
             let mut hint = Hint::new();
-            if let Some(ext) = extension_from_url(&url_clone) {
+            if let Some(ext) = extension_from_url(&url_for_logs_owned) {
                 hint.with_extension(&ext);
             }
 

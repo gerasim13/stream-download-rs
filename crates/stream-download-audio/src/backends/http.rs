@@ -133,7 +133,9 @@ impl SeekGateHandle {
 /// - Seeking is disabled initially and can be enabled via the returned `SeekGateHandle`.
 ///
 /// This is intended to be passed to Symphonia's probe API alongside the `Hint`.
-pub async fn open_http_seek_gated_mss(url: &str) -> IoResult<(MediaSourceStream, SeekGateHandle)> {
+pub async fn open_http_seek_gated_mss(
+    url: &str,
+) -> IoResult<(MediaSourceStream<'static>, SeekGateHandle)> {
     open_http_seek_gated_mss_with(url, Settings::default()).await
 }
 
@@ -141,7 +143,7 @@ pub async fn open_http_seek_gated_mss(url: &str) -> IoResult<(MediaSourceStream,
 pub async fn open_http_seek_gated_mss_with(
     url: &str,
     settings: Settings<stream_download::http::HttpStream<reqwest::Client>>,
-) -> IoResult<(MediaSourceStream, SeekGateHandle)> {
+) -> IoResult<(MediaSourceStream<'static>, SeekGateHandle)> {
     // Initialize the seek gate disabled; will be enabled after probe by the caller.
     let seek_flag = Arc::new(AtomicBool::new(false));
 
@@ -160,7 +162,7 @@ pub async fn open_http_seek_gated_mss_with(
     let source = HttpMediaSource::new(Box::new(reader) as Box<dyn ReadSeek>, seek_flag.clone());
 
     // Wrap in a `MediaSourceStream` with default options.
-    let mss = MediaSourceStream::new(
+    let mss: MediaSourceStream<'static> = MediaSourceStream::new(
         Box::new(source) as Box<dyn MediaSource>,
         MediaSourceStreamOptions::default(),
     );
