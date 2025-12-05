@@ -2,96 +2,22 @@ use std::env;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
-use stream_download_hls::{
-    AdaptiveHlsAudio, AdaptiveHlsAudioOptions, FloatSampleSource, PlayerEvent, VariantMode,
+use stream_download_audio::{
+    AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, VariantMode, adapt_to_rodio,
 };
 
-use rodio::{OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStreamBuilder, Sink};
 
 fn default_url() -> String {
-    env::var("HLS_URL").unwrap_or_else(|_| {
-        // Public live MP3 HLS radio stream; override with HLS_URL if needed.
+    env::var("AUDIO_URL").unwrap_or_else(|_| {
+        // Default to an HLS stream; pass an MP3 URL to test HTTP playback.
         "https://stream.silvercomet.top/hls/master.m3u8".to_string()
     })
 }
 
-struct RodioSourceAdapter {
-    inner: Arc<Mutex<AdaptiveHlsAudio>>,
-    buf: Vec<f32>,
-    pos: usize,
-    chunk_samples: usize,
-    sample_rate: u32,
-    channels: u16,
-    // If EOF is reached, stop iteration.
-    eof: bool,
-}
-
-impl RodioSourceAdapter {
-    fn new(inner: Arc<Mutex<AdaptiveHlsAudio>>, chunk_samples: usize) -> Self {
-        // Lock once to read initial spec (may change later; rodio assumes static).
-        let spec = inner.lock().unwrap().spec();
-        Self {
-            inner,
-            buf: Vec::with_capacity(chunk_samples),
-            pos: 0,
-            chunk_samples,
-            sample_rate: spec.sample_rate,
-            channels: spec.channels,
-            eof: false,
-        }
-    }
-}
-
-impl Iterator for RodioSourceAdapter {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
-        if self.eof {
-            return None;
-        }
-
-        if self.pos >= self.buf.len() {
-            // Refill buffer from the source.
-            self.buf.resize(self.chunk_samples, 0.0);
-            let read = {
-                let mut guard = self.inner.lock().unwrap();
-                guard.read_interleaved(&mut self.buf)
-            };
-
-            if read == 0 {
-                // No data yet; output a short silence sample to keep the stream alive.
-                thread::sleep(Duration::from_millis(10));
-                return Some(0.0);
-            }
-
-            self.buf.truncate(read);
-            self.pos = 0;
-        }
-
-        let s = self.buf[self.pos];
-        self.pos += 1;
-        Some(s)
-    }
-}
-
-impl Source for RodioSourceAdapter {
-    fn current_span_len(&self) -> Option<usize> {
-        None
-    }
-
-    fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<std::time::Duration> {
-        None
-    }
+fn is_hls(url: &str) -> bool {
+    url.to_ascii_lowercase().contains(".m3u8")
 }
 
 fn parse_args() -> (String, VariantMode, Option<usize>) {
@@ -138,26 +64,37 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (url, vm, manual_idx) = parse_args();
 
-    eprintln!("rodio_adaptive");
+    eprintln!("rodio_adaptive (stream-download-audio)");
     eprintln!("  URL: {}", url);
     match vm {
         VariantMode::Auto => eprintln!("  Mode: AUTO"),
         VariantMode::Manual(i) => eprintln!("  Mode: MANUAL (index: {})", i),
     }
+    eprintln!(
+        "  Detected source: {}",
+        if is_hls(&url) { "HLS" } else { "HTTP" }
+    );
 
-    // Build adaptive audio source
-    let mut opts = AdaptiveHlsAudioOptions::default();
+    // Build audio stream
+    let mut opts = AudioOptions::default();
     opts.initial_mode = vm;
-    // Keep modest buffer targets for responsive startup
-    opts.target_decoded_ms = 400;
-    opts.target_compressed_ms = 1200;
 
-    let mut src = AdaptiveHlsAudio::new(url, opts)?;
-    src.start()?;
+    let stream = if is_hls(&url) {
+        // HLS backend with default configs.
+        AudioStream::from_hls(
+            url.clone(),
+            opts,
+            HlsConfig::default(),
+            AbrConfig::default(),
+        )
+    } else {
+        // HTTP backend (e.g., MP3/AAC/FLAC).
+        AudioStream::from_http(url.clone(), opts)
+    };
 
     // Subscribe to events for visibility
-    let events_rx = src.subscribe_events();
-    let shared = Arc::new(Mutex::new(src));
+    let events_rx = stream.subscribe_events();
+    let shared = Arc::new(Mutex::new(stream));
 
     // Spawn an event logger
     let rx = events_rx;
@@ -198,14 +135,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Setup rodio output
     let stream_handle =
-        rodio::OutputStreamBuilder::open_default_stream().expect("open default audio stream");
-    let sink = rodio::Sink::connect_new(&stream_handle.mixer());
+        OutputStreamBuilder::open_default_stream().expect("open default audio stream");
+    let sink = Sink::connect_new(&stream_handle.mixer());
     sink.play();
 
-    // Adapter pulls from FloatSampleSource and feeds rodio
-    // A chunk of ~4096 samples is a good balance
-    let adapter = RodioSourceAdapter::new(shared.clone(), 4096);
-    sink.append(adapter);
+    // Adapt AudioStream into a rodio Source and play.
+    let source = adapt_to_rodio(shared.clone());
+    sink.append(source);
 
     // Block until finished (EOF). For live streams, this runs indefinitely.
     sink.sleep_until_end();

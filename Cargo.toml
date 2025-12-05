@@ -1,6 +1,7 @@
 
 [workspace]
 members = ["./crates/*", "examples", "tests"]
+# stream-download-audio is included via the glob "./crates/*"
 resolver = "3"
 
 [workspace.package]

@@ -1,0 +1,52 @@
+[package]
+name = "stream-download-audio"
+version = "0.0.1"
+readme = "README.md"
+description = "Audio pipeline for stream-download: unified float PCM source for HTTP and HLS with async resampling and optional rodio adapter"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+include.workspace = true
+categories.workspace = true
+keywords.workspace = true
+
+[dependencies]
+# Core ecosystem deps (use workspace versions where available)
+tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+bytes = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+# Stream-download ecosystem
+stream-download = { version = "0.22.9", path = "../stream-download" }
+stream-download-hls = { version = "0.0.1", path = "../stream-download-hls" }
+
+# Concurrency primitives
+kanal = "0.1"
+
+# Lock-free ring buffer for PCM frames (SPSC)
+ringbuf = "0.4"
+
+# High-quality resampling (runs asynchronously in a worker)
+rubato = "0.14"
+
+# Mandatory decoding via Symphonia (dev-0.6 for better AAC support)
+symphonia = { git = "https://github.com/pdeljanov/Symphonia.git", branch = "dev-0.6", default-features = false, features = ["all", "opt-simd"] }
+
+# Optional rodio adapter (feature-gated)
+rodio = { workspace = true, optional = true }
+
+[features]
+default = []
+rodio = ["dep:rodio"]
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]

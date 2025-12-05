@@ -32,28 +32,15 @@ mod model;
 mod parser;
 mod traits;
 
-pub use crate::model::{
-    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
-    VariantStream,
-};
-
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics, SelectionMode};
 pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
 pub use crate::manager::HlsManager;
-pub use crate::model::diff_playlists;
+pub use crate::model::{
+    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
+    VariantStream, diff_playlists,
+};
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::traits::{MediaStream, SegmentData};
+
 pub use bytes::Bytes;
-
-// Temporary re-export of Duration while it's actively used in public types.
-// This may be removed later if the types are better encapsulated.
-#[cfg(feature = "adaptive-audio")]
-mod audio;
-
-#[cfg(feature = "adaptive-audio")]
-pub use crate::audio::{
-    AdaptiveHlsAudio, AdaptiveHlsAudioOptions, AudioSpec, FloatSampleSource, PlayerEvent,
-    VariantMode,
-};
-
 pub use std::time::Duration;

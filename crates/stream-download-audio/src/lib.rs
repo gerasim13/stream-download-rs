@@ -1,0 +1,29 @@
+//! Unified audio pipeline for `stream-download`.
+//!
+//! This crate exposes a unified float PCM API over HLS and HTTP backends,
+//! with async resampling and optional processing hooks. The implementation
+//! details live in dedicated modules; this file only wires modules and re-exports.
+
+mod api;
+mod backends {
+    pub mod http;
+}
+mod pipeline;
+mod stream;
+
+#[cfg(feature = "rodio")]
+mod rodio_adapter;
+
+// Re-export useful HLS types for convenience.
+pub use stream_download_hls::{
+    AbrConfig, AbrController, HlsConfig, HlsManager, MediaStream, SegmentData, VariantStream,
+};
+
+// Public API re-exports.
+pub use crate::api::{
+    AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent, VariantMode,
+};
+pub use crate::stream::AudioStream;
+
+#[cfg(feature = "rodio")]
+pub use crate::rodio_adapter::{RodioSourceAdapter, adapt_to_rodio};
