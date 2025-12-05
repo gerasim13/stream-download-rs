@@ -37,7 +37,7 @@ pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
 pub use crate::manager::HlsManager;
 pub use crate::model::{
     HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
-    VariantStream, diff_playlists,
+    VariantId, VariantStream, diff_playlists,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::traits::{MediaStream, SegmentData};

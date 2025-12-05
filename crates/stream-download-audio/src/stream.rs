@@ -64,7 +64,7 @@ fn spawn_decode_worker<C>(
 {
     tokio::task::spawn_blocking(move || {
         // Select the default audio track.
-        let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
+        let (mut track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
             Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
                 Some(ap) => {
                     trace!(
@@ -125,7 +125,34 @@ fn spawn_decode_worker<C>(
             match format.next_packet() {
                 Ok(Some(packet)) => {
                     if packet.track_id() != track_id {
-                        continue;
+                        // Attempt to (re)create decoder for the new track id (variant switch).
+                        let new_tid = packet.track_id();
+                        if let Some(t) = format.tracks().iter().find(|t| t.id == new_tid) {
+                            if let Some(ap) =
+                                t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned()
+                            {
+                                match get_codecs().make_audio_decoder(&ap, &dec_opts) {
+                                    Ok(d) => {
+                                        decoder = d;
+                                        track_id = new_tid;
+                                        signalled_format = false; // force re-emit FormatChanged on first decoded frame
+                                        trace!("decode: rebuilt decoder for track id={}", track_id);
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "decode: failed to rebuild decoder for new track: {e}"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // Unknown new track type; skip packet.
+                                continue;
+                            }
+                        } else {
+                            // New track id not present; skip packet.
+                            continue;
+                        }
                     }
 
                     match decoder.decode(&packet) {
@@ -337,6 +364,7 @@ impl AudioStream {
         let (mss, controller) = match crate::backends::hls::open_hls_media_source_async(
             url.clone(),
             hls_cfg,
+            abr_config.clone(),
             initial_variant_idx,
         )
         .await

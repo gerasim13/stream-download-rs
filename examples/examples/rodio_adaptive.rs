@@ -28,7 +28,7 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
 
     let mut url = default_url();
-    let mut mode = "manual".to_string();
+    let mut mode = "auto".to_string();
     let mut manual_idx: Option<usize> = None;
 
     let mut i = 0usize;
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
-                .add_directive("stream_download_audio=debug".parse()?)
+                .add_directive("stream_download_audio=trace".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
         .with_line_number(false)

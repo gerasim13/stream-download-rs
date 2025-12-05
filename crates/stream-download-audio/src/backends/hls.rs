@@ -9,7 +9,8 @@ use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptio
 use tracing::{debug, error, info, trace};
 
 use stream_download_hls::{
-    DownloaderConfig, HlsConfig, HlsManager, MediaStream, ResourceDownloader, VariantStream,
+    AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
+    ResourceDownloader, VariantId, VariantStream,
 };
 
 /// A blocking, non-seekable MediaSource that streams bytes coming from an HLS pipeline.
@@ -299,6 +300,7 @@ impl Drop for HlsSourceController {
 pub async fn open_hls_media_source_async(
     url: String,
     hls_config: HlsConfig,
+    abr_config: AbrConfig,
     initial_variant_index: Option<usize>,
 ) -> IoResult<(MediaSourceStream<'static>, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
@@ -316,11 +318,11 @@ pub async fn open_hls_media_source_async(
             .build()
             .expect("HLS runtime build failed");
         rt.block_on(async move {
-        // Prepare downloader and manager.
+        // Prepare downloader and manager and wrap with ABR controller.
         let downloader = ResourceDownloader::new(DownloaderConfig::default());
         let mut manager = HlsManager::new(url_str.clone(), hls_config, downloader);
 
-        // Load master and select a variant.
+        // Load master and select a starting variant index (for initial bandwidth and logging).
         if let Err(e) = manager.load_master().await {
             error!("HLS: failed to load master playlist: {e:?}");
             return;
@@ -366,80 +368,23 @@ pub async fn open_hls_media_source_async(
             chosen.codec.as_ref().and_then(|c| c.codecs.clone()),
         );
 
-        if let Err(e) = manager.select_variant(chosen_index).await {
-            error!("HLS: failed to select variant {chosen_index}: {e:?}");
+        // Build ABR controller and initialize (this will select the initial variant internally).
+        let init_bw = master.variants[chosen_index].bandwidth.unwrap_or(0) as f64;
+        let mut controller = AbrController::new(manager, abr_config.clone(), chosen_index, init_bw);
+        if let Err(e) = controller.init().await {
+            error!("HLS: controller init failed: {e:?}");
             return;
         }
 
-        // Try to download and send init segment first (for fMP4).
-        match manager.download_init_segment().await {
+
+
+        // Send init segment for the initially selected variant (if any).
+        match controller.inner_stream_mut().download_init_segment().await {
             Ok(Some(bytes)) => {
-                // Some CMAF init segments include a top-level 'sidx' box which makes the demuxer
-                // assume segmented mode and try random seeks. Strip 'sidx' to keep linear playback.
-                fn strip_sidx(data: &[u8]) -> Vec<u8> {
-                    let mut out = Vec::with_capacity(data.len());
-                    let mut pos = 0usize;
-                    while pos + 8 <= data.len() {
-                        let size = u32::from_be_bytes([
-                            data[pos],
-                            data[pos + 1],
-                            data[pos + 2],
-                            data[pos + 3],
-                        ]) as u64;
-                        let typ = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
-                        let (hdr_len, box_size) = if size == 1 {
-                            if pos + 16 > data.len() {
-                                break;
-                            }
-                            let larg = u64::from_be_bytes([
-                                data[pos + 8],
-                                data[pos + 9],
-                                data[pos + 10],
-                                data[pos + 11],
-                                data[pos + 12],
-                                data[pos + 13],
-                                data[pos + 14],
-                                data[pos + 15],
-                            ]);
-                            (16usize, larg as usize)
-                        } else if size == 0 {
-                            // box extends to end of buffer
-                            (8usize, data.len() - pos)
-                        } else {
-                            (8usize, size as usize)
-                        };
-                        if box_size < hdr_len || pos + box_size > data.len() {
-                            // malformed size; copy the rest and stop
-                            out.extend_from_slice(&data[pos..]);
-                            pos = data.len();
-                            break;
-                        }
-                        if &typ == b"sidx" {
-                            // skip this box entirely
-                            pos += box_size;
-                            continue;
-                        } else {
-                            out.extend_from_slice(&data[pos..pos + box_size]);
-                            pos += box_size;
-                        }
-                    }
-                    if pos < data.len() {
-                        out.extend_from_slice(&data[pos..]);
-                    }
-                    out
-                }
-                let orig_len = bytes.len();
-                trace!(
-                    "HLS: init segment fetched: bytes={} (before strip_sidx)",
-                    orig_len
-                );
-                let cleaned = strip_sidx(&bytes);
-                trace!(
-                    "HLS: init segment cleaned: bytes={} (after strip_sidx)",
-                    cleaned.len()
-                );
-                if data_tx.send(cleaned).is_err() {
+                trace!("HLS: init segment fetched: bytes={}", bytes.len());
+                if data_tx.send(bytes).is_err() {
                     trace!("HLS: consumer dropped while sending init segment; stopping producer");
+                    return;
                 }
             }
             Ok(None) => {
@@ -447,9 +392,12 @@ pub async fn open_hls_media_source_async(
             }
             Err(e) => {
                 error!("HLS: failed to download init segment: {e:?}");
-                // Non-fatal: proceed with media segments.
+                // Non-fatal.
             }
         }
+
+        // Track current variant; on change, send a fresh init segment before media bytes.
+        let mut last_variant_id: Option<VariantId> = controller.current_variant_id();
 
         // Stream media segments until EOF or stop signal.
         loop {
@@ -458,9 +406,33 @@ pub async fn open_hls_media_source_async(
                 break;
             }
 
-            match manager.next_segment().await {
+            match controller.next_segment().await {
                 Ok(Some(seg)) => {
-                    // Convert Bytes to Vec<u8>
+                    // If variant switched, send its init segment before first media packet.
+                    if Some(seg.variant_id) != last_variant_id {
+                        trace!(
+                            "HLS: variant switch detected: {:?} -> {:?}",
+                            last_variant_id,
+                            seg.variant_id
+                        );
+                        match controller.inner_stream_mut().download_init_segment().await {
+                            Ok(Some(bytes)) => {
+                                if data_tx.send(bytes).is_err() {
+                                    trace!("HLS: consumer dropped while sending switched init; stopping producer");
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                trace!("HLS: switched variant has no init segment");
+                            }
+                            Err(e) => {
+                                error!("HLS: failed to download switched init segment: {e:?}");
+                            }
+                        }
+                        last_variant_id = Some(seg.variant_id);
+                    }
+
+                    // Convert Bytes to Vec<u8> and forward.
                     let chunk_len = seg.data.len();
                     let variant = seg.variant_id.0;
                     let dur_ms = seg.duration.as_millis();
