@@ -35,6 +35,7 @@ rubato = "0.14"
 
 # Mandatory decoding via Symphonia (dev-0.6 for better AAC support)
 symphonia = { git = "https://github.com/pdeljanov/Symphonia.git", branch = "dev-0.6", default-features = false, features = ["all", "opt-simd"] }
+symphonia-core = { git = "https://github.com/pdeljanov/Symphonia.git", branch = "dev-0.6" }
 
 # Optional rodio adapter (feature-gated)
 rodio = { workspace = true, optional = true }
