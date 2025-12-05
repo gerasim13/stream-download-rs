@@ -7,7 +7,6 @@ use hls_m3u8::Decryptable;
 use hls_m3u8::MasterPlaylist as HlsMasterPlaylist;
 use hls_m3u8::MediaPlaylist as HlsMediaPlaylist;
 use hls_m3u8::tags::VariantStream as HlsVariantStreamTag;
-use hls_m3u8::types::PlaylistType;
 
 use crate::model::{
     CodecInfo, EncryptionMethod, HlsError, HlsResult, InitSegment, KeyInfo, MasterPlaylist,
@@ -71,7 +70,9 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
 
     let target_duration = Some(hls_media.target_duration);
     let media_sequence = hls_media.media_sequence as u64;
-    let end_list = matches!(hls_media.playlist_type, Some(PlaylistType::Vod));
+    // Derive end-of-stream strictly from presence of the EXT-X-ENDLIST tag.
+    // Some servers set Playlist-Type=VOD or EVENT without a terminal ENDLIST.
+    let end_list = input.contains("#EXT-X-ENDLIST");
 
     // TODO: handle EXT-X-KEY and SAMPLE-AES via Decryptable if/when needed.
     let current_key: Option<KeyInfo> = None;

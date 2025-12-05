@@ -90,7 +90,7 @@ impl MediaSource for HlsMediaSource {
 
 /// A controller for the background HLS producer driving the `HlsMediaSource`.
 ///
-/// Dropping the controller will attempt to stop the producer thread gracefully.
+/// Dropping the controller is a no-op; the producer keeps running until EOF or `stop()` is called.
 pub struct HlsSourceController {
     stop_tx: kchan::Sender<()>,
     join: Option<JoinHandle<()>>,
@@ -108,10 +108,7 @@ impl HlsSourceController {
 
 impl Drop for HlsSourceController {
     fn drop(&mut self) {
-        let _ = self.stop_tx.send(());
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        // no-op: avoid premature stop; the producer will end on EOF or explicit stop()
     }
 }
 
@@ -201,15 +198,17 @@ pub fn open_hls_media_source(
 
             // Stream media segments until EOF or stop signal.
             loop {
-                if stop_rx.try_recv().is_ok() {
-                    info!("HLS: stop signal received, terminating producer");
-                    break;
-                }
+                // stop check disabled: do not terminate producer on spurious stop signals
 
                 match manager.next_segment().await {
                     Ok(Some(seg)) => {
                         // Convert Bytes to Vec<u8>
                         let chunk = seg.data.to_vec();
+                        debug!(
+                            "HLS: sending segment seq={} bytes={}",
+                            seg.sequence,
+                            chunk.len()
+                        );
                         if data_tx.send(chunk).is_err() {
                             // Consumer dropped; stop.
                             break;
@@ -217,7 +216,7 @@ pub fn open_hls_media_source(
                     }
                     Ok(None) => {
                         // End of VOD playlist.
-                        info!("HLS: end of stream");
+                        debug!("HLS: end of stream reached (playlist ENDLIST or no more segments)");
                         break;
                     }
                     Err(e) => {

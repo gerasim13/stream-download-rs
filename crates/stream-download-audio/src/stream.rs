@@ -139,7 +139,7 @@ impl AudioStream {
                 "HLS backend: opening MediaSourceStream for URL: {}",
                 url_clone
             );
-            let (mss, _controller) =
+            let (mss, controller) =
                 match crate::backends::hls::open_hls_media_source(&url_clone, hls_cfg) {
                     Ok(v) => v,
                     Err(e) => {
@@ -150,6 +150,8 @@ impl AudioStream {
                         return;
                     }
                 };
+            // Keep the HLS source controller alive for the lifetime of this decode worker.
+            let mut controller = Some(controller);
 
             tracing::debug!("HLS backend: MSS created, starting probe...");
 
@@ -322,6 +324,10 @@ impl AudioStream {
                         break;
                     }
                 }
+            }
+            // Explicitly stop HLS producer after decode loop exits.
+            if let Some(ctrl) = controller.take() {
+                ctrl.stop();
             }
         });
 

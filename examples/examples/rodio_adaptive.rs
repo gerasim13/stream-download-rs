@@ -8,6 +8,7 @@ use stream_download_audio::{
     AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, VariantMode, adapt_to_rodio,
 };
 use tracing::metadata::LevelFilter;
+use tracing::trace;
 use tracing_subscriber::EnvFilter;
 
 fn default_url() -> String {
@@ -64,7 +65,11 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::default().add_directive(LevelFilter::DEBUG.into()))
+        .with_env_filter(
+            EnvFilter::default()
+                .add_directive("stream_download_audio=debug".parse()?)
+                .add_directive(LevelFilter::INFO.into()),
+        )
         .with_line_number(true)
         .with_file(true)
         .init();
@@ -127,7 +132,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     );
                 }
                 PlayerEvent::BufferLevel { decoded_frames } => {
-                    eprintln!("[event] buffer: {} frames decoded", decoded_frames);
+                    trace!("[event] buffer: {} frames decoded", decoded_frames);
                 }
                 PlayerEvent::EndOfStream => {
                     eprintln!("[event] end-of-stream");
