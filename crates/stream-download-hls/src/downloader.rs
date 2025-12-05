@@ -76,10 +76,17 @@ impl ResourceDownloader {
             }
         };
 
-        let mut buffer = Vec::new();
-        reader
-            .read_to_end(&mut buffer)
-            .map_err(|e| HlsError::Io(e.to_string()))?;
+        let buffer = tokio::task::spawn_blocking(move || {
+            let mut r = reader;
+            let mut buf = Vec::new();
+            match r.read_to_end(&mut buf) {
+                Ok(_) => Ok(buf),
+                Err(e) => Err(HlsError::Io(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| HlsError::Io(format!("join error: {e}")))??;
+
         Ok(Bytes::from(buffer))
     }
 }

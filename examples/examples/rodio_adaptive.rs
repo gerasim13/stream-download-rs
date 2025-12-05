@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
-                .add_directive("stream_download_audio=trace".parse()?)
+                .add_directive("stream_download_audio=debug".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
         .with_line_number(false)

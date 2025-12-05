@@ -23,7 +23,7 @@ tokio-util = { workspace = true }
 
 # Stream-download ecosystem
 stream-download = { version = "0.22.9", path = "../stream-download" }
-stream-download-hls = { version = "0.0.1", path = "../stream-download-hls" }
+stream-download-hls = { version = "0.0.1", path = "../stream-download-hls", features = ["aes-decrypt"] }
 
 # Concurrency primitives
 kanal = "0.1"

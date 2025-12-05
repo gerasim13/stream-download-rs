@@ -26,10 +26,209 @@ use stream_download_hls::{AbrConfig, HlsConfig};
 
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::default::{get_codecs, get_probe};
-use symphonia_core::formats::probe::Hint;
+
+/// Small trait to unify enabling seek after decoder init for different controllers.
+trait SeekEnable: Send + Sync + 'static {
+    fn enable_seek_gate(&self);
+}
+
+/// Blanket impl for HTTP seek gate handle.
+impl SeekEnable for crate::backends::http::SeekGateHandle {
+    fn enable_seek_gate(&self) {
+        self.enable_seek();
+    }
+}
+
+/// Blanket impl for HLS source controller.
+impl SeekEnable for crate::backends::hls::HlsSourceController {
+    fn enable_seek_gate(&self) {
+        self.enable_seek();
+    }
+}
+
+/// Spawn a blocking decode worker that probes, decodes, converts to f32 and pushes into the ring.
+/// This unifies HTTP/HLS decode loop in one place.
+fn spawn_decode_worker<C>(
+    mut format: Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
+    controller: C,
+    producer: Arc<Mutex<HeapProd<f32>>>,
+    events: Arc<EventHub>,
+    spec_out: Arc<Mutex<AudioSpec>>,
+    container_name: Option<String>,
+) where
+    C: SeekEnable,
+{
+    tokio::task::spawn_blocking(move || {
+        // Select the default audio track.
+        let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
+            Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
+                Some(ap) => {
+                    trace!(
+                        "decode: selected track id={} sr={:?} ch={:?}",
+                        t.id,
+                        ap.sample_rate,
+                        ap.channels.clone().map(|c| c.count())
+                    );
+                    (t.id, ap)
+                }
+                None => {
+                    error!("decode: selected track is not audio");
+                    events.send(PlayerEvent::Error {
+                        message: "no audio params on selected track".into(),
+                    });
+                    return;
+                }
+            },
+            None => {
+                error!("decode: no default audio track");
+                events.send(PlayerEvent::Error {
+                    message: "no default audio track".into(),
+                });
+                return;
+            }
+        };
+
+        // Build the decoder using dev-0.6 API with owned audio params.
+        let dec_opts = AudioDecoderOptions::default();
+        trace!("decode: creating audio decoder...");
+        let mut decoder = match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("decode: decoder make failed: {e}");
+                events.send(PlayerEvent::Error {
+                    message: format!("decoder make failed: {e}"),
+                });
+                return;
+            }
+        };
+
+        // Enable seek on the underlying source now that decoder is ready.
+        controller.enable_seek_gate();
+        trace!("decode: seek enabled, entering loop");
+
+        // Temporary interleaved buffer for converted f32 samples.
+        let mut tmp: Vec<f32> = Vec::new();
+        let mut signalled_format = false;
+
+        // Throttle for BufferLevel events (every ~500ms).
+        let mut last_level_instant = std::time::Instant::now();
+
+        // HLS-specific heuristic: retry on unexpected EOFs.
+        let mut eof_retry_count: u32 = 0;
+
+        // Decode loop: read packets, decode, convert to f32, push into ring buffer.
+        loop {
+            match format.next_packet() {
+                Ok(Some(packet)) => {
+                    if packet.track_id() != track_id {
+                        continue;
+                    }
+
+                    match decoder.decode(&packet) {
+                        Ok(decoded) => {
+                            // Convert to a generic buffer reference and then to interleaved f32.
+                            let gab: GenericAudioBufferRef = decoded;
+                            let chans = gab.num_planes();
+                            let frames = gab.frames();
+                            let needed = chans * frames;
+
+                            // Reset EOF retry counter on successful decode (HLS).
+                            eof_retry_count = 0;
+
+                            // Resize temp buffer to exact length and copy as interleaved f32.
+                            tmp.resize(needed, 0.0);
+                            gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
+
+                            // Emit format on first decoded frame.
+                            if !signalled_format {
+                                let ds = gab.spec();
+                                let new_spec = AudioSpec {
+                                    sample_rate: ds.rate(),
+                                    channels: ds.channels().count() as u16,
+                                };
+                                *spec_out.lock().unwrap() = new_spec;
+                                trace!(
+                                    "decode: first frame -> FormatChanged rate={}Hz ch={}",
+                                    new_spec.sample_rate, new_spec.channels
+                                );
+                                events.send(PlayerEvent::FormatChanged {
+                                    sample_rate: new_spec.sample_rate,
+                                    channels: new_spec.channels,
+                                    codec: None,
+                                    container: container_name.clone(),
+                                });
+                                events.send(PlayerEvent::Started);
+                                signalled_format = true;
+                            }
+
+                            // Push into the ring buffer with simple backpressure (no drops).
+                            if needed > 0 {
+                                if let Ok(mut prod) = producer.lock() {
+                                    let mut i = 0usize;
+                                    while i < needed {
+                                        if prod.try_push(tmp[i]).is_ok() {
+                                            i += 1;
+                                        } else {
+                                            // Ring full: wait for consumer to drain a bit.
+                                            std::thread::sleep(std::time::Duration::from_millis(5));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Throttle BufferLevel events (~500ms).
+                            if last_level_instant.elapsed() >= std::time::Duration::from_millis(500)
+                            {
+                                events.send(PlayerEvent::BufferLevel {
+                                    decoded_frames: frames,
+                                });
+                                last_level_instant = std::time::Instant::now();
+                            }
+                        }
+                        Err(e) => {
+                            // Non-fatal decode error; continue.
+                            debug!("decode: decode error: {e}");
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // End of stream reached.
+                    info!("decode: end of stream");
+                    events.send(PlayerEvent::EndOfStream);
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // Heuristic handling for segmented fMP4 (isomp4) over streaming (HLS):
+                    // - Unexpected EOF while more data is expected: backoff and retry.
+                    if msg.to_ascii_lowercase().contains("unexpected")
+                        && msg.to_ascii_lowercase().contains("eof")
+                    {
+                        eof_retry_count = eof_retry_count.saturating_add(1);
+                        if eof_retry_count > 50 {
+                            info!("decode: repeated unexpected EOFs -> EndOfStream");
+                            events.send(PlayerEvent::EndOfStream);
+                            break;
+                        }
+                        debug!("decode: unexpected EOF (retry #{})", eof_retry_count);
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+
+                    error!("decode: next_packet error: {msg}");
+                    events.send(PlayerEvent::Error {
+                        message: format!("next_packet error: {msg}"),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
 
 /// Internal backend selector for the audio source.
 #[derive(Debug, Clone)]
@@ -100,7 +299,7 @@ impl std::fmt::Debug for AudioStream {
 impl AudioStream {
     /// Create an AudioStream from an HLS master playlist URL.
     ///
-    /// This skeleton only initializes state; background tasks are TODO.
+    /// This path opens the HLS MediaSourceStream, then starts a unified decode worker.
     pub async fn from_hls(
         url: impl Into<String>,
         opts: AudioOptions,
@@ -123,8 +322,7 @@ impl AudioStream {
         let events = Arc::new(EventHub::new());
         let producer = Arc::new(Mutex::new(prod));
 
-        // Clone state for background decoding worker.
-        let url_clone = url.clone();
+        // Clone state for unified decode worker.
         let events_clone = events.clone();
         let spec_clone = spec.clone();
         let producer_clone = producer.clone();
@@ -135,12 +333,9 @@ impl AudioStream {
         };
 
         // Open HLS MediaSourceStream (spawns its own async producer internally).
-        tracing::trace!(
-            "HLS backend: opening MediaSourceStream for URL: {}",
-            url_clone
-        );
+        tracing::trace!("HLS backend: opening MediaSourceStream for URL: {}", url);
         let (mss, controller) = match crate::backends::hls::open_hls_media_source_async(
-            url_clone.clone(),
+            url.clone(),
             hls_cfg,
             initial_variant_idx,
         )
@@ -167,267 +362,74 @@ impl AudioStream {
             }
         };
 
-        // Spawn blocking decode worker so we don't block the async runtime.
-        tokio::task::spawn_blocking(move || {
-            // Use owned clone of URL inside blocking task to satisfy 'static lifetime.
-            let _url_for_logs = url_clone.clone();
-            tracing::trace!("HLS backend: MSS created, starting probe...");
-
-            // No specific hint required; Symphonia should detect fMP4/ADTS from bytes.
-            let hint = Hint::new();
-
-            // Probe and open the container.
-            let mut format = match get_probe().probe(
+        // Probe and open the container in a blocking thread so we don't block the Tokio workers.
+        // This allows the HLS producer task to run and feed bytes into the channel for probing.
+        let hint = Hint::new();
+        let probe_join = tokio::task::spawn_blocking(move || {
+            get_probe().probe(
                 &hint,
                 mss,
                 FormatOptions::default(),
                 MetadataOptions::default(),
-            ) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("HLS backend: probe failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("probe failed: {e}"),
-                    });
-                    return;
-                }
-            };
-            trace!(
-                "HLS backend: probe OK, format='{}'",
-                format.format_info().short_name
-            );
+            )
+        })
+        .await;
 
-            let container_name = Some(format.format_info().short_name.to_string());
-            trace!("HLS backend: selecting default audio track...");
-
-            // Select the default audio track.
-            let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
-                Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
-                    Some(ap) => {
-                        trace!(
-                            "HLS backend: selected track id={} sr={:?} ch={:?}",
-                            t.id,
-                            ap.sample_rate,
-                            ap.channels.clone().map(|c| c.count())
-                        );
-                        (t.id, ap)
-                    }
-                    None => {
-                        error!("HLS backend: selected track is not audio");
-                        events_clone.send(PlayerEvent::Error {
-                            message: "no audio params on selected track".into(),
-                        });
-                        return;
-                    }
-                },
-                None => {
-                    error!("HLS backend: no default audio track");
-                    events_clone.send(PlayerEvent::Error {
-                        message: "no default audio track".into(),
-                    });
-                    return;
-                }
-            };
-
-            // Build the decoder using dev-0.6 API with owned audio params.
-            let dec_opts = AudioDecoderOptions::default();
-            trace!("HLS backend: creating audio decoder...");
-            let mut decoder = match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts)
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("HLS backend: decoder make failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("decoder make failed: {e}"),
-                    });
-                    return;
-                }
-            };
-            trace!("HLS backend: decoder created, enabling seek gate.");
-            controller.enable_seek();
-
-            let mut pkt_counter: u64 = 0;
-            let mut total_decoded_frames: u64 = 0;
-            trace!(
-                "HLS backend: seek gate enabled, entering decode loop. pkt_counter={} total_frames={}",
-                pkt_counter, total_decoded_frames
-            );
-
-            // Temporary interleaved buffer for converted f32 samples.
-            let mut tmp: Vec<f32> = Vec::new();
-            let mut signalled_format = false;
-            // Count consecutive unexpected EOFs to treat VOD end as graceful EOF.
-            let mut eof_retry_count: u32 = 0;
-
-            // Decode loop: read packets, decode, convert to f32, push into ring buffer.
-            loop {
-                pkt_counter = pkt_counter.saturating_add(1);
-                trace!("HLS backend: next_packet() call #{}", pkt_counter);
-                match format.next_packet() {
-                    Ok(Some(packet)) => {
-                        if packet.track_id() != track_id {
-                            continue;
-                        }
-
-                        match decoder.decode(&packet) {
-                            Ok(decoded) => {
-                                // Convert to a generic buffer reference and then to interleaved f32.
-                                let gab: GenericAudioBufferRef = decoded;
-                                // Reset EOF retry counter on successful decode.
-                                eof_retry_count = 0;
-                                let chans = gab.num_planes();
-                                let frames = gab.frames();
-                                let needed = chans * frames;
-                                total_decoded_frames =
-                                    total_decoded_frames.saturating_add(frames as u64);
-                                trace!(
-                                    "HLS backend: decoded packet #{} -> {} frames ({} ch), total_decoded_frames={}",
-                                    pkt_counter, frames, chans, total_decoded_frames
-                                );
-
-                                // Resize temp buffer to exact length and copy as interleaved f32.
-                                tmp.resize(needed, 0.0);
-                                gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
-
-                                // Emit format on first decoded frame.
-                                if !signalled_format {
-                                    let ds = gab.spec();
-                                    let new_spec = AudioSpec {
-                                        sample_rate: ds.rate(),
-                                        channels: ds.channels().count() as u16,
-                                    };
-                                    *spec_clone.lock().unwrap() = new_spec;
-                                    trace!(
-                                        "HLS backend: first audio frame -> FormatChanged rate={}Hz ch={}",
-                                        new_spec.sample_rate, new_spec.channels
-                                    );
-                                    events_clone.send(PlayerEvent::FormatChanged {
-                                        sample_rate: new_spec.sample_rate,
-                                        channels: new_spec.channels,
-                                        codec: None,
-                                        container: container_name.clone(),
-                                    });
-                                    events_clone.send(PlayerEvent::Started);
-                                    signalled_format = true;
-                                }
-
-                                // Push into the ring buffer with simple backpressure (no drops).
-                                let mut pushed = 0usize;
-                                if needed > 0 {
-                                    if let Ok(mut prod) = producer_clone.lock() {
-                                        let mut i = 0usize;
-                                        while i < needed {
-                                            if prod.try_push(tmp[i]).is_ok() {
-                                                pushed += 1;
-                                                i += 1;
-                                            } else {
-                                                // Ring full: wait for consumer to drain a bit.
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(5),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if pushed > 0 {
-                                    trace!(
-                                        "HLS backend: pushed {} samples to ring (~{} frames)",
-                                        pushed,
-                                        pushed / chans
-                                    );
-                                    events_clone.send(PlayerEvent::BufferLevel {
-                                        decoded_frames: pushed / chans,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                // Non-fatal decode error; continue.
-                                debug!("HLS backend: decode error: {e}");
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // End of stream reached.
-                        info!("HLS backend: end of stream");
-                        events_clone.send(PlayerEvent::EndOfStream);
-                        break;
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        // Heuristic handling for segmented fMP4 (isomp4) over streaming:
-                        // - Unexpected EOF while more data is expected: backoff and retry.
-                        // - Reset-required style errors: try to rebuild decoder from current track params.
-                        if msg.contains("unexpected end of file")
-                            || msg.contains("end of file")
-                            || msg.contains("unexpected eof")
-                        {
-                            // Allow more bytes to arrive from the producer before retrying.
-                            eof_retry_count = eof_retry_count.saturating_add(1);
-                            if eof_retry_count > 50 {
-                                // Treat repeated EOFs as graceful end-of-stream (VOD finished).
-                                info!(
-                                    "HLS backend: repeated unexpected EOFs, treating as EndOfStream"
-                                );
-                                events_clone.send(PlayerEvent::EndOfStream);
-                                break;
-                            }
-                            debug!("HLS backend: unexpected EOF (retry #{})", eof_retry_count);
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                            continue;
-                        } else if msg.to_ascii_lowercase().contains("reset")
-                            || msg.contains("ResetRequired")
-                        {
-                            debug!(
-                                "HLS backend: packet stream signalled reset; attempting to rebuild decoder"
-                            );
-                            // Try to get fresh audio params from the current default audio track.
-                            if let Some(t) = format.default_track(TrackType::Audio) {
-                                if let Some(ap) =
-                                    t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned()
-                                {
-                                    match get_codecs().make_audio_decoder(&ap, &dec_opts) {
-                                        Ok(new_dec) => {
-                                            decoder = new_dec;
-                                            // Re-emit format on next decoded frame.
-                                            signalled_format = false;
-                                            debug!(
-                                                "HLS backend: decoder successfully rebuilt after reset"
-                                            );
-                                            continue;
-                                        }
-                                        Err(e2) => {
-                                            error!(
-                                                "HLS backend: failed to rebuild decoder after reset: {e2}"
-                                            );
-                                        }
-                                    }
-                                } else {
-                                    error!(
-                                        "HLS backend: reset indicated but no audio params on selected track"
-                                    );
-                                }
-                            } else {
-                                error!(
-                                    "HLS backend: reset indicated but no default audio track found"
-                                );
-                            }
-                            events_clone.send(PlayerEvent::Error {
-                                message: format!("decoder reset failed after error: {msg}"),
-                            });
-                            break;
-                        } else {
-                            error!("HLS backend: next_packet error: {msg}");
-                            events_clone.send(PlayerEvent::Error {
-                                message: format!("next_packet error: {msg}"),
-                            });
-                            break;
-                        }
-                    }
-                }
+        let format = match probe_join {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                error!("HLS backend: probe failed: {e}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("probe failed: {e}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Hls {
+                        url,
+                        hls_config,
+                        abr_config,
+                    },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
             }
-            // Note: we don't explicitly stop the HLS producer here; it will end on EOF or cancellation.
-        });
+            Err(join_err) => {
+                error!("HLS backend: probe join error: {join_err}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("probe join error: {join_err}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Hls {
+                        url,
+                        hls_config,
+                        abr_config,
+                    },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
+            }
+        };
+
+        trace!(
+            "HLS backend: probe OK, format='{}'",
+            format.format_info().short_name
+        );
+        let container_name = Some(format.format_info().short_name.to_string());
+
+        // Start unified decode worker (spawn_blocking).
+        spawn_decode_worker(
+            format,
+            controller,
+            producer_clone,
+            events_clone,
+            spec_clone,
+            container_name,
+        );
 
         Self {
             spec,
@@ -445,7 +447,7 @@ impl AudioStream {
 
     /// Create an AudioStream from a regular HTTP URL (e.g., MP3/AAC/FLAC).
     ///
-    /// This skeleton only initializes state; background tasks are TODO.
+    /// This path opens the HTTP MediaSourceStream, then starts a unified decode worker.
     pub async fn from_http(url: impl Into<String>, opts: AudioOptions) -> Self {
         let url = url.into();
 
@@ -463,225 +465,95 @@ impl AudioStream {
         let events = Arc::new(EventHub::new());
         let producer = Arc::new(Mutex::new(prod));
 
-        // Clone state for background decoding worker.
+        // Clone state for unified decode worker.
         let events_clone = events.clone();
         let spec_clone = spec.clone();
         let producer_clone = producer.clone();
 
-        // Limit scope of borrowed URL so it doesn't live across the spawn_blocking move.
-        let (mss, gate, url_for_logs_owned) = {
-            let url_for_open: String = url.clone();
-            let url_for_logs_owned = url.clone();
-
-            // Open a seek-gated MediaSourceStream.
-            trace!(
-                "HTTP backend: opening seek-gated MSS for URL: {}",
-                url_for_open
-            );
-            let (mss, gate) = match open_http_seek_gated_mss(&url_for_open).await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("HTTP backend: open failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("open failed: {e}"),
-                    });
-                    return Self {
-                        spec,
-                        producer,
-                        consumer: cons,
-                        events,
-                        backend: Backend::Http { url },
-                        processors: Arc::new(Mutex::new(Vec::new())),
-                    };
-                }
-            };
-            (mss, gate, url_for_logs_owned)
+        // Open a seek-gated MediaSourceStream.
+        trace!("HTTP backend: opening seek-gated MSS for URL: {}", url);
+        let (mss, gate) = match open_http_seek_gated_mss(&url).await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("HTTP backend: open failed: {e}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("open failed: {e}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Http { url },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
+            }
         };
 
-        // Spawn blocking decode worker so we don't block the async runtime.
-        tokio::task::spawn_blocking(move || {
-            trace!("HTTP backend: MSS created, starting probe...");
-
-            // Prepare a probe hint using the URL extension (if any).
-            let mut hint = Hint::new();
-            if let Some(ext) = extension_from_url(&url_for_logs_owned) {
-                hint.with_extension(&ext);
-            }
-
-            // Probe and open the container.
-            let mut format = match get_probe().probe(
+        // Probe and open the container in a blocking thread so we don't block the Tokio workers.
+        // This avoids starving the HTTP fetcher and lets it feed bytes for probing.
+        let mut hint = Hint::new();
+        if let Some(ext) = extension_from_url(&url) {
+            hint.with_extension(&ext);
+        }
+        let probe_join = tokio::task::spawn_blocking(move || {
+            get_probe().probe(
                 &hint,
                 mss,
                 FormatOptions::default(),
                 MetadataOptions::default(),
-            ) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("HTTP backend: probe failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("probe failed: {e}"),
-                    });
-                    return;
-                }
-            };
-            trace!(
-                "HTTP backend: probe OK, format='{}'",
-                format.format_info().short_name
-            );
+            )
+        })
+        .await;
 
-            let container_name = Some(format.format_info().short_name.to_string());
-            trace!("HTTP backend: selecting default audio track...");
-
-            // Select the default audio track.
-            let (track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
-                Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
-                    Some(ap) => {
-                        trace!(
-                            "HTTP backend: selected track id={} sr={:?} ch={:?}",
-                            t.id,
-                            ap.sample_rate,
-                            ap.channels.clone().map(|c| c.count())
-                        );
-                        (t.id, ap)
-                    }
-                    None => {
-                        error!("HTTP backend: selected track is not audio");
-                        events_clone.send(PlayerEvent::Error {
-                            message: "no audio params on selected track".into(),
-                        });
-                        return;
-                    }
-                },
-                None => {
-                    error!("HTTP backend: no default audio track");
-                    events_clone.send(PlayerEvent::Error {
-                        message: "no default audio track".into(),
-                    });
-                    return;
-                }
-            };
-
-            // Build the decoder using dev-0.6 API with owned audio params.
-            let dec_opts = AudioDecoderOptions::default();
-            trace!("HTTP backend: creating audio decoder...");
-            let mut decoder = match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts)
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("HTTP backend: decoder make failed: {e}");
-                    events_clone.send(PlayerEvent::Error {
-                        message: format!("decoder make failed: {e}"),
-                    });
-                    return;
-                }
-            };
-            trace!("HTTP backend: decoder created, enabling seek gate.");
-
-            // Enable seeking now that the decoder is initialized.
-            gate.enable_seek();
-            trace!("HTTP backend: seek gate enabled, entering decode loop.");
-
-            // Defer FormatChanged until after the first decoded frame to get accurate spec.
-
-            // Temporary interleaved buffer for converted f32 samples.
-            let mut tmp: Vec<f32> = Vec::new();
-            let mut signalled_format = false;
-
-            // Decode loop: read packets, decode, convert to f32, push into ring buffer.
-            loop {
-                match format.next_packet() {
-                    Ok(Some(packet)) => {
-                        if packet.track_id() != track_id {
-                            continue;
-                        }
-
-                        match decoder.decode(&packet) {
-                            Ok(decoded) => {
-                                // Convert to a generic buffer reference and then to interleaved f32.
-                                let gab: GenericAudioBufferRef = decoded;
-                                let chans = gab.num_planes();
-                                let frames = gab.frames();
-                                let needed = chans * frames;
-                                trace!("HTTP backend: decoded {} frames ({} ch)", frames, chans);
-
-                                // Resize temp buffer to exact length and copy as interleaved f32.
-                                tmp.resize(needed, 0.0);
-                                gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
-
-                                // Emit format on first decoded frame.
-                                if !signalled_format {
-                                    let ds = gab.spec();
-                                    let new_spec = AudioSpec {
-                                        sample_rate: ds.rate(),
-                                        channels: ds.channels().count() as u16,
-                                    };
-                                    *spec_clone.lock().unwrap() = new_spec;
-                                    trace!(
-                                        "HTTP backend: first audio frame -> FormatChanged rate={}Hz ch={}",
-                                        new_spec.sample_rate, new_spec.channels
-                                    );
-                                    events_clone.send(PlayerEvent::FormatChanged {
-                                        sample_rate: new_spec.sample_rate,
-                                        channels: new_spec.channels,
-                                        codec: None,
-                                        container: container_name.clone(),
-                                    });
-                                    events_clone.send(PlayerEvent::Started);
-                                    signalled_format = true;
-                                }
-
-                                // Push into the ring buffer without blocking.
-                                let mut pushed = 0usize;
-                                if needed > 0 {
-                                    if let Ok(mut prod) = producer_clone.lock() {
-                                        let mut i = 0usize;
-                                        while i < needed {
-                                            if prod.try_push(tmp[i]).is_ok() {
-                                                pushed += 1;
-                                                i += 1;
-                                            } else {
-                                                // Ring full: wait for consumer to drain a bit instead of dropping samples.
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(5),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if pushed > 0 {
-                                    trace!(
-                                        "HTTP backend: pushed {} samples to ring (~{} frames)",
-                                        pushed,
-                                        pushed / chans
-                                    );
-                                    events_clone.send(PlayerEvent::BufferLevel {
-                                        decoded_frames: pushed / chans,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                // Non-fatal decode error; continue.
-                                debug!("HTTP backend: decode error: {e}");
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // End of stream reached.
-                        info!("HTTP backend: end of stream");
-                        events_clone.send(PlayerEvent::EndOfStream);
-                        break;
-                    }
-                    Err(e) => {
-                        error!("HTTP backend: next_packet error: {e}");
-                        events_clone.send(PlayerEvent::Error {
-                            message: format!("next_packet error: {e}"),
-                        });
-                        break;
-                    }
-                }
+        let format = match probe_join {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => {
+                error!("HTTP backend: probe failed: {e}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("probe failed: {e}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Http { url },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
             }
-        });
+            Err(join_err) => {
+                error!("HTTP backend: probe join error: {join_err}");
+                events_clone.send(PlayerEvent::Error {
+                    message: format!("probe join error: {join_err}"),
+                });
+                return Self {
+                    spec,
+                    producer,
+                    consumer: cons,
+                    events,
+                    backend: Backend::Http { url },
+                    processors: Arc::new(Mutex::new(Vec::new())),
+                };
+            }
+        };
+
+        trace!(
+            "HTTP backend: probe OK, format='{}'",
+            format.format_info().short_name
+        );
+        let container_name = Some(format.format_info().short_name.to_string());
+
+        // Enable seeking now that the decoder is initialized (in worker).
+        // We pass the gate as controller to the unified worker which calls enable_seek().
+        spawn_decode_worker(
+            format,
+            gate,
+            producer_clone,
+            events_clone,
+            spec_clone,
+            container_name,
+        );
 
         Self {
             spec,

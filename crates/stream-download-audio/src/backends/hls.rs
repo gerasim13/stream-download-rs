@@ -1,7 +1,7 @@
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::task::JoinHandle;
+use std::thread::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use kanal as kchan;
@@ -139,12 +139,17 @@ impl Read for HlsMediaSource {
             return Ok(0);
         }
 
-        // If current buffer depleted, attempt to refill from channel (blocking).
-        if (self.cur.position() as usize) >= self.cur.get_ref().len() {
+        // If current buffer depleted, attempt to refill with bounded waits to let producer progress.
+        while (self.cur.position() as usize) >= self.cur.get_ref().len() && !self.eof {
             self.refill()?;
-            if self.eof {
-                return Ok(0);
+            if (self.cur.position() as usize) < self.cur.get_ref().len() || self.eof {
+                break;
             }
+            // Briefly yield to avoid busy-wait and allow async producer to make progress.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if self.eof {
+            return Ok(0);
         }
 
         let want = out.len();
@@ -264,7 +269,7 @@ impl HlsSourceController {
             }
         };
         if let Some(j) = join {
-            let _ = j.await;
+            let _ = j.join();
         }
     }
 }
@@ -298,12 +303,19 @@ pub async fn open_hls_media_source_async(
 ) -> IoResult<(MediaSourceStream<'static>, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
 
-    let url_str = url;
+    let url_str = url.clone();
     let cancel = CancellationToken::new();
     let cancel_child = cancel.child_token();
 
+    trace!("HLS: preparing worker spawn for URL: {}", url_str);
+
     // Spawn a background task to drive the async HLS pipeline.
-    let join: JoinHandle<()> = tokio::spawn(async move {
+    let join: JoinHandle<()> = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("HLS runtime build failed");
+        rt.block_on(async move {
         // Prepare downloader and manager.
         let downloader = ResourceDownloader::new(DownloaderConfig::default());
         let mut manager = HlsManager::new(url_str.clone(), hls_config, downloader);
@@ -322,14 +334,36 @@ pub async fn open_hls_media_source_async(
             }
         };
 
+        // Log master variants for troubleshooting.
+        for (i, v) in master.variants.iter().enumerate() {
+            let bw = v
+                .bandwidth
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let name = v.name.as_deref().unwrap_or("-");
+            let codecs = v
+                .codec
+                .as_ref()
+                .and_then(|c| c.codecs.clone())
+                .unwrap_or_else(|| "-".into());
+            trace!(
+                "HLS: variant[{i}]: bw={} name={} uri={} codecs={}",
+                bw, name, v.uri, codecs
+            );
+        }
         let chosen_index = initial_variant_index
             .filter(|&i| i < master.variants.len())
             .unwrap_or_else(|| select_variant_index(master.variants.as_slice()));
+        let chosen = &master.variants[chosen_index];
         info!(
-            "HLS: selecting variant index {} of {} (initial={:?})",
+            "HLS: selecting variant index {} of {} (initial={:?}) -> uri={} bw={:?} name={:?} codecs={:?}",
             chosen_index,
             master.variants.len(),
-            initial_variant_index
+            initial_variant_index,
+            chosen.uri,
+            chosen.bandwidth,
+            chosen.name,
+            chosen.codec.as_ref().and_then(|c| c.codecs.clone()),
         );
 
         if let Err(e) = manager.select_variant(chosen_index).await {
@@ -394,8 +428,19 @@ pub async fn open_hls_media_source_async(
                     }
                     out
                 }
+                let orig_len = bytes.len();
+                trace!(
+                    "HLS: init segment fetched: bytes={} (before strip_sidx)",
+                    orig_len
+                );
                 let cleaned = strip_sidx(&bytes);
-                let _ = data_tx.send(cleaned);
+                trace!(
+                    "HLS: init segment cleaned: bytes={} (after strip_sidx)",
+                    cleaned.len()
+                );
+                if data_tx.send(cleaned).is_err() {
+                    trace!("HLS: consumer dropped while sending init segment; stopping producer");
+                }
             }
             Ok(None) => {
                 debug!("HLS: no init segment present");
@@ -416,14 +461,16 @@ pub async fn open_hls_media_source_async(
             match manager.next_segment().await {
                 Ok(Some(seg)) => {
                     // Convert Bytes to Vec<u8>
-                    let chunk = seg.data.to_vec();
+                    let chunk_len = seg.data.len();
+                    let variant = seg.variant_id.0;
+                    let dur_ms = seg.duration.as_millis();
+                    let codec = seg.codec_info.as_ref().and_then(|c| c.codecs.clone());
                     trace!(
-                        "HLS: sending segment seq={} bytes={}",
-                        seg.sequence,
-                        chunk.len()
+                        "HLS: sending segment seq={} bytes={} variant={} dur_ms={} codec={:?}",
+                        seg.sequence, chunk_len, variant, dur_ms, codec
                     );
-                    if data_tx.send(chunk).is_err() {
-                        // Consumer dropped; stop.
+                    if data_tx.send(seg.data.to_vec()).is_err() {
+                        trace!("HLS: consumer dropped; stopping producer");
                         break;
                     }
                 }
@@ -439,7 +486,10 @@ pub async fn open_hls_media_source_async(
                 }
             }
         }
+        });
     });
+
+    trace!("HLS: worker spawn complete for URL: {}", url);
 
     // Initialize seek gate disabled; playback code can enable after decoder init.
     let seek_flag = Arc::new(AtomicBool::new(false));
@@ -461,22 +511,65 @@ pub async fn open_hls_media_source_async(
 }
 
 /// Variant selection heuristic:
-/// - Prefer the variant with the lowest advertised bandwidth (safer startup),
-/// - Fallback to index 0 if bandwidth is missing or list is empty.
+/// - Prefer variants that declare audio codecs (mp4a, aac, ac-3, ec-3, opus, vorbis, flac, mp3),
+///   picking the one with the lowest advertised bandwidth among them.
+/// - If none declare audio explicitly, fall back to the absolute lowest-bandwidth variant.
+/// - If bandwidth is missing across the board, fall back to index 0 (or first audio-declared).
 fn select_variant_index(variants: &[VariantStream]) -> usize {
     if variants.is_empty() {
         return 0;
     }
-    let mut best_idx = 0usize;
-    let mut best_bw = u64::MAX;
+
+    // First pass: collect variants that explicitly declare audio codecs.
+    let mut audio_idxs: Vec<usize> = Vec::new();
     for (i, v) in variants.iter().enumerate() {
-        if let Some(bw) = v.bandwidth {
-            if bw < best_bw {
-                best_bw = bw;
-                best_idx = i;
+        let mut has_audio = false;
+        if let Some(codec) = &v.codec {
+            // Prefer explicit audio codec field when present.
+            if let Some(ac) = &codec.audio_codec {
+                if !ac.is_empty() {
+                    has_audio = true;
+                }
+            }
+            // Also inspect the raw CODECS string for common audio identifiers.
+            if let Some(codecs_str) = &codec.codecs {
+                let s = codecs_str.to_ascii_lowercase();
+                const TOKENS: [&str; 8] = [
+                    "mp4a", "aac", "ac-3", "ec-3", "opus", "vorbis", "flac", "mp3",
+                ];
+                if TOKENS.iter().any(|t| s.contains(t)) {
+                    has_audio = true;
+                }
             }
         }
+        if has_audio {
+            audio_idxs.push(i);
+        }
     }
-    // If no bandwidth was set on any variant, stick to 0.
+
+    // If we found audio-declared variants, choose the one with the lowest bandwidth.
+    if !audio_idxs.is_empty() {
+        let mut best_i = audio_idxs[0];
+        let mut best_bw = variants[best_i].bandwidth.unwrap_or(u64::MAX);
+        for &idx in &audio_idxs[1..] {
+            let bw = variants[idx].bandwidth.unwrap_or(u64::MAX);
+            if bw < best_bw {
+                best_bw = bw;
+                best_i = idx;
+            }
+        }
+        return best_i;
+    }
+
+    // Fallback: choose the variant with the lowest bandwidth overall.
+    let mut best_idx = 0usize;
+    let mut best_bw = variants[0].bandwidth.unwrap_or(u64::MAX);
+    for (i, v) in variants.iter().enumerate().skip(1) {
+        let bw = v.bandwidth.unwrap_or(u64::MAX);
+        if bw < best_bw {
+            best_bw = bw;
+            best_idx = i;
+        }
+    }
     best_idx
 }
