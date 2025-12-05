@@ -5,9 +5,7 @@
 //! details live in dedicated modules; this file only wires modules and re-exports.
 
 mod api;
-mod backends {
-    pub mod http;
-}
+mod backends;
 mod pipeline;
 mod stream;
 

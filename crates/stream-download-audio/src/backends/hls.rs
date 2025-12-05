@@ -138,7 +138,8 @@ pub fn open_hls_media_source(
 
     // Spawn a background thread to drive the async HLS pipeline.
     let join = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
         {

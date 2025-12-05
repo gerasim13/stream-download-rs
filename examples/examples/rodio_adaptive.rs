@@ -3,11 +3,12 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use rodio::{OutputStreamBuilder, Sink};
 use stream_download_audio::{
     AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, VariantMode, adapt_to_rodio,
 };
-
-use rodio::{OutputStreamBuilder, Sink};
+use tracing::metadata::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 fn default_url() -> String {
     env::var("AUDIO_URL").unwrap_or_else(|_| {
@@ -62,6 +63,12 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::default().add_directive(LevelFilter::DEBUG.into()))
+        .with_line_number(true)
+        .with_file(true)
+        .init();
+
     let (url, vm, manual_idx) = parse_args();
 
     eprintln!("rodio_adaptive (stream-download-audio)");
