@@ -43,7 +43,8 @@ fn parse_args() -> String {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
@@ -67,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         target_channels: 2,
         ..Default::default()
     };
-    let stream = AudioStream::from_http(url.clone(), opts);
+    let stream = AudioStream::from_http(url.clone(), opts).await;
 
     // Subscribe to events for visibility.
     let events_rx = stream.subscribe_events();

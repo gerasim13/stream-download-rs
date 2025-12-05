@@ -99,9 +99,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             HlsConfig::default(),
             AbrConfig::default(),
         )
+        .await
     } else {
         // HTTP backend (e.g., MP3/AAC/FLAC).
-        AudioStream::from_http(url.clone(), opts)
+        AudioStream::from_http(url.clone(), opts).await
     };
 
     // Subscribe to events for visibility

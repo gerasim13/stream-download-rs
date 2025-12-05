@@ -19,6 +19,7 @@ tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread
 bytes = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+tokio-util = { workspace = true }
 
 # Stream-download ecosystem
 stream-download = { version = "0.22.9", path = "../stream-download" }

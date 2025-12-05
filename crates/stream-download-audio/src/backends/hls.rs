@@ -1,7 +1,8 @@
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use kanal as kchan;
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
@@ -83,7 +84,6 @@ impl HlsMediaSource {
         // If target lies within the current buffer (even if it's behind),
         // adjust the local cursor position.
         let cur_len = self.cur.get_ref().len() as u64;
-        let cur_off = self.cur.position() as u64;
         if target >= self.base_pos && target <= self.base_pos + cur_len {
             let new_off = target - self.base_pos;
             self.cur.set_position(new_off);
@@ -240,8 +240,8 @@ impl MediaSource for HlsMediaSource {
 ///
 /// Dropping the controller is a no-op; the producer keeps running until EOF or `stop()` is called.
 pub struct HlsSourceController {
-    stop_tx: kchan::Sender<()>,
-    join: Option<JoinHandle<()>>,
+    cancel: CancellationToken,
+    join: Mutex<Option<JoinHandle<()>>>,
     seek_flag: Arc<AtomicBool>,
 }
 
@@ -252,10 +252,19 @@ impl HlsSourceController {
     }
 
     /// Signal the background producer to stop and wait for it to finish.
-    pub fn stop(mut self) {
-        let _ = self.stop_tx.send(());
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
+    pub async fn stop(&self) {
+        self.cancel.cancel();
+        // Take the JoinHandle out under the mutex, then drop the guard
+        // before awaiting to avoid holding a non-Send MutexGuard across .await.
+        let join = {
+            if let Ok(mut guard) = self.join.lock() {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(j) = join {
+            let _ = j.await;
         }
     }
 }
@@ -282,164 +291,154 @@ impl Drop for HlsSourceController {
 /// Parameters:
 /// - `initial_variant_index`: Optional index into the master playlist variants to select initially.
 ///    If `None` or out of bounds, the lowest bandwidth variant is selected.
-pub fn open_hls_media_source(
+pub async fn open_hls_media_source_async(
     url: &str,
     hls_config: HlsConfig,
     initial_variant_index: Option<usize>,
 ) -> IoResult<(MediaSourceStream, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
-    let (stop_tx, stop_rx) = kchan::unbounded::<()>();
 
     let url_str = url.to_string();
+    let cancel = CancellationToken::new();
+    let cancel_child = cancel.child_token();
 
-    // Spawn a background thread to drive the async HLS pipeline.
-    let join = thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("failed to build tokio runtime for HLS backend: {e}");
+    // Spawn a background task to drive the async HLS pipeline.
+    let join: JoinHandle<()> = tokio::spawn(async move {
+        // Prepare downloader and manager.
+        let downloader = ResourceDownloader::new(DownloaderConfig::default());
+        let mut manager = HlsManager::new(url_str.clone(), hls_config, downloader);
+
+        // Load master and select a variant.
+        if let Err(e) = manager.load_master().await {
+            error!("HLS: failed to load master playlist: {e:?}");
+            return;
+        }
+
+        let master = match manager.master() {
+            Some(m) => m,
+            None => {
+                error!("HLS: master playlist not available after load_master()");
                 return;
             }
         };
 
-        rt.block_on(async move {
-            // Prepare downloader and manager.
-            let downloader = ResourceDownloader::new(DownloaderConfig::default());
-            let mut manager = HlsManager::new(url_str.clone(), hls_config, downloader);
+        let chosen_index = initial_variant_index
+            .filter(|&i| i < master.variants.len())
+            .unwrap_or_else(|| select_variant_index(master.variants.as_slice()));
+        info!(
+            "HLS: selecting variant index {} of {} (initial={:?})",
+            chosen_index,
+            master.variants.len(),
+            initial_variant_index
+        );
 
-            // Load master and select a variant.
-            if let Err(e) = manager.load_master().await {
-                error!("HLS: failed to load master playlist: {e:?}");
-                return;
-            }
+        if let Err(e) = manager.select_variant(chosen_index).await {
+            error!("HLS: failed to select variant {chosen_index}: {e:?}");
+            return;
+        }
 
-            let master = match manager.master() {
-                Some(m) => m,
-                None => {
-                    error!("HLS: master playlist not available after load_master()");
-                    return;
-                }
-            };
-
-            let chosen_index = initial_variant_index
-                .filter(|&i| i < master.variants.len())
-                .unwrap_or_else(|| select_variant_index(master.variants.as_slice()));
-            info!(
-                "HLS: selecting variant index {} of {} (initial={:?})",
-                chosen_index,
-                master.variants.len(),
-                initial_variant_index
-            );
-
-            if let Err(e) = manager.select_variant(chosen_index).await {
-                error!("HLS: failed to select variant {chosen_index}: {e:?}");
-                return;
-            }
-
-            // Try to download and send init segment first (for fMP4).
-            match manager.download_init_segment().await {
-                Ok(Some(bytes)) => {
-                    // Some CMAF init segments include a top-level 'sidx' box which makes the demuxer
-                    // assume segmented mode and try random seeks. Strip 'sidx' to keep linear playback.
-                    fn strip_sidx(data: &[u8]) -> Vec<u8> {
-                        let mut out = Vec::with_capacity(data.len());
-                        let mut pos = 0usize;
-                        while pos + 8 <= data.len() {
-                            let size = u32::from_be_bytes([
-                                data[pos],
-                                data[pos + 1],
-                                data[pos + 2],
-                                data[pos + 3],
-                            ]) as u64;
-                            let typ = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
-                            let (hdr_len, box_size) = if size == 1 {
-                                if pos + 16 > data.len() {
-                                    break;
-                                }
-                                let larg = u64::from_be_bytes([
-                                    data[pos + 8],
-                                    data[pos + 9],
-                                    data[pos + 10],
-                                    data[pos + 11],
-                                    data[pos + 12],
-                                    data[pos + 13],
-                                    data[pos + 14],
-                                    data[pos + 15],
-                                ]);
-                                (16usize, larg as usize)
-                            } else if size == 0 {
-                                // box extends to end of buffer
-                                (8usize, data.len() - pos)
-                            } else {
-                                (8usize, size as usize)
-                            };
-                            if box_size < hdr_len || pos + box_size > data.len() {
-                                // malformed size; copy the rest and stop
-                                out.extend_from_slice(&data[pos..]);
-                                pos = data.len();
+        // Try to download and send init segment first (for fMP4).
+        match manager.download_init_segment().await {
+            Ok(Some(bytes)) => {
+                // Some CMAF init segments include a top-level 'sidx' box which makes the demuxer
+                // assume segmented mode and try random seeks. Strip 'sidx' to keep linear playback.
+                fn strip_sidx(data: &[u8]) -> Vec<u8> {
+                    let mut out = Vec::with_capacity(data.len());
+                    let mut pos = 0usize;
+                    while pos + 8 <= data.len() {
+                        let size = u32::from_be_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]) as u64;
+                        let typ = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+                        let (hdr_len, box_size) = if size == 1 {
+                            if pos + 16 > data.len() {
                                 break;
                             }
-                            if &typ == b"sidx" {
-                                // skip this box entirely
-                                pos += box_size;
-                                continue;
-                            } else {
-                                out.extend_from_slice(&data[pos..pos + box_size]);
-                                pos += box_size;
-                            }
-                        }
-                        if pos < data.len() {
+                            let larg = u64::from_be_bytes([
+                                data[pos + 8],
+                                data[pos + 9],
+                                data[pos + 10],
+                                data[pos + 11],
+                                data[pos + 12],
+                                data[pos + 13],
+                                data[pos + 14],
+                                data[pos + 15],
+                            ]);
+                            (16usize, larg as usize)
+                        } else if size == 0 {
+                            // box extends to end of buffer
+                            (8usize, data.len() - pos)
+                        } else {
+                            (8usize, size as usize)
+                        };
+                        if box_size < hdr_len || pos + box_size > data.len() {
+                            // malformed size; copy the rest and stop
                             out.extend_from_slice(&data[pos..]);
-                        }
-                        out
-                    }
-                    let cleaned = strip_sidx(&bytes);
-                    let _ = data_tx.send(cleaned);
-                }
-                Ok(None) => {
-                    debug!("HLS: no init segment present");
-                }
-                Err(e) => {
-                    error!("HLS: failed to download init segment: {e:?}");
-                    // Non-fatal: proceed with media segments.
-                }
-            }
-
-            // Stream media segments until EOF or stop signal.
-            loop {
-                // stop check disabled: do not terminate producer on spurious stop signals
-
-                match manager.next_segment().await {
-                    Ok(Some(seg)) => {
-                        // Convert Bytes to Vec<u8>
-                        let chunk = seg.data.to_vec();
-                        trace!(
-                            "HLS: sending segment seq={} bytes={}",
-                            seg.sequence,
-                            chunk.len()
-                        );
-                        if data_tx.send(chunk).is_err() {
-                            // Consumer dropped; stop.
+                            pos = data.len();
                             break;
                         }
+                        if &typ == b"sidx" {
+                            // skip this box entirely
+                            pos += box_size;
+                            continue;
+                        } else {
+                            out.extend_from_slice(&data[pos..pos + box_size]);
+                            pos += box_size;
+                        }
                     }
-                    Ok(None) => {
-                        // End of VOD playlist.
-                        trace!("HLS: end of stream reached (playlist ENDLIST or no more segments)");
-                        break;
+                    if pos < data.len() {
+                        out.extend_from_slice(&data[pos..]);
                     }
-                    Err(e) => {
-                        trace!("HLS: next_segment error: {e:?}");
-                        // Decide whether to continue or break; for now, break on errors.
+                    out
+                }
+                let cleaned = strip_sidx(&bytes);
+                let _ = data_tx.send(cleaned);
+            }
+            Ok(None) => {
+                debug!("HLS: no init segment present");
+            }
+            Err(e) => {
+                error!("HLS: failed to download init segment: {e:?}");
+                // Non-fatal: proceed with media segments.
+            }
+        }
+
+        // Stream media segments until EOF or stop signal.
+        loop {
+            if cancel_child.is_cancelled() {
+                trace!("HLS: cancel requested, stopping producer");
+                break;
+            }
+
+            match manager.next_segment().await {
+                Ok(Some(seg)) => {
+                    // Convert Bytes to Vec<u8>
+                    let chunk = seg.data.to_vec();
+                    trace!(
+                        "HLS: sending segment seq={} bytes={}",
+                        seg.sequence,
+                        chunk.len()
+                    );
+                    if data_tx.send(chunk).is_err() {
+                        // Consumer dropped; stop.
                         break;
                     }
                 }
+                Ok(None) => {
+                    // End of VOD playlist.
+                    trace!("HLS: end of stream reached (playlist ENDLIST or no more segments)");
+                    break;
+                }
+                Err(e) => {
+                    trace!("HLS: next_segment error: {e:?}");
+                    // Decide whether to continue or break; for now, break on errors.
+                    break;
+                }
             }
-        });
+        }
     });
 
     // Initialize seek gate disabled; playback code can enable after decoder init.
@@ -454,8 +453,8 @@ pub fn open_hls_media_source(
     Ok((
         mss,
         HlsSourceController {
-            stop_tx,
-            join: Some(join),
+            cancel,
+            join: Mutex::new(Some(join)),
             seek_flag,
         },
     ))
