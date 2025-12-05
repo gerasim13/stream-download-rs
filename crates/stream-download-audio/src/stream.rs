@@ -236,7 +236,12 @@ impl AudioStream {
             if let Some(ctrl) = &controller {
                 ctrl.enable_seek();
             }
-            debug!("HLS backend: seek gate enabled, entering decode loop.");
+            let mut pkt_counter: u64 = 0;
+            let mut total_decoded_frames: u64 = 0;
+            debug!(
+                "HLS backend: seek gate enabled, entering decode loop. pkt_counter={} total_frames={}",
+                pkt_counter, total_decoded_frames
+            );
 
             // Temporary interleaved buffer for converted f32 samples.
             let mut tmp: Vec<f32> = Vec::new();
@@ -246,6 +251,8 @@ impl AudioStream {
 
             // Decode loop: read packets, decode, convert to f32, push into ring buffer.
             loop {
+                pkt_counter = pkt_counter.saturating_add(1);
+                debug!("HLS backend: next_packet() call #{}", pkt_counter);
                 match format.next_packet() {
                     Ok(Some(packet)) => {
                         if packet.track_id() != track_id {
@@ -261,6 +268,12 @@ impl AudioStream {
                                 let chans = gab.num_planes();
                                 let frames = gab.frames();
                                 let needed = chans * frames;
+                                total_decoded_frames =
+                                    total_decoded_frames.saturating_add(frames as u64);
+                                debug!(
+                                    "HLS backend: decoded packet #{} -> {} frames ({} ch), total_decoded_frames={}",
+                                    pkt_counter, frames, chans, total_decoded_frames
+                                );
                                 trace!("HLS backend: decoded {} frames ({} ch)", frames, chans);
 
                                 // Resize temp buffer to exact length and copy as interleaved f32.
@@ -350,6 +363,7 @@ impl AudioStream {
                                 events_clone.send(PlayerEvent::EndOfStream);
                                 break;
                             }
+                            debug!("HLS backend: unexpected EOF (retry #{})", eof_retry_count);
                             std::thread::sleep(std::time::Duration::from_millis(50));
                             continue;
                         } else if msg.to_ascii_lowercase().contains("reset")

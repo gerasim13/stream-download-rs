@@ -48,12 +48,21 @@ impl HlsMediaSource {
             Ok(chunk) => {
                 // New chunk begins at the current absolute position.
                 self.base_pos = self.pos;
+                let len = chunk.len();
+                debug!(
+                    "HLSMediaSource::refill: received chunk bytes={} base_pos={} pos={}",
+                    len, self.base_pos, self.pos
+                );
                 self.cur = std::io::Cursor::new(chunk);
                 Ok(())
             }
             Err(_) => {
                 // Producer dropped; mark EOF.
                 self.eof = true;
+                debug!(
+                    "HLSMediaSource::refill: channel closed -> EOF at pos={} base_pos={}",
+                    self.pos, self.base_pos
+                );
                 Ok(())
             }
         }
@@ -138,8 +147,17 @@ impl Read for HlsMediaSource {
             }
         }
 
+        let want = out.len();
         let n = self.cur.read(out)?;
         self.pos = self.base_pos + self.cur.position() as u64;
+        debug!(
+            "HLSMediaSource::read: requested={} returned={} pos={} base_pos={} cur_pos={}",
+            want,
+            n,
+            self.pos,
+            self.base_pos,
+            self.cur.position()
+        );
         Ok(n)
     }
 }
@@ -148,17 +166,36 @@ impl Seek for HlsMediaSource {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
         // Gate seeks until decoder is initialized to avoid tail-probing during probe.
         if !self.seek_enabled.load(Ordering::Relaxed) {
+            debug!("HLSMediaSource::seek: denied during probe: {:?}", pos);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "seek disabled during probe",
             ));
         }
         match pos {
-            SeekFrom::Start(n) => self.seek_to_forward_only(n),
+            SeekFrom::Start(n) => {
+                let res = self.seek_to_forward_only(n);
+                match &res {
+                    Ok(np) => debug!("HLSMediaSource::seek(Start): target={} -> pos={}", n, np),
+                    Err(e) => debug!("HLSMediaSource::seek(Start): target={} -> error={}", n, e),
+                }
+                res
+            }
             SeekFrom::Current(off) => {
                 if off >= 0 {
                     let target = self.pos.saturating_add(off as u64);
-                    self.seek_to_forward_only(target)
+                    let res = self.seek_to_forward_only(target);
+                    match &res {
+                        Ok(np) => debug!(
+                            "HLSMediaSource::seek(Current+): off={} target={} -> pos={}",
+                            off, target, np
+                        ),
+                        Err(e) => debug!(
+                            "HLSMediaSource::seek(Current+): off={} target={} -> error={}",
+                            off, target, e
+                        ),
+                    }
+                    res
                 } else {
                     // Attempt a limited backward seek within the current buffer.
                     let back = (-off) as u64;
@@ -166,6 +203,10 @@ impl Seek for HlsMediaSource {
                         let new_off = self.cur.position() as u64 - back;
                         self.cur.set_position(new_off);
                         self.pos = self.base_pos + new_off;
+                        debug!(
+                            "HLSMediaSource::seek(Current- within chunk): back={} -> pos={}",
+                            back, self.pos
+                        );
                         Ok(self.pos)
                     } else {
                         Err(std::io::Error::new(
@@ -246,7 +287,7 @@ pub fn open_hls_media_source(
     hls_config: HlsConfig,
     initial_variant_index: Option<usize>,
 ) -> IoResult<(MediaSourceStream, HlsSourceController)> {
-    let (data_tx, data_rx) = kchan::unbounded::<Vec<u8>>();
+    let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
     let (stop_tx, stop_rx) = kchan::unbounded::<()>();
 
     let url_str = url.to_string();
@@ -261,7 +302,6 @@ pub fn open_hls_media_source(
             Ok(rt) => rt,
             Err(e) => {
                 error!("failed to build tokio runtime for HLS backend: {e}");
-                let _ = data_tx.close();
                 return;
             }
         };
@@ -274,7 +314,6 @@ pub fn open_hls_media_source(
             // Load master and select a variant.
             if let Err(e) = manager.load_master().await {
                 error!("HLS: failed to load master playlist: {e:?}");
-                let _ = data_tx.close();
                 return;
             }
 
@@ -282,7 +321,6 @@ pub fn open_hls_media_source(
                 Some(m) => m,
                 None => {
                     error!("HLS: master playlist not available after load_master()");
-                    let _ = data_tx.close();
                     return;
                 }
             };
@@ -299,14 +337,68 @@ pub fn open_hls_media_source(
 
             if let Err(e) = manager.select_variant(chosen_index).await {
                 error!("HLS: failed to select variant {chosen_index}: {e:?}");
-                let _ = data_tx.close();
                 return;
             }
 
             // Try to download and send init segment first (for fMP4).
             match manager.download_init_segment().await {
                 Ok(Some(bytes)) => {
-                    let _ = data_tx.send(bytes);
+                    // Some CMAF init segments include a top-level 'sidx' box which makes the demuxer
+                    // assume segmented mode and try random seeks. Strip 'sidx' to keep linear playback.
+                    fn strip_sidx(data: &[u8]) -> Vec<u8> {
+                        let mut out = Vec::with_capacity(data.len());
+                        let mut pos = 0usize;
+                        while pos + 8 <= data.len() {
+                            let size = u32::from_be_bytes([
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
+                            ]) as u64;
+                            let typ = [data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]];
+                            let (hdr_len, box_size) = if size == 1 {
+                                if pos + 16 > data.len() {
+                                    break;
+                                }
+                                let larg = u64::from_be_bytes([
+                                    data[pos + 8],
+                                    data[pos + 9],
+                                    data[pos + 10],
+                                    data[pos + 11],
+                                    data[pos + 12],
+                                    data[pos + 13],
+                                    data[pos + 14],
+                                    data[pos + 15],
+                                ]);
+                                (16usize, larg as usize)
+                            } else if size == 0 {
+                                // box extends to end of buffer
+                                (8usize, data.len() - pos)
+                            } else {
+                                (8usize, size as usize)
+                            };
+                            if box_size < hdr_len || pos + box_size > data.len() {
+                                // malformed size; copy the rest and stop
+                                out.extend_from_slice(&data[pos..]);
+                                pos = data.len();
+                                break;
+                            }
+                            if &typ == b"sidx" {
+                                // skip this box entirely
+                                pos += box_size;
+                                continue;
+                            } else {
+                                out.extend_from_slice(&data[pos..pos + box_size]);
+                                pos += box_size;
+                            }
+                        }
+                        if pos < data.len() {
+                            out.extend_from_slice(&data[pos..]);
+                        }
+                        out
+                    }
+                    let cleaned = strip_sidx(&bytes);
+                    let _ = data_tx.send(cleaned);
                 }
                 Ok(None) => {
                     debug!("HLS: no init segment present");
@@ -347,9 +439,6 @@ pub fn open_hls_media_source(
                     }
                 }
             }
-
-            // Close the data channel so the MediaSource sees EOF.
-            let _ = data_tx.close();
         });
     });
 

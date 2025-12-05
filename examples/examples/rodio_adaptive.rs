@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .add_directive("stream_download_audio=debug".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
-        .with_line_number(true)
-        .with_file(true)
+        .with_line_number(false)
+        .with_file(false)
         .init();
 
     let (url, vm, manual_idx) = parse_args();
