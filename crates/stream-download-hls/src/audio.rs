@@ -225,7 +225,15 @@ impl DecodedSampleRing {
             if !inner.buf.is_empty() {
                 break;
             }
-            inner = self.cv.wait(inner).unwrap();
+            let (guard, timeout) = self
+                .cv
+                .wait_timeout(inner, Duration::from_millis(15))
+                .unwrap();
+            inner = guard;
+            if timeout.timed_out() {
+                // Non-blocking behavior: return 0 on timeout so callers can poll.
+                return 0;
+            }
         }
 
         let n = out.len().min(inner.buf.len());
@@ -487,14 +495,92 @@ impl AdaptiveHlsAudio {
                                 // - (future) reinitialize symphonia demux/decoder.
 
                                 // Placeholder "decode": generate zeros matching duration (in frames).
-                                let s = spec.lock().unwrap().clone();
-                                let frames = (seg.duration.as_secs_f64() * s.sample_rate as f64)
-                                    .ceil() as usize;
-                                let samples = frames * s.channels as usize;
+                                // Try to decode the segment bytes with Symphonia. If it fails, fall back to silence.
+                                let mut pushed_any = false;
+                                {
+                                    // Wrap segment data in a seekable cursor for Symphonia.
+                                    let cursor = std::io::Cursor::new(seg.data.to_vec());
+                                    let mss = symphonia::core::io::MediaSourceStream::new(
+                                        Box::new(cursor),
+                                        Default::default(),
+                                    );
+                                    let hint = symphonia::core::probe::Hint::new();
 
-                                // Keep zeros; could add a fade-in/out to show progress.
-                                let silence = vec![0.0f32; samples];
-                                decoded.push_samples(&silence);
+                                    if let Ok(probed) = symphonia::default::get_probe().format(
+                                        &hint,
+                                        mss,
+                                        &symphonia::core::formats::FormatOptions::default(),
+                                        &symphonia::core::meta::MetadataOptions::default(),
+                                    ) {
+                                        let mut format = probed.format;
+                                        // Choose the first track that has codec params (likely audio).
+                                        if let Some(track) = format.tracks().iter().find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL) {
+                                            let track_id = track.id;
+                                            // Initialize decoder for the selected track.
+                                            if let Ok(mut decoder) = symphonia::default::get_codecs().make(
+                                                &track.codec_params,
+                                                &symphonia::core::codecs::DecoderOptions::default(),
+                                            ) {
+                                                // Update output spec (sample rate / channels) from track if available.
+                                                if let (Some(sr), Some(ch)) = (track.codec_params.sample_rate, track.codec_params.channels) {
+                                                    let mut sp = spec.lock().unwrap();
+                                                    sp.sample_rate = sr;
+                                                    sp.channels = ch.count() as u16;
+                                                }
+
+                                                // Decode all packets in this segment and push f32 interleaved samples.
+                                                loop {
+                                                    match format.next_packet() {
+                                                        Ok(packet) => {
+                                                            if packet.track_id() != track_id {
+                                                                continue;
+                                                            }
+                                                            match decoder.decode(&packet) {
+                                                                Ok(audio_buf) => {
+                                                                    // Update output spec from the decoded buffer if available.
+                                                                    {
+                                                                        let mut sp = spec.lock().unwrap();
+                                                                        sp.sample_rate = audio_buf.spec().rate;
+                                                                        sp.channels = audio_buf.spec().channels.count() as u16;
+                                                                    }
+                                                                    // Convert to interleaved f32 using a temporary SampleBuffer.
+                                                                    let frames = audio_buf.frames();
+                                                                    let mut sample_buf = symphonia::core::audio::SampleBuffer::<f32>::new(
+                                                                        frames as u64,
+                                                                        *audio_buf.spec(),
+                                                                    );
+                                                                    sample_buf.copy_interleaved_ref(audio_buf);
+                                                                    let samples = sample_buf.samples();
+                                                                    if !samples.is_empty() {
+                                                                        decoded.push_samples(samples);
+                                                                        pushed_any = true;
+                                                                    }
+                                                                }
+                                                                Err(_) => {
+                                                                    // Decoding error for this packet; continue.
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(_) => {
+                                                            // End of packets for this segment.
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !pushed_any {
+                                    // Fallback: synthesize silence matching the segment duration.
+                                    let s = spec.lock().unwrap().clone();
+                                    let frames = (seg.duration.as_secs_f64() * s.sample_rate as f64)
+                                        .ceil() as usize;
+                                    let samples = frames * s.channels as usize;
+                                    let silence = vec![0.0f32; samples];
+                                    decoded.push_samples(&silence);
+                                }
 
                                 // Monitoring
                                 events.send(PlayerEvent::BufferLevel {

@@ -13,7 +13,7 @@ use rodio::{OutputStreamBuilder, Sink, Source};
 fn default_url() -> String {
     env::var("HLS_URL").unwrap_or_else(|_| {
         // Public live MP3 HLS radio stream; override with HLS_URL if needed.
-        "https://streams.radiomast.io/ref-128k-mp3-stereo/hls.m3u8".to_string()
+        "https://stream.silvercomet.top/hls/master.m3u8".to_string()
     })
 }
 
@@ -61,13 +61,9 @@ impl Iterator for RodioSourceAdapter {
             };
 
             if read == 0 {
-                // The source may be at EOF (VOD finished) or not yet produced any data.
-                // Sleep briefly and try again on next call to avoid busy looping.
+                // No data yet; output a short silence sample to keep the stream alive.
                 thread::sleep(Duration::from_millis(10));
-                // If it keeps returning 0 after some time, rodio would keep polling.
-                // Mark EOF here to signal completion for VOD/end-of-stream.
-                self.eof = true;
-                return None;
+                return Some(0.0);
             }
 
             self.buf.truncate(read);
@@ -104,7 +100,7 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
 
     let mut url = default_url();
-    let mut mode = "auto".to_string();
+    let mut mode = "manual".to_string();
     let mut manual_idx: Option<usize> = None;
 
     let mut i = 0usize;
@@ -204,6 +200,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let stream_handle =
         rodio::OutputStreamBuilder::open_default_stream().expect("open default audio stream");
     let sink = rodio::Sink::connect_new(&stream_handle.mixer());
+    sink.play();
 
     // Adapter pulls from FloatSampleSource and feeds rodio
     // A chunk of ~4096 samples is a good balance
