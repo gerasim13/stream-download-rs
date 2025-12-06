@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
-                .add_directive("stream_download_audio=debug".parse()?)
+                .add_directive("stream_download_audio=trace".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
         .with_line_number(true)
@@ -73,39 +73,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Subscribe to events for visibility.
     let events_rx = stream.subscribe_events();
     let shared = Arc::new(Mutex::new(stream));
-
-    // Spawn an event logger.
-    thread::spawn(move || {
-        while let Ok(ev) = events_rx.recv() {
-            match ev {
-                PlayerEvent::Started => trace!("[event] pipeline started"),
-                PlayerEvent::FormatChanged {
-                    sample_rate,
-                    channels,
-                    codec,
-                    container,
-                } => {
-                    eprintln!(
-                        "[event] format changed: {} Hz, {} ch, codec={:?}, container={:?}",
-                        sample_rate, channels, codec, container
-                    );
-                }
-                PlayerEvent::BufferLevel { decoded_frames } => {
-                    trace!("[event] buffer: {} frames decoded", decoded_frames);
-                }
-                PlayerEvent::EndOfStream => {
-                    eprintln!("[event] end-of-stream");
-                    break;
-                }
-                PlayerEvent::VariantSwitched { .. } => {
-                    // Not relevant for HTTP, but included for completeness.
-                }
-                PlayerEvent::Error { message } => {
-                    eprintln!("[event] ERROR: {}", message);
-                }
-            }
-        }
-    });
 
     // Setup rodio output.
     let stream_handle =

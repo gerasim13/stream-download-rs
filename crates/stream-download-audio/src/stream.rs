@@ -1,35 +1,28 @@
 /*!
-AudioStream implementation: unified float PCM source backed by a ring buffer.
+AudioStream implementation: unified float PCM source backed by async ring buffers and PipelineRunner.
 
 This module provides the high-level `AudioStream` type that:
 - exposes a pull-based API (`FloatSampleSource`) returning interleaved f32 PCM,
 - can be constructed from either an HLS URL (via `stream-download-hls`) or a single HTTP URL (via `stream-download`),
-- maintains a lock-free SPSC ring buffer for low-latency audio delivery,
+- maintains SPSC async ring buffers for low-latency audio delivery,
 - emits player events via `kanal`,
-- anticipates a future processing chain and background pipeline (decode, resample, effects).
+- delegates background work (I/O, probe, decode, resample, effects) to `pipeline::PipelineRunner`.
 
 Status:
-- This is a skeleton implementation that wires up the public API and buffering.
-- The actual background pipeline (I/O, decode, resample, effects) will be integrated later.
+- The decode/resample/effects pipeline is orchestrated by `PipelineRunner`.
 */
 
 use std::sync::{Arc, Mutex};
 
+use async_ringbuf::{AsyncHeapCons, traits::*};
 use kanal as kchan;
-use ringbuf::traits::{Consumer, Producer, Split};
-use ringbuf::{HeapCons, HeapProd, HeapRb};
-use tracing::{debug, error, info, trace};
+use tracing::trace;
 
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
-use crate::backends::http::{extension_from_url, open_http_seek_gated_mss};
-use stream_download_hls::{AbrConfig, HlsConfig, SelectionMode};
-
-use symphonia::core::audio::GenericAudioBufferRef;
-use symphonia::core::codecs::audio::AudioDecoderOptions;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, TrackType};
-use symphonia::core::meta::MetadataOptions;
-use symphonia::default::{get_codecs, get_probe};
+use crate::backends::hls::run_hls_packet_producer;
+use crate::backends::http::run_http_packet_producer;
+use crate::pipeline::{EventHub as PipeEventHub, PipelineRunner};
+use stream_download_hls::{AbrConfig, HlsConfig};
 
 /// Small trait to unify enabling seek after decoder init for different controllers.
 trait SeekEnable: Send + Sync + 'static {
@@ -48,182 +41,6 @@ impl SeekEnable for crate::backends::hls::HlsSourceController {
     fn enable_seek_gate(&self) {
         self.enable_seek();
     }
-}
-
-/// Spawn a blocking decode worker that probes, decodes, converts to f32 and pushes into the ring.
-/// This unifies HTTP/HLS decode loop in one place.
-fn spawn_decode_worker<C>(
-    mut format: Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
-    controller: C,
-    producer: Arc<Mutex<HeapProd<f32>>>,
-    events: Arc<EventHub>,
-    spec_out: Arc<Mutex<AudioSpec>>,
-    container_name: Option<String>,
-) where
-    C: SeekEnable,
-{
-    tokio::task::spawn_blocking(move || {
-        // Select the default audio track.
-        let (mut track_id, owned_audio_params) = match format.default_track(TrackType::Audio) {
-            Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
-                Some(ap) => {
-                    trace!(
-                        "decode: selected track id={} sr={:?} ch={:?}",
-                        t.id,
-                        ap.sample_rate,
-                        ap.channels.clone().map(|c| c.count())
-                    );
-                    (t.id, ap)
-                }
-                None => {
-                    error!("decode: selected track is not audio");
-                    events.send(PlayerEvent::Error {
-                        message: "no audio params on selected track".into(),
-                    });
-                    return;
-                }
-            },
-            None => {
-                error!("decode: no default audio track");
-                events.send(PlayerEvent::Error {
-                    message: "no default audio track".into(),
-                });
-                return;
-            }
-        };
-
-        // Build the decoder using dev-0.6 API with owned audio params.
-        let dec_opts = AudioDecoderOptions::default();
-        trace!("decode: creating audio decoder...");
-        let mut decoder = match get_codecs().make_audio_decoder(&owned_audio_params, &dec_opts) {
-            Ok(d) => d,
-            Err(e) => {
-                error!("decode: decoder make failed: {e}");
-                events.send(PlayerEvent::Error {
-                    message: format!("decoder make failed: {e}"),
-                });
-                return;
-            }
-        };
-
-        // Enable seek on the underlying source now that decoder is ready.
-        controller.enable_seek_gate();
-        trace!("decode: seek enabled, entering loop");
-
-        // Temporary interleaved buffer for converted f32 samples.
-        let mut tmp: Vec<f32> = Vec::new();
-        let mut signalled_format = false;
-
-        // Throttle for BufferLevel events (every ~500ms).
-        let mut last_level_instant = std::time::Instant::now();
-
-        // HLS-specific heuristic: retry on unexpected EOFs.
-        let mut eof_retry_count: u32 = 0;
-
-        // Decode loop: read packets, decode, convert to f32, push into ring buffer.
-        loop {
-            match format.next_packet() {
-                Ok(Some(packet)) => {
-                    match decoder.decode(&packet) {
-                        Ok(decoded) => {
-                            // Convert to a generic buffer reference and then to interleaved f32.
-                            let gab: GenericAudioBufferRef = decoded;
-                            let chans = gab.num_planes();
-                            let frames = gab.frames();
-                            let needed = chans * frames;
-
-                            // Reset EOF retry counter on successful decode (HLS).
-                            eof_retry_count = 0;
-
-                            // Resize temp buffer to exact length and copy as interleaved f32.
-                            tmp.resize(needed, 0.0);
-                            gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
-
-                            // Emit format on first decoded frame.
-                            if !signalled_format {
-                                let ds = gab.spec();
-                                let new_spec = AudioSpec {
-                                    sample_rate: ds.rate(),
-                                    channels: ds.channels().count() as u16,
-                                };
-                                *spec_out.lock().unwrap() = new_spec;
-                                trace!(
-                                    "decode: first frame -> FormatChanged rate={}Hz ch={}",
-                                    new_spec.sample_rate, new_spec.channels
-                                );
-                                events.send(PlayerEvent::FormatChanged {
-                                    sample_rate: new_spec.sample_rate,
-                                    channels: new_spec.channels,
-                                    codec: None,
-                                    container: container_name.clone(),
-                                });
-                                events.send(PlayerEvent::Started);
-                                signalled_format = true;
-                            }
-
-                            // Push into the ring buffer with simple backpressure (no drops).
-                            if needed > 0 {
-                                if let Ok(mut prod) = producer.lock() {
-                                    let mut i = 0usize;
-                                    while i < needed {
-                                        if prod.try_push(tmp[i]).is_ok() {
-                                            i += 1;
-                                        } else {
-                                            // Ring full: wait for consumer to drain a bit.
-                                            std::thread::sleep(std::time::Duration::from_millis(5));
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Throttle BufferLevel events (~500ms).
-                            if last_level_instant.elapsed() >= std::time::Duration::from_millis(500)
-                            {
-                                events.send(PlayerEvent::BufferLevel {
-                                    decoded_frames: frames,
-                                });
-                                last_level_instant = std::time::Instant::now();
-                            }
-                        }
-                        Err(e) => {
-                            // Non-fatal decode error; continue.
-                            debug!("decode: decode error: {e}");
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // End of stream reached.
-                    info!("decode: end of stream");
-                    events.send(PlayerEvent::EndOfStream);
-                    break;
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    // Heuristic handling for segmented fMP4 (isomp4) over streaming (HLS):
-                    // - Unexpected EOF while more data is expected: backoff and retry.
-                    if msg.to_ascii_lowercase().contains("unexpected")
-                        && msg.to_ascii_lowercase().contains("eof")
-                    {
-                        eof_retry_count = eof_retry_count.saturating_add(1);
-                        if eof_retry_count > 50 {
-                            info!("decode: repeated unexpected EOFs -> EndOfStream");
-                            events.send(PlayerEvent::EndOfStream);
-                            break;
-                        }
-                        debug!("decode: unexpected EOF (retry #{})", eof_retry_count);
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-
-                    error!("decode: next_packet error: {msg}");
-                    events.send(PlayerEvent::Error {
-                        message: format!("next_packet error: {msg}"),
-                    });
-                    break;
-                }
-            }
-        }
-    });
 }
 
 /// Internal backend selector for the audio source.
@@ -273,8 +90,8 @@ impl EventHub {
 /// surface are implemented.
 pub struct AudioStream {
     spec: Arc<Mutex<AudioSpec>>,
-    producer: Arc<Mutex<HeapProd<f32>>>,
-    consumer: HeapCons<f32>,
+
+    pcm_cons: AsyncHeapCons<f32>,
     events: Arc<EventHub>,
 
     pub(crate) backend: Backend,
@@ -303,136 +120,51 @@ impl AudioStream {
         abr_config: AbrConfig,
     ) -> Self {
         let url = url.into();
-
         let spec = Arc::new(Mutex::new(AudioSpec {
             sample_rate: opts.target_sample_rate,
             channels: opts.target_channels,
         }));
-
-        let cap = opts
-            .ring_capacity_frames
-            .saturating_mul(opts.target_channels as usize);
-        let rb = HeapRb::<f32>::new(cap.max(1)); // avoid zero-capacity
-        let (prod, cons) = rb.split();
-
         let events = Arc::new(EventHub::new());
-        let producer = Arc::new(Mutex::new(prod));
+        let byte_capacity = 8usize;
+        let pcm_capacity = opts
+            .ring_capacity_frames
+            .saturating_mul(opts.target_channels as usize)
+            .max(1);
+        let mut runner = PipelineRunner::new(byte_capacity, pcm_capacity);
 
-        // Clone state for unified decode worker.
+        // Wire events from pipeline to this AudioStream's EventHub.
         let events_clone = events.clone();
-        let spec_clone = spec.clone();
-        let producer_clone = producer.clone();
-        let hls_cfg = hls_config.clone();
-        let initial_variant_idx = match opts.initial_mode {
-            SelectionMode::Manual(i) => Some(i.0),
-            _ => None,
-        };
+        runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
-        // Open HLS MediaSourceStream (spawns its own async producer internally).
-        tracing::trace!("HLS backend: opening MediaSourceStream for URL: {}", url);
-        let (mss, controller) = match crate::backends::hls::open_hls_media_source_async(
+        // Launch HLS packet producer (async) using the producer half from runner.
+        let selection = opts.initial_mode;
+        let byte_prod = runner
+            .byte_prod
+            .take()
+            .expect("byte producer already taken");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(run_hls_packet_producer(
             url.clone(),
-            hls_cfg,
+            hls_config.clone(),
             abr_config.clone(),
-            opts.initial_mode,
-            initial_variant_idx,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                error!("HLS backend: open failed: {e}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("HLS open failed: {e}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Hls {
-                        url,
-                        hls_config,
-                        abr_config,
-                    },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-        };
+            selection,
+            byte_prod,
+            cancel.clone(),
+        ));
 
-        // Probe and open the container in a blocking thread so we don't block the Tokio workers.
-        // This allows the HLS producer task to run and feed bytes into the channel for probing.
-        let hint = Hint::new();
-        let probe_join = tokio::task::spawn_blocking(move || {
-            get_probe().probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-        })
-        .await;
+        // Launch decoder loop (spawn_blocking internally)
+        let pipe_events = PipeEventHub::new();
+        let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
+        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), pipe_events, processors);
 
-        let format = match probe_join {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
-                error!("HLS backend: probe failed: {e}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("probe failed: {e}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Hls {
-                        url,
-                        hls_config,
-                        abr_config,
-                    },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-            Err(join_err) => {
-                error!("HLS backend: probe join error: {join_err}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("probe join error: {join_err}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Hls {
-                        url,
-                        hls_config,
-                        abr_config,
-                    },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-        };
+        // Expose runner's PCM ring to AudioStream
 
-        trace!(
-            "HLS backend: probe OK, format='{}'",
-            format.format_info().short_name
-        );
-        let container_name = Some(format.format_info().short_name.to_string());
-
-        // Start unified decode worker (spawn_blocking).
-        spawn_decode_worker(
-            format,
-            controller,
-            producer_clone,
-            events_clone,
-            spec_clone,
-            container_name,
-        );
+        let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
 
         Self {
             spec,
-            producer,
-            consumer: cons,
+
+            pcm_cons,
             events,
             backend: Backend::Hls {
                 url,
@@ -448,115 +180,45 @@ impl AudioStream {
     /// This path opens the HTTP MediaSourceStream, then starts a unified decode worker.
     pub async fn from_http(url: impl Into<String>, opts: AudioOptions) -> Self {
         let url = url.into();
-
         let spec = Arc::new(Mutex::new(AudioSpec {
             sample_rate: opts.target_sample_rate,
             channels: opts.target_channels,
         }));
-
-        let cap = opts
-            .ring_capacity_frames
-            .saturating_mul(opts.target_channels as usize);
-        let rb = HeapRb::<f32>::new(cap.max(1));
-        let (prod, cons) = rb.split();
-
         let events = Arc::new(EventHub::new());
-        let producer = Arc::new(Mutex::new(prod));
+        let byte_capacity = 8usize;
+        let pcm_capacity = opts
+            .ring_capacity_frames
+            .saturating_mul(opts.target_channels as usize)
+            .max(1);
+        let mut runner = PipelineRunner::new(byte_capacity, pcm_capacity);
 
-        // Clone state for unified decode worker.
+        // Wire events from pipeline to this AudioStream's EventHub.
         let events_clone = events.clone();
-        let spec_clone = spec.clone();
-        let producer_clone = producer.clone();
+        runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
-        // Open a seek-gated MediaSourceStream.
-        trace!("HTTP backend: opening seek-gated MSS for URL: {}", url);
-        let (mss, gate) = match open_http_seek_gated_mss(&url).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!("HTTP backend: open failed: {e}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("open failed: {e}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Http { url },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-        };
+        // Launch HTTP packet producer (async) using the producer half from runner.
+        let byte_prod = runner
+            .byte_prod
+            .take()
+            .expect("byte producer already taken");
+        let url_for_task = url.clone();
+        tokio::spawn(async move {
+            let _ = run_http_packet_producer(url_for_task.as_str(), byte_prod).await;
+        });
 
-        // Probe and open the container in a blocking thread so we don't block the Tokio workers.
-        // This avoids starving the HTTP fetcher and lets it feed bytes for probing.
-        let mut hint = Hint::new();
-        if let Some(ext) = extension_from_url(&url) {
-            hint.with_extension(&ext);
-        }
-        let probe_join = tokio::task::spawn_blocking(move || {
-            get_probe().probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-        })
-        .await;
+        // Launch decoder loop (spawn_blocking internally)
+        let pipe_events = PipeEventHub::new();
+        let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
+        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), pipe_events, processors);
 
-        let format = match probe_join {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => {
-                error!("HTTP backend: probe failed: {e}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("probe failed: {e}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Http { url },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-            Err(join_err) => {
-                error!("HTTP backend: probe join error: {join_err}");
-                events_clone.send(PlayerEvent::Error {
-                    message: format!("probe join error: {join_err}"),
-                });
-                return Self {
-                    spec,
-                    producer,
-                    consumer: cons,
-                    events,
-                    backend: Backend::Http { url },
-                    processors: Arc::new(Mutex::new(Vec::new())),
-                };
-            }
-        };
+        // Expose runner's PCM ring to AudioStream
 
-        trace!(
-            "HTTP backend: probe OK, format='{}'",
-            format.format_info().short_name
-        );
-        let container_name = Some(format.format_info().short_name.to_string());
-
-        // Enable seeking now that the decoder is initialized (in worker).
-        // We pass the gate as controller to the unified worker which calls enable_seek().
-        spawn_decode_worker(
-            format,
-            gate,
-            producer_clone,
-            events_clone,
-            spec_clone,
-            container_name,
-        );
+        let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
 
         Self {
             spec,
-            producer,
-            consumer: cons,
+
+            pcm_cons,
             events,
             backend: Backend::Http { url },
             processors: Arc::new(Mutex::new(Vec::new())),
@@ -574,20 +236,8 @@ impl AudioStream {
     }
 
     /// Push helper for tests or manual feeding (not part of final API necessarily).
-    pub fn push_samples_for_test(&mut self, samples: &[f32]) -> usize {
-        let mut written = 0usize;
-        for &s in samples {
-            if self.producer.lock().unwrap().try_push(s).is_err() {
-                break;
-            }
-            written += 1;
-        }
-        if written > 0 {
-            self.events.send(PlayerEvent::BufferLevel {
-                decoded_frames: written / self.spec.lock().unwrap().channels as usize,
-            });
-        }
-        written
+    pub async fn push_samples_for_test(&mut self, _samples: &[f32]) -> usize {
+        0
     }
 
     /// Register a processor (no-op for now; not applied in the skeleton).
@@ -596,15 +246,15 @@ impl AudioStream {
     }
 
     /// Internal: pop a single sample (for adapters that need one-by-one consumption).
-    pub(crate) fn pop_one(&mut self) -> Option<f32> {
-        self.consumer.try_pop()
+    pub async fn pop_one_async(&mut self) -> Option<f32> {
+        self.pcm_cons.pop().await
     }
 
     /// Internal: pop up to `out.len()` samples into `out`, returning the count.
-    pub(crate) fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
+    pub async fn pop_chunk_async(&mut self, out: &mut [f32]) -> usize {
         let mut n = 0usize;
         while n < out.len() {
-            match self.consumer.try_pop() {
+            match self.pcm_cons.pop().await {
                 Some(s) => {
                     out[n] = s;
                     n += 1;
@@ -618,7 +268,17 @@ impl AudioStream {
 
 impl FloatSampleSource for AudioStream {
     fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
-        let n = self.pop_chunk(out);
+        // Best-effort async -> sync bridge using a local current-thread runtime when necessary.
+        // This avoids creating a multi-threaded runtime inside audio callback paths.
+        let n = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(self.pop_chunk_async(out))
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("audio local rt");
+            rt.block_on(self.pop_chunk_async(out))
+        };
         if n < out.len() {
             trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
         }

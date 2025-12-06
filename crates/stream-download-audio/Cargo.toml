@@ -29,7 +29,7 @@ stream-download-hls = { version = "0.0.1", path = "../stream-download-hls", feat
 kanal = "0.1"
 
 # Lock-free ring buffer for PCM frames (SPSC)
-ringbuf = "0.4"
+async-ringbuf = "0.3.4"
 
 # High-quality resampling (runs asynchronously in a worker)
 rubato = "0.14"
