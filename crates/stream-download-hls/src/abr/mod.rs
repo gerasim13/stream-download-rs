@@ -31,7 +31,7 @@ pub enum SelectionMode {
     /// ABR automatically selects the most suitable variant based on metrics.
     Auto,
     /// Manual mode locks the stream to a specific variant chosen by the user.
-    Manual,
+    Manual(VariantId),
 }
 
 /// Basic playback / network metrics used for ABR decisions.
@@ -131,6 +131,7 @@ impl<S: MediaStream> AbrController<S> {
     pub fn new(
         stream: S,
         config: AbrConfig,
+        selection_mode: SelectionMode,
         initial_variant_index: usize,
         initial_bandwidth: f64,
     ) -> Self {
@@ -140,7 +141,7 @@ impl<S: MediaStream> AbrController<S> {
             bandwidth_estimator: BandwidthEstimator::new(initial_bandwidth),
             current_variant_id: None,
             initial_variant_index,
-            selection_mode: SelectionMode::Auto,
+            selection_mode,
             manual_variant_id: None,
             buffer_seconds_estimate: 0.0,
             last_buffer_update: Instant::now(),
@@ -183,7 +184,7 @@ impl<S: MediaStream> AbrController<S> {
 
     /// Switch to MANUAL mode and lock to the given variant.
     pub async fn set_manual(&mut self, variant_id: VariantId) -> HlsResult<()> {
-        self.selection_mode = SelectionMode::Manual;
+        self.selection_mode = SelectionMode::Manual(variant_id);
         self.manual_variant_id = Some(variant_id);
         self.current_variant_id = Some(variant_id);
         self.stream.select_variant(variant_id).await
@@ -203,7 +204,7 @@ impl<S: MediaStream> AbrController<S> {
     /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
     pub async fn maybe_switch(&mut self, metrics: &PlaybackMetrics) -> HlsResult<()> {
         // If manual mode is active, ensure we are locked to the manual target and skip ABR.
-        if let SelectionMode::Manual = self.selection_mode {
+        if let SelectionMode::Manual(_) = self.selection_mode {
             if let Some(target) = self.manual_variant_id {
                 if Some(target) != self.current_variant_id {
                     self.stream.select_variant(target).await?;
@@ -377,7 +378,7 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
 
     async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
         // Treat direct select_variant calls as manual override, as in typical players.
-        self.selection_mode = SelectionMode::Manual;
+        self.selection_mode = SelectionMode::Manual(variant_id);
         self.manual_variant_id = Some(variant_id);
         self.current_variant_id = Some(variant_id);
         self.stream.select_variant(variant_id).await

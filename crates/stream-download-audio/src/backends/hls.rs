@@ -10,7 +10,7 @@ use tracing::{debug, error, info, trace};
 
 use stream_download_hls::{
     AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
-    ResourceDownloader, VariantId, VariantStream,
+    ResourceDownloader, SelectionMode, VariantId, VariantStream,
 };
 
 /// A blocking, non-seekable MediaSource that streams bytes coming from an HLS pipeline.
@@ -301,6 +301,7 @@ pub async fn open_hls_media_source_async(
     url: String,
     hls_config: HlsConfig,
     abr_config: AbrConfig,
+    initial_mode: SelectionMode,
     initial_variant_index: Option<usize>,
 ) -> IoResult<(MediaSourceStream<'static>, HlsSourceController)> {
     let (data_tx, data_rx) = kchan::bounded::<Vec<u8>>(8);
@@ -370,7 +371,7 @@ pub async fn open_hls_media_source_async(
 
         // Build ABR controller and initialize (this will select the initial variant internally).
         let init_bw = master.variants[chosen_index].bandwidth.unwrap_or(0) as f64;
-        let mut controller = AbrController::new(manager, abr_config.clone(), chosen_index, init_bw);
+        let mut controller = AbrController::new(manager, abr_config.clone(), initial_mode, chosen_index, init_bw);
         if let Err(e) = controller.init().await {
             error!("HLS: controller init failed: {e:?}");
             return;

@@ -62,7 +62,7 @@ impl ResourceDownloader {
         _ttl: Option<Duration>, // ttl is unused for now
     ) -> HlsResult<Bytes> {
         let url = Url::parse(url).map_err(|e| HlsError::Io(e.to_string()))?;
-        let mut reader = match StreamDownload::new_http(
+        let reader = match StreamDownload::new_http(
             url,
             TempStorageProvider::default(),
             Settings::default(),

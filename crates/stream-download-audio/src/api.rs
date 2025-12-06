@@ -8,6 +8,8 @@ separate modules; `lib.rs` should primarily re-export items from here.
 
 use std::time::Duration;
 
+use stream_download_hls::SelectionMode;
+
 /// Basic PCM specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioSpec {
@@ -38,14 +40,6 @@ pub trait FloatSampleSource: Send {
     fn is_eof(&self) -> bool {
         false
     }
-}
-
-/// Selection mode for HLS variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VariantMode {
-    Auto,
-    /// Index into the variants returned by the master playlist.
-    Manual(usize),
 }
 
 /// High-level player events useful for UI/telemetry.
@@ -83,7 +77,7 @@ pub trait AudioProcessor: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct AudioOptions {
     /// Initial HLS mode selection (ignored for HTTP sources).
-    pub initial_mode: VariantMode,
+    pub initial_mode: SelectionMode,
     /// Target output sample rate of the audio session (resampling target).
     pub target_sample_rate: u32,
     /// Target output channels (e.g., 2 for stereo).
@@ -99,7 +93,7 @@ pub struct AudioOptions {
 impl Default for AudioOptions {
     fn default() -> Self {
         Self {
-            initial_mode: VariantMode::Auto,
+            initial_mode: SelectionMode::Auto,
             target_sample_rate: 48_000,
             target_channels: 2,
             ring_capacity_frames: 8192, // ~170ms @ 48kHz

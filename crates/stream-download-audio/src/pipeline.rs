@@ -26,11 +26,10 @@ spawning background tasks or performing actual work.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use stream_download_hls::SelectionMode;
 use tracing::{debug, info, warn};
 
-use crate::{
-    AbrConfig, AudioOptions, AudioProcessor, AudioSpec, HlsConfig, PlayerEvent, VariantMode,
-};
+use crate::{AbrConfig, AudioOptions, AudioProcessor, AudioSpec, HlsConfig, PlayerEvent};
 
 /// Backend configuration for the pipeline.
 ///
@@ -41,7 +40,7 @@ pub enum BackendConfig {
         url: String,
         hls: HlsConfig,
         abr: AbrConfig,
-        mode: VariantMode,
+        mode: SelectionMode,
     },
     Http {
         url: String,

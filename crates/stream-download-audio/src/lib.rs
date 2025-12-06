@@ -14,13 +14,12 @@ mod rodio_adapter;
 
 // Re-export useful HLS types for convenience.
 pub use stream_download_hls::{
-    AbrConfig, AbrController, HlsConfig, HlsManager, MediaStream, SegmentData, VariantStream,
+    AbrConfig, AbrController, HlsConfig, HlsManager, MediaStream, SegmentData, SelectionMode,
+    VariantId, VariantStream,
 };
 
 // Public API re-exports.
-pub use crate::api::{
-    AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent, VariantMode,
-};
+pub use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
 pub use crate::stream::AudioStream;
 
 #[cfg(feature = "rodio")]

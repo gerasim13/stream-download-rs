@@ -5,7 +5,8 @@ use std::thread;
 
 use rodio::{OutputStreamBuilder, Sink};
 use stream_download_audio::{
-    AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, VariantMode, adapt_to_rodio,
+    AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, SelectionMode, VariantId,
+    adapt_to_rodio,
 };
 use tracing::metadata::LevelFilter;
 use tracing::trace;
@@ -22,13 +23,13 @@ fn is_hls(url: &str) -> bool {
     url.to_ascii_lowercase().contains(".m3u8")
 }
 
-fn parse_args() -> (String, VariantMode, Option<usize>) {
+fn parse_args() -> (String, SelectionMode, Option<usize>) {
     // CLI:
     //   rodio_adaptive [URL] [--mode auto|manual] [--variant N]
     let mut args = env::args().skip(1).collect::<Vec<_>>();
 
     let mut url = default_url();
-    let mut mode = "auto".to_string();
+    let mut mode = "manual".to_string();
     let mut manual_idx: Option<usize> = None;
 
     let mut i = 0usize;
@@ -54,9 +55,9 @@ fn parse_args() -> (String, VariantMode, Option<usize>) {
     }
 
     let vm = if mode == "manual" {
-        VariantMode::Manual(manual_idx.unwrap_or(0))
+        SelectionMode::Manual(VariantId(manual_idx.unwrap_or(0)))
     } else {
-        VariantMode::Auto
+        SelectionMode::Auto
     };
 
     (url, vm, manual_idx)
@@ -79,8 +80,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     eprintln!("rodio_adaptive (stream-download-audio)");
     eprintln!("  URL: {}", url);
     match vm {
-        VariantMode::Auto => eprintln!("  Mode: AUTO"),
-        VariantMode::Manual(i) => eprintln!("  Mode: MANUAL (index: {})", i),
+        SelectionMode::Auto => eprintln!("  Mode: AUTO"),
+        SelectionMode::Manual(i) => eprintln!("  Mode: MANUAL (index: {})", i.0),
     }
     eprintln!(
         "  Detected source: {}",

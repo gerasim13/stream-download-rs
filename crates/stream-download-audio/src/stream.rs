@@ -22,7 +22,7 @@ use tracing::{debug, error, info, trace};
 
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
 use crate::backends::http::{extension_from_url, open_http_seek_gated_mss};
-use stream_download_hls::{AbrConfig, HlsConfig};
+use stream_download_hls::{AbrConfig, HlsConfig, SelectionMode};
 
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -124,37 +124,6 @@ fn spawn_decode_worker<C>(
         loop {
             match format.next_packet() {
                 Ok(Some(packet)) => {
-                    if packet.track_id() != track_id {
-                        // Attempt to (re)create decoder for the new track id (variant switch).
-                        let new_tid = packet.track_id();
-                        if let Some(t) = format.tracks().iter().find(|t| t.id == new_tid) {
-                            if let Some(ap) =
-                                t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned()
-                            {
-                                match get_codecs().make_audio_decoder(&ap, &dec_opts) {
-                                    Ok(d) => {
-                                        decoder = d;
-                                        track_id = new_tid;
-                                        signalled_format = false; // force re-emit FormatChanged on first decoded frame
-                                        trace!("decode: rebuilt decoder for track id={}", track_id);
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            "decode: failed to rebuild decoder for new track: {e}"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                // Unknown new track type; skip packet.
-                                continue;
-                            }
-                        } else {
-                            // New track id not present; skip packet.
-                            continue;
-                        }
-                    }
-
                     match decoder.decode(&packet) {
                         Ok(decoded) => {
                             // Convert to a generic buffer reference and then to interleaved f32.
@@ -355,7 +324,7 @@ impl AudioStream {
         let producer_clone = producer.clone();
         let hls_cfg = hls_config.clone();
         let initial_variant_idx = match opts.initial_mode {
-            crate::api::VariantMode::Manual(i) => Some(i),
+            SelectionMode::Manual(i) => Some(i.0),
             _ => None,
         };
 
@@ -365,6 +334,7 @@ impl AudioStream {
             url.clone(),
             hls_cfg,
             abr_config.clone(),
+            opts.initial_mode,
             initial_variant_idx,
         )
         .await
