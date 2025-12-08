@@ -303,6 +303,7 @@ pub struct Feeder {
     queue: VecDeque<Bytes>,
     pos_in_front: usize,
     eof: bool,
+    buffered_len: usize,
 }
 
 impl Feeder {
@@ -311,11 +312,13 @@ impl Feeder {
             queue: VecDeque::new(),
             pos_in_front: 0,
             eof: false,
+            buffered_len: 0,
         }
     }
 
     pub fn push_bytes(&mut self, chunk: Bytes) {
         if !chunk.is_empty() {
+            self.buffered_len = self.buffered_len.saturating_add(chunk.len());
             self.queue.push_back(chunk);
         }
     }
@@ -378,6 +381,7 @@ impl Read for FeederMediaSource {
         let n = std::cmp::min(buf.len(), front.len() - start);
         buf[..n].copy_from_slice(&front.slice(start..start + n));
         guard.pos_in_front += n;
+        guard.buffered_len = guard.buffered_len.saturating_sub(n);
         Ok(n)
     }
 }
@@ -518,9 +522,6 @@ impl PipelineRunner {
             let mut current_sample_rate = output_spec.sample_rate;
             let mut current_channels = output_spec.channels;
 
-            // Track last seen variant to emit from->to in VariantSwitched
-            let mut last_variant_index: Option<usize> = None;
-
             // Helper to probe a new reader from fresh feeder with init+first media bytes.
             let mut open_reader = |feeder_arc: Arc<Mutex<Feeder>>| {
                 let mss = symphonia::core::io::MediaSourceStream::new(
@@ -588,6 +589,38 @@ impl PipelineRunner {
                         let mut guard = feeder.lock().unwrap();
                         guard.push_bytes(packet.init_bytes.clone());
                         guard.push_bytes(packet.media_bytes.clone());
+                    }
+                    // Prebuffer additional packets into feeder to reduce initial underflow/glitches.
+                    // We drain a few packets or stop after a short timeout/budget.
+                    let prebuffer_budget: usize = 64 * 1024; // bytes
+                    let start_prebuffer = std::time::Instant::now();
+                    loop {
+                        // Stop if enough bytes buffered.
+                        if feeder.lock().unwrap().buffered_len >= prebuffer_budget {
+                            break;
+                        }
+                        // Stop if we spent too much time prebuffering.
+                        if start_prebuffer.elapsed() > std::time::Duration::from_millis(10) {
+                            break;
+                        }
+                        // Try to fetch one more packet with a very short timeout.
+                        let next_opt = rt.block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(1),
+                                byte_cons.pop(),
+                            )
+                            .await
+                        });
+                        match next_opt {
+                            Ok(Some(extra_pkt)) => {
+                                if let Ok(mut guard) = feeder.lock() {
+                                    // Only media bytes; init_hash change will re-open on the next outer loop iteration.
+                                    guard.push_bytes(extra_pkt.media_bytes.clone());
+                                }
+                            }
+                            Ok(None) => break, // producer closed
+                            Err(_) => break,   // timeout
+                        }
                     }
 
                     match open_reader(feeder.clone()) {
@@ -675,6 +708,12 @@ impl PipelineRunner {
                                             break;
                                         }
                                     }
+                                    // Apply soft fade-in to the prebuffer to hide residual clicks.
+                                    PipelineRunner::apply_fade_in(
+                                        &mut tmp_warm[..],
+                                        current_channels,
+                                        fade_ms,
+                                    );
                                     rt.block_on(async {
                                         for &s in &tmp_warm {
                                             if pcm_prod.push(s).await.is_err() {

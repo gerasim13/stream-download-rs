@@ -3,7 +3,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use rodio::Source;
-use tracing::{debug, trace, warn};
+use tracing::trace;
 
 use crate::{AudioSpec, AudioStream, FloatSampleSource};
 
@@ -23,10 +23,12 @@ pub struct RodioSourceAdapter {
     inner: Arc<Mutex<AudioStream>>,
     cur_spec: AudioSpec,
 
+    // Background-refilled chunk queue.
+    rx: std::sync::mpsc::Receiver<Vec<f32>>,
+
     // Small pending buffer to amortize locking cost by reading in chunks.
     pending: Vec<f32>,
     cursor: usize,
-    consecutive_silence: u32,
 }
 
 impl RodioSourceAdapter {
@@ -35,12 +37,30 @@ impl RodioSourceAdapter {
     /// The adapter captures the current output spec (sample rate, channels) at construction.
     pub fn new(inner: Arc<Mutex<AudioStream>>) -> Self {
         let cur_spec = inner.lock().unwrap().spec();
+
+        // Spawn background refill thread which pulls PCM in chunks and sends to a channel.
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let inner_cloned = Arc::clone(&inner);
+        std::thread::spawn(move || {
+            let chunk_len = 4096usize;
+            loop {
+                let mut buf = vec![0.0f32; chunk_len];
+                // Pull from AudioStream; if no data right now, back off briefly to avoid busy spin.
+                let n = inner_cloned.lock().unwrap().read_interleaved(&mut buf);
+                if n > 0 {
+                    let _ = tx.send(buf[..n].to_vec());
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        });
+
         Self {
             inner,
             cur_spec,
+            rx,
             pending: Vec::with_capacity(4096),
             cursor: 0,
-            consecutive_silence: 0,
         }
     }
 
@@ -48,13 +68,9 @@ impl RodioSourceAdapter {
         self.pending.clear();
         self.cursor = 0;
 
-        // Read a chunk from the underlying source.
-        // Keep the chunk relatively small to keep latency low.
-        let chunk_len = 4096usize;
-        let mut buf = vec![0.0f32; chunk_len];
-        let n = self.inner.lock().unwrap().read_interleaved(&mut buf);
-        if n > 0 {
-            self.pending.extend_from_slice(&buf[..n]);
+        // Non-blocking receive from background thread.
+        if let Ok(chunk) = self.rx.try_recv() {
+            self.pending = chunk;
         }
     }
 }
@@ -64,39 +80,16 @@ impl Iterator for RodioSourceAdapter {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor >= self.pending.len() {
-            // Try to refill; if still empty, briefly sleep and retry a few times to let
-            // the decode thread fill the ring buffer. This reduces long stretches of
-            // silence at startup or after underruns.
-            const MAX_TRIES: usize = 24;
-            let mut tries = 0usize;
-            while self.cursor >= self.pending.len() && tries < MAX_TRIES {
-                self.refill();
-                if self.cursor < self.pending.len() {
-                    break;
-                }
-                // Small backoff to avoid busy-spinning.
-                sleep(Duration::from_millis(12));
-                tries += 1;
-            }
-            if self.cursor >= self.pending.len() {
-                trace!(
-                    "rodio: ring still empty after {} retries, will emit silence",
-                    MAX_TRIES
-                );
-            }
+            // Non-blocking: single attempt to fetch a new chunk.
+            self.refill();
         }
 
         if self.cursor < self.pending.len() {
             let s = self.pending[self.cursor];
             self.cursor += 1;
-            self.consecutive_silence = 0;
             Some(s)
         } else {
-            // No data available right now; emit silence to keep the audio clock advancing.
-            self.consecutive_silence = self.consecutive_silence.saturating_add(1);
-            if self.consecutive_silence > 4 {
-                sleep(Duration::from_millis(5));
-            }
+            // No data available right now; emit silence without blocking.
             Some(0.0)
         }
     }
