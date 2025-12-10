@@ -1,289 +1,18 @@
-/*!
-Pipeline internals
-
-This module defines a minimal but functional skeleton for the future audio pipeline implementation.
-It introduces:
-- Packet: a self-contained message carrying init+media bytes (and optional metadata).
-- FeederMediaSource: a blocking Read/Seek bridge over an internal fifo fed by Packets.
-- PipelineRunner: orchestrates producer/decoder using async_ringbuf for bytes and ringbuf for PCM.
-
-Design:
-- Producer (Tokio task) writes Packet into an async SPSC ring (ByteRing).
-- Decoder (spawn_blocking) reads Packet from ByteRing, re-probes when init_hash changes,
-  decodes to f32, resamples, applies processors, and writes PCM into the PcmRing (SPSC).
-- On variant switch (init_hash change): flush PcmRing and apply a short fade-out/in.
-
-This file still carries placeholders for submodules (source_hls/http, resample, process),
-but now wires the core types needed to evolve the pipeline.
-*/
-
 use std::collections::VecDeque;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bytes::Bytes;
+use symphonia::core::audio::GenericAudioBufferRef;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSource;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::default::{get_codecs, get_probe};
 
-use stream_download_hls::SelectionMode;
-use tracing::{debug, info, warn};
-
-use crate::{AbrConfig, AudioOptions, AudioProcessor, AudioSpec, HlsConfig, PlayerEvent};
-
-/// Backend configuration for the pipeline.
-///
-/// This enumerates the supported audio sources: HLS (with configs) or HTTP (single resource).
-#[derive(Debug, Clone)]
-pub enum BackendConfig {
-    Hls {
-        url: String,
-        hls: HlsConfig,
-        abr: AbrConfig,
-        mode: SelectionMode,
-    },
-    Http {
-        url: String,
-    },
-}
-
-/// High-level pipeline state machine (skeleton).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineState {
-    Stopped,
-    Starting,
-    Running,
-    Draining,
-    Stopping,
-    Error,
-}
-
-/// Runtime configuration resolved for the pipeline.
-///
-/// This reflects the output (target) audio session spec and buffering choices.
-#[derive(Debug, Clone)]
-pub struct PipelineConfig {
-    pub output_spec: AudioSpec,
-    pub ring_capacity_frames: usize,
-    pub abr_min_switch_interval: Duration,
-    pub abr_up_hysteresis_ratio: f32,
-}
-
-impl From<&AudioOptions> for PipelineConfig {
-    fn from(opts: &AudioOptions) -> Self {
-        Self {
-            output_spec: AudioSpec {
-                sample_rate: opts.target_sample_rate,
-                channels: opts.target_channels,
-            },
-            ring_capacity_frames: opts.ring_capacity_frames,
-            abr_min_switch_interval: opts.abr_min_switch_interval,
-            abr_up_hysteresis_ratio: opts.abr_up_hysteresis_ratio,
-        }
-    }
-}
-
-/// Pipeline builder (skeleton).
-///
-/// Constructed with a backend and options, optionally configured with processors,
-/// producing a `Pipeline` that can be started.
-#[derive(Clone)]
-pub struct PipelineBuilder {
-    backend: BackendConfig,
-    config: PipelineConfig,
-    processors: Vec<Arc<dyn AudioProcessor>>,
-}
-
-impl PipelineBuilder {
-    /// Create a builder for an HLS backend.
-    pub fn hls(url: impl Into<String>, opts: AudioOptions, hls: HlsConfig, abr: AbrConfig) -> Self {
-        Self {
-            backend: BackendConfig::Hls {
-                url: url.into(),
-                hls,
-                abr,
-                mode: opts.initial_mode,
-            },
-            config: PipelineConfig::from(&opts),
-            processors: Vec::new(),
-        }
-    }
-
-    /// Create a builder for an HTTP backend.
-    pub fn http(url: impl Into<String>, opts: AudioOptions) -> Self {
-        Self {
-            backend: BackendConfig::Http { url: url.into() },
-            config: PipelineConfig::from(&opts),
-            processors: Vec::new(),
-        }
-    }
-
-    /// Override ring capacity (frames).
-    pub fn ring_capacity_frames(mut self, capacity: usize) -> Self {
-        self.config.ring_capacity_frames = capacity;
-        self
-    }
-
-    /// Add an audio processor to the chain (executed post-resample).
-    pub fn add_processor(mut self, p: Arc<dyn AudioProcessor>) -> Self {
-        self.processors.push(p);
-        self
-    }
-
-    /// Build a `Pipeline`. The returned pipeline is not started yet.
-    pub fn build(self) -> Pipeline {
-        Pipeline {
-            backend: self.backend,
-            config: self.config,
-            processors: Arc::new(Mutex::new(self.processors)),
-            state: Arc::new(Mutex::new(PipelineState::Stopped)),
-            events: EventHub::new(),
-        }
-    }
-}
-
-/// Simple event hub (skeleton) for broadcasting PlayerEvent.
-///
-/// The final implementation will use `kanal` senders/receivers owned by the pipeline.
-/// Here we keep a simple subscription model for future replacement.
-#[derive(Clone)]
-pub struct EventHub {
-    inner: Arc<Mutex<Vec<crossbeam_like::Tx<PlayerEvent>>>>,
-}
-
-impl EventHub {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    /// Subscribe to player events; returns a receiver (stubbed).
-    pub fn subscribe(&self) -> crossbeam_like::Rx<PlayerEvent> {
-        let (tx, rx) = crossbeam_like::unbounded();
-        self.inner.lock().unwrap().push(tx);
-        rx
-    }
-
-    /// Broadcast an event to all subscribers (no-op if none).
-    pub fn send(&self, ev: PlayerEvent) {
-        let subs = self.inner.lock().unwrap();
-        for tx in subs.iter() {
-            let _ = tx.send(ev.clone());
-        }
-    }
-}
-
-/// The audio pipeline (skeleton).
-///
-/// This object will orchestrate background tasks in the future:
-/// - IO (HLS/HTTP),
-/// - Decode (Symphonia),
-/// - Resample (rubato),
-/// - Process (AudioProcessor chain),
-/// - Buffering (ringbuf),
-/// and emit `PlayerEvent`s along the way.
-///
-/// In this skeleton, methods are no-ops to establish the API surface first.
-#[derive(Clone)]
-pub struct Pipeline {
-    backend: BackendConfig,
-    config: PipelineConfig,
-    processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
-    state: Arc<Mutex<PipelineState>>,
-    events: EventHub,
-}
-
-impl Pipeline {
-    /// Current pipeline state (cheap).
-    pub fn state(&self) -> PipelineState {
-        *self.state.lock().unwrap()
-    }
-
-    /// Event hub for subscribing to `PlayerEvent`s.
-    pub fn events(&self) -> &EventHub {
-        &self.events
-    }
-
-    /// Start the pipeline (no-op skeleton).
-    ///
-    /// Future behavior:
-    /// - spawn tokio tasks for IO/decode/resample/process,
-    /// - send PlayerEvent::Started when all stages are ready.
-    pub fn start(&self) {
-        let mut st = self.state.lock().unwrap();
-        if *st != PipelineState::Stopped {
-            warn!("Pipeline.start() called but state is {:?}", *st);
-            return;
-        }
-        *st = PipelineState::Starting;
-        info!("Pipeline is starting (skeleton)");
-        *st = PipelineState::Running;
-
-        self.events.send(PlayerEvent::Started);
-    }
-
-    /// Stop the pipeline (no-op skeleton).
-    ///
-    /// Future behavior:
-    /// - signal tasks to stop,
-    /// - drain buffers,
-    /// - join handles.
-    pub fn stop(&self) {
-        let mut st = self.state.lock().unwrap();
-        match *st {
-            PipelineState::Running | PipelineState::Starting | PipelineState::Draining => {
-                *st = PipelineState::Stopping;
-                info!("Pipeline is stopping (skeleton)");
-                *st = PipelineState::Stopped;
-                self.events.send(PlayerEvent::EndOfStream);
-            }
-            _ => debug!("Pipeline.stop() ignored; state={:?}", *st),
-        }
-    }
-
-    /// Replace all processors (skeleton).
-    pub fn set_processors(&self, new_list: Vec<Arc<dyn AudioProcessor>>) {
-        let mut guard = self.processors.lock().unwrap();
-        *guard = new_list;
-    }
-
-    /// Add a single processor to the end of the chain (skeleton).
-    pub fn add_processor(&self, proc_: Arc<dyn AudioProcessor>) {
-        let mut guard = self.processors.lock().unwrap();
-        guard.push(proc_);
-    }
-
-    /// Clear the processor chain (skeleton).
-    pub fn clear_processors(&self) {
-        let mut guard = self.processors.lock().unwrap();
-        guard.clear();
-    }
-
-    /// Change the output spec (e.g., after an audio session change).
-    ///
-    /// Future behavior:
-    /// - re-create resampler,
-    /// - update buffer sizes if needed,
-    /// - emit FormatChanged.
-    pub fn reconfigure_output(&self, new_spec: AudioSpec) {
-        let mut cfg = self.config.clone();
-        if cfg.output_spec != new_spec {
-            cfg.output_spec = new_spec;
-            self.events.send(PlayerEvent::FormatChanged {
-                sample_rate: new_spec.sample_rate,
-                channels: new_spec.channels,
-                codec: None,
-                container: None,
-            });
-        }
-    }
-
-    /// Return a copy of the current output spec.
-    pub fn output_spec(&self) -> AudioSpec {
-        self.config.output_spec
-    }
-}
+use crate::{AudioProcessor, AudioSpec, PlayerEvent};
 
 /// Packet flowing through ByteRing from Producer to Decoder.
 /// Always carries init and media together, enabling re-probe when init_hash changes.
@@ -293,7 +22,6 @@ pub struct Packet {
     pub init_bytes: Bytes,
     pub media_bytes: Bytes,
     pub variant_index: Option<usize>,
-    pub codec_tag: Option<String>,
 }
 
 /// Blocking feeder implementing Read over a queue of byte chunks.
@@ -321,10 +49,6 @@ impl Feeder {
             self.buffered_len = self.buffered_len.saturating_add(chunk.len());
             self.queue.push_back(chunk);
         }
-    }
-
-    pub fn set_eof(&mut self) {
-        self.eof = true;
     }
 
     fn pop_front_if_empty(&mut self) {
@@ -388,24 +112,7 @@ impl Read for FeederMediaSource {
 
 impl Seek for FeederMediaSource {
     fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
-        if !self.seek_enabled {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "seek disabled",
-            ));
-        }
-        match pos {
-            SeekFrom::Start(0) => {
-                let mut guard = self.inner.lock().unwrap();
-                guard.queue.clear();
-                guard.pos_in_front = 0;
-                Ok(0)
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "seek not supported",
-            )),
-        }
+        unimplemented!()
     }
 }
 
@@ -418,6 +125,7 @@ impl MediaSource for FeederMediaSource {
         None
     }
 }
+
 /// Runner wiring async producer and blocking decoder.
 ///
 /// Note: This is a skeleton; actual decode/probe/resample is implemented elsewhere.
@@ -429,9 +137,6 @@ pub struct PipelineRunner {
     // PCM ring: decoder -> consumer (async)
     pub pcm_prod: Option<AsyncHeapProd<f32>>,
     pub pcm_cons: Option<AsyncHeapCons<f32>>,
-
-    // Fade configuration (ms)
-    pub fade_ms: u32,
 
     // Optional event callback to bubble up player events without tying to a hub here.
     pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
@@ -450,46 +155,7 @@ impl PipelineRunner {
             byte_cons: Some(byte_cons),
             pcm_prod: Some(pcm_prod),
             pcm_cons: Some(pcm_cons),
-            fade_ms: 5,
             on_event: None,
-        }
-    }
-
-    /// Apply a short linear fade-out by appending a ramp-down to the PCM ring.
-    /// Note: Does not drain the consumer side; consumer should read remaining samples.
-    pub async fn fade_out_and_flush(
-        pcm_prod: &mut AsyncHeapProd<f32>,
-        sample_rate: u32,
-        channels: u16,
-        fade_ms: u32,
-    ) {
-        let frames = (fade_ms as u64 * sample_rate as u64 / 1000) as usize;
-        if frames == 0 || channels == 0 {
-            return;
-        }
-        let samples = frames.saturating_mul(channels as usize);
-        for i in 0..samples {
-            // linear ramp down from 1.0 -> 0.0 across 'samples'
-            let t = 1.0 - (i as f32 / samples as f32);
-            let _ = pcm_prod.push(0.0_f32 * t).await;
-        }
-    }
-
-    /// Apply a short linear fade-in in place to a just-produced buffer slice.
-    pub fn apply_fade_in(buf: &mut [f32], channels: u16, fade_ms: u32) {
-        if fade_ms == 0 || channels == 0 {
-            return;
-        }
-        // Apply a short linear fade-in on the beginning of 'buf'.
-        // We assume 'buf' contains interleaved samples. Use a small fixed-time fade.
-        let frames = (fade_ms as usize) * 48; // ~5ms @ 48kHz -> 240 frames for fade_ms=5
-        let max_samples = frames.saturating_mul(channels as usize).min(buf.len());
-        if max_samples == 0 {
-            return;
-        }
-        for i in 0..max_samples {
-            let t = i as f32 / max_samples as f32; // 0..1
-            buf[i] *= t;
         }
     }
 
@@ -497,33 +163,23 @@ impl PipelineRunner {
     pub fn spawn_decoder_loop(
         &mut self,
         output_spec: AudioSpec,
-        _events: EventHub,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
     ) -> tokio::task::JoinHandle<()> {
-        use symphonia::core::audio::GenericAudioBufferRef;
-        use symphonia::core::codecs::audio::AudioDecoderOptions;
-        use symphonia::core::formats::probe::Hint;
-        use symphonia::core::formats::{FormatOptions, TrackType};
-        use symphonia::core::io::MediaSource;
-        use symphonia::core::meta::MetadataOptions;
-        use symphonia::default::{get_codecs, get_probe};
-
         // Move required ring ends and settings into the decoding task.
         let mut byte_cons = self.byte_cons.take().expect("byte_cons already taken");
         let mut pcm_prod = self.pcm_prod.take().expect("pcm_prod already taken");
-        let fade_ms = self.fade_ms;
         let on_event = self.on_event.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut last_init_hash: Option<u64> = None;
             let mut feeder = Arc::new(Mutex::new(Feeder::new()));
-            let mut container_name: Option<String> = None;
+            let mut container_name: Option<String>;
 
-            let mut current_sample_rate = output_spec.sample_rate;
-            let mut current_channels = output_spec.channels;
+            let current_sample_rate = output_spec.sample_rate;
+            let current_channels = output_spec.channels;
 
             // Helper to probe a new reader from fresh feeder with init+first media bytes.
-            let mut open_reader = |feeder_arc: Arc<Mutex<Feeder>>| {
+            let open_reader = |feeder_arc: Arc<Mutex<Feeder>>| {
                 let mss = symphonia::core::io::MediaSourceStream::new(
                     Box::new(FeederMediaSource::new(feeder_arc)) as Box<dyn MediaSource>,
                     symphonia::core::io::MediaSourceStreamOptions::default(),
@@ -575,14 +231,6 @@ impl PipelineRunner {
                 let need_reopen = last_init_hash.map(|h| h != new_hash).unwrap_or(true);
 
                 if need_reopen {
-                    // Optional: fade-out before format switch.
-                    rt.block_on(PipelineRunner::fade_out_and_flush(
-                        &mut pcm_prod,
-                        current_sample_rate,
-                        current_channels,
-                        fade_ms,
-                    ));
-
                     // New feeder and reader.
                     feeder = Arc::new(Mutex::new(Feeder::new()));
                     {
@@ -624,7 +272,7 @@ impl PipelineRunner {
                     }
 
                     match open_reader(feeder.clone()) {
-                        Ok((mut format, cn)) => {
+                        Ok((format, cn)) => {
                             container_name = Some(cn.clone());
                             // Select default audio track and build decoder.
                             let (_tid, ap) = match format.default_track(TrackType::Audio) {
@@ -708,12 +356,6 @@ impl PipelineRunner {
                                             break;
                                         }
                                     }
-                                    // Apply soft fade-in to the prebuffer to hide residual clicks.
-                                    PipelineRunner::apply_fade_in(
-                                        &mut tmp_warm[..],
-                                        current_channels,
-                                        fade_ms,
-                                    );
                                     rt.block_on(async {
                                         for &s in &tmp_warm {
                                             if pcm_prod.push(s).await.is_err() {
@@ -822,143 +464,5 @@ impl PipelineRunner {
                 cb(PlayerEvent::EndOfStream);
             }
         })
-    }
-}
-
-/*------------------------------------------------------------------------------
- Placeholders for future submodules (will be split into files):
-
- - source_hls:     Mapping HlsManager + AbrController to a compressed byte stream.
- - source_http:    Mapping StreamDownload to a compressed byte stream.
- - decode:         Symphonia-based decoder to f32 interleaved PCM.
- - resample:       rubato-based resampler to target AudioSpec.
- - process:        AudioProcessor chain application.
- - buffers:        Ring buffer helpers / metrics.
-
- For now we keep them as empty modules to document the layout.
-------------------------------------------------------------------------------*/
-
-/// HLS source backend (placeholder).
-pub mod source_hls {
-    //! HLS source backend: connects `HlsManager` + `AbrController` to the decode stage.
-    //!
-    //! Responsibilities (future):
-    //! - Handle init segments and segment fetching.
-    //! - Align live sequences on variant switches.
-    //! - Expose a `Stream<Item = Bytes>`-like abstraction for the decoder.
-
-    /// Placeholder type for the future HLS source.
-    #[derive(Debug)]
-    pub struct HlsSource;
-}
-
-/// HTTP source backend (placeholder).
-pub mod source_http {
-    //! HTTP source backend: connects `stream-download` to the decode stage.
-    //!
-    //! Responsibilities (future):
-    //! - Fetch single resource (streaming if possible).
-    //! - Offer seek if the storage/backend allows it.
-
-    /// Placeholder type for the future HTTP source.
-    #[derive(Debug)]
-    pub struct HttpSource;
-}
-
-/// Decode stage (placeholder).
-pub mod decode {
-    //! Decode compressed audio using Symphonia to interleaved f32 PCM.
-    //!
-    //! Responsibilities (future):
-    //! - Format detection, track selection.
-    //! - Expose a pull/push API for PCM frames.
-
-    /// Placeholder type for the future decoder.
-    #[derive(Debug)]
-    pub struct Decoder;
-}
-
-/// Resample stage (placeholder).
-pub mod resample {
-    //! Resample interleaved f32 PCM to the target `AudioSpec` using `rubato`.
-    //!
-    //! Responsibilities (future):
-    //! - Manage internal latency/buffers for high-quality resampling.
-    //! - Recreate resampler on format/output changes.
-
-    /// Placeholder type for the future resampler.
-    #[derive(Debug)]
-    pub struct Resampler;
-}
-
-/// Processing stage (placeholder).
-pub mod process {
-    //! Apply an `AudioProcessor` chain on interleaved f32 PCM.
-    //!
-    //! Responsibilities (future):
-    //! - Execute processors in order.
-    //! - Handle dynamic changes to the chain safely.
-
-    /// Placeholder type for the future processor chain executor.
-    #[derive(Debug)]
-    pub struct ProcessorChain;
-}
-
-/// Buffer helpers (placeholder).
-pub mod buffers {
-    //! Ring buffer helpers and metrics around the final PCM queue.
-    //!
-    //! Responsibilities (future):
-    //! - Encapsulate SPSC ring buffer logic.
-    //! - Provide buffer level metrics/events.
-
-    /// Placeholder type for the future PCM ring buffer wrapper.
-    #[derive(Debug)]
-    pub struct PcmRing;
-}
-
-/*------------------------------------------------------------------------------
- Minimal crossbeam-like stubs to allow the EventHub placeholder to compile
- without pulling actual channel implementations here.
-
- The real pipeline will use `kanal` senders/receivers instead of these.
-------------------------------------------------------------------------------*/
-
-mod crossbeam_like {
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    pub struct Tx<T> {
-        inner: Arc<Mutex<VecDeque<T>>>,
-    }
-
-    #[derive(Clone)]
-    pub struct Rx<T> {
-        inner: Arc<Mutex<VecDeque<T>>>,
-    }
-
-    pub fn unbounded<T>() -> (Tx<T>, Rx<T>) {
-        let inner = Arc::new(Mutex::new(VecDeque::new()));
-        (
-            Tx {
-                inner: inner.clone(),
-            },
-            Rx { inner },
-        )
-    }
-
-    impl<T: Clone> Tx<T> {
-        pub fn send(&self, item: T) -> Result<(), ()> {
-            self.inner.lock().map_err(|_| ())?.push_back(item);
-            Ok(())
-        }
-    }
-
-    impl<T: Clone> Iterator for Rx<T> {
-        type Item = T;
-        fn next(&mut self) -> Option<Self::Item> {
-            self.inner.lock().ok()?.pop_front()
-        }
     }
 }

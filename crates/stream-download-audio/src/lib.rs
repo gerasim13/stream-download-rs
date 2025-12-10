@@ -10,7 +10,7 @@ mod pipeline;
 mod stream;
 
 #[cfg(feature = "rodio")]
-mod rodio_adapter;
+mod rodio;
 
 // Re-export useful HLS types for convenience.
 pub use stream_download_hls::{
@@ -23,4 +23,4 @@ pub use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource,
 pub use crate::stream::AudioStream;
 
 #[cfg(feature = "rodio")]
-pub use crate::rodio_adapter::{RodioSourceAdapter, adapt_to_rodio};
+pub use crate::rodio::RodioSourceAdapter;

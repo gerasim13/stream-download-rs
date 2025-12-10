@@ -76,8 +76,8 @@ pub trait AudioProcessor: Send + Sync {
 /// Options for constructing an audio stream.
 #[derive(Debug, Clone)]
 pub struct AudioOptions {
-    /// Initial HLS mode selection (ignored for HTTP sources).
-    pub initial_mode: SelectionMode,
+    /// HLS selection mode selection (ignored for HTTP sources).
+    pub selection_mode: SelectionMode,
     /// Target output sample rate of the audio session (resampling target).
     pub target_sample_rate: u32,
     /// Target output channels (e.g., 2 for stereo).
@@ -93,12 +93,44 @@ pub struct AudioOptions {
 impl Default for AudioOptions {
     fn default() -> Self {
         Self {
-            initial_mode: SelectionMode::Auto,
+            selection_mode: SelectionMode::Auto,
             target_sample_rate: 48_000,
             target_channels: 2,
             ring_capacity_frames: 8192, // ~170ms @ 48kHz
             abr_min_switch_interval: Duration::from_millis(4000),
             abr_up_hysteresis_ratio: 0.15,
         }
+    }
+}
+
+impl AudioOptions {
+    pub fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
+        self.selection_mode = mode;
+        self
+    }
+
+    pub fn with_target_sample_rate(mut self, rate: u32) -> Self {
+        self.target_sample_rate = rate;
+        self
+    }
+
+    pub fn with_target_channels(mut self, channels: u16) -> Self {
+        self.target_channels = channels;
+        self
+    }
+
+    pub fn with_ring_capacity_frames(mut self, capacity: usize) -> Self {
+        self.ring_capacity_frames = capacity;
+        self
+    }
+
+    pub fn with_abr_min_switch_interval(mut self, interval: Duration) -> Self {
+        self.abr_min_switch_interval = interval;
+        self
+    }
+
+    pub fn with_abr_up_hysteresis_ratio(mut self, ratio: f32) -> Self {
+        self.abr_up_hysteresis_ratio = ratio;
+        self
     }
 }

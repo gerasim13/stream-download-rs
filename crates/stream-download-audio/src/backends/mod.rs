@@ -12,7 +12,3 @@ Additional backends (e.g., S3/opendal, process, async_read) can be added here in
 
 pub mod hls;
 pub mod http;
-
-// Re-export backend items for convenient access as `backends::*`.
-pub use hls::*;
-pub use http::*;

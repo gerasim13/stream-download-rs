@@ -1,17 +1,3 @@
-/*!
-AudioStream implementation: unified float PCM source backed by async ring buffers and PipelineRunner.
-
-This module provides the high-level `AudioStream` type that:
-- exposes a pull-based API (`FloatSampleSource`) returning interleaved f32 PCM,
-- can be constructed from either an HLS URL (via `stream-download-hls`) or a single HTTP URL (via `stream-download`),
-- maintains SPSC async ring buffers for low-latency audio delivery,
-- emits player events via `kanal`,
-- delegates background work (I/O, probe, decode, resample, effects) to `pipeline::PipelineRunner`.
-
-Status:
-- The decode/resample/effects pipeline is orchestrated by `PipelineRunner`.
-*/
-
 use std::sync::{Arc, Mutex};
 
 use async_ringbuf::{AsyncHeapCons, traits::*};
@@ -21,40 +7,8 @@ use tracing::trace;
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
 use crate::backends::hls::run_hls_packet_producer;
 use crate::backends::http::run_http_packet_producer;
-use crate::pipeline::{EventHub as PipeEventHub, PipelineRunner};
+use crate::pipeline::PipelineRunner;
 use stream_download_hls::{AbrConfig, HlsConfig};
-
-/// Small trait to unify enabling seek after decoder init for different controllers.
-trait SeekEnable: Send + Sync + 'static {
-    fn enable_seek_gate(&self);
-}
-
-/// Blanket impl for HTTP seek gate handle.
-impl SeekEnable for crate::backends::http::SeekGateHandle {
-    fn enable_seek_gate(&self) {
-        self.enable_seek();
-    }
-}
-
-/// Blanket impl for HLS source controller.
-impl SeekEnable for crate::backends::hls::HlsSourceController {
-    fn enable_seek_gate(&self) {
-        self.enable_seek();
-    }
-}
-
-/// Internal backend selector for the audio source.
-#[derive(Debug, Clone)]
-pub(crate) enum Backend {
-    Hls {
-        url: String,
-        hls_config: HlsConfig,
-        abr_config: AbrConfig,
-    },
-    Http {
-        url: String,
-    },
-}
 
 /// Simple broadcast hub for `PlayerEvent` using `kanal`.
 #[derive(Debug)]
@@ -90,23 +44,8 @@ impl EventHub {
 /// surface are implemented.
 pub struct AudioStream {
     spec: Arc<Mutex<AudioSpec>>,
-
     pcm_cons: AsyncHeapCons<f32>,
     events: Arc<EventHub>,
-
-    pub(crate) backend: Backend,
-
-    // Processing chain (skeleton; not applied yet)
-    pub(crate) processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
-}
-
-impl std::fmt::Debug for AudioStream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AudioStream")
-            .field("spec", &self.spec.lock().unwrap())
-            .field("backend", &self.backend)
-            .finish()
-    }
 }
 
 impl AudioStream {
@@ -137,7 +76,6 @@ impl AudioStream {
         runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
         // Launch HLS packet producer (async) using the producer half from runner.
-        let selection = opts.initial_mode;
         let byte_prod = runner
             .byte_prod
             .take()
@@ -147,15 +85,14 @@ impl AudioStream {
             url.clone(),
             hls_config.clone(),
             abr_config.clone(),
-            selection,
+            opts.selection_mode,
             byte_prod,
             cancel.clone(),
         ));
 
         // Launch decoder loop (spawn_blocking internally)
-        let pipe_events = PipeEventHub::new();
         let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
-        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), pipe_events, processors);
+        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), processors);
 
         // Expose runner's PCM ring to AudioStream
 
@@ -163,15 +100,8 @@ impl AudioStream {
 
         Self {
             spec,
-
             pcm_cons,
             events,
-            backend: Backend::Hls {
-                url,
-                hls_config,
-                abr_config,
-            },
-            processors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -207,21 +137,16 @@ impl AudioStream {
         });
 
         // Launch decoder loop (spawn_blocking internally)
-        let pipe_events = PipeEventHub::new();
         let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
-        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), pipe_events, processors);
+        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), processors);
 
         // Expose runner's PCM ring to AudioStream
-
         let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
 
         Self {
             spec,
-
             pcm_cons,
             events,
-            backend: Backend::Http { url },
-            processors: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -240,15 +165,24 @@ impl AudioStream {
         0
     }
 
-    /// Register a processor (no-op for now; not applied in the skeleton).
-    pub fn add_processor(&mut self, p: Arc<dyn AudioProcessor>) {
-        self.processors.lock().unwrap().push(p);
-    }
-
-    /// Internal: pop a single sample (for adapters that need one-by-one consumption).
-    pub async fn pop_one_async(&mut self) -> Option<f32> {
-        self.pcm_cons.pop().await
-    }
+impl SampleSource for AudioStream {
+    // fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
+    //     // Best-effort async -> sync bridge using a local current-thread runtime when necessary.
+    //     // This avoids creating a multi-threaded runtime inside audio callback paths.
+    //     let n = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+    //         handle.block_on(self.pop_chunk_async(out))
+    //     } else {
+    //         let rt = tokio::runtime::Builder::new_current_thread()
+    //             .enable_all()
+    //             .build()
+    //             .expect("audio local rt");
+    //         rt.block_on(self.pop_chunk_async(out))
+    //     };
+    //     if n < out.len() {
+    //         trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
+    //     }
+    //     n
+    // }
 
     /// Internal: pop up to `out.len()` samples into `out`, returning the count.
     pub async fn pop_chunk_async(&mut self, out: &mut [f32]) -> usize {

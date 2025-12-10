@@ -112,8 +112,3 @@ impl Source for RodioSourceAdapter {
         None
     }
 }
-
-/// Helper to adapt an `AudioStream` into a `rodio::Source<Item = f32>`.
-pub fn adapt_to_rodio(stream: Arc<Mutex<AudioStream>>) -> RodioSourceAdapter {
-    RodioSourceAdapter::new(stream)
-}

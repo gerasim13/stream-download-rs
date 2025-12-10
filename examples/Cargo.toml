@@ -52,7 +52,7 @@ name = "s3"
 required-features = ["opendal"]
 
 [[example]]
-name = "rodio_adaptive"
+name = "audio_hls"
 required-features = ["audio"]
 
 [[example]]
