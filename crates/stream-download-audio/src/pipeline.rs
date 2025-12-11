@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::{debug, trace};
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bytes::Bytes;
@@ -22,6 +24,8 @@ pub struct Packet {
     pub init_bytes: Bytes,
     pub media_bytes: Bytes,
     pub variant_index: Option<usize>,
+    pub segment_duration: std::time::Duration,
+    pub segment_sequence: u64,
 }
 
 /// Blocking feeder implementing Read over a queue of byte chunks.
@@ -127,6 +131,243 @@ impl MediaSource for FeederMediaSource {
     }
 }
 
+/// State tracking for seamless variant switching.
+#[derive(Debug, Clone)]
+struct PlaybackState {
+    /// Total playback time accumulated from decoded segments.
+    total_playback_time: Duration,
+    /// Current variant index.
+    current_variant_index: Option<usize>,
+    /// Total number of decoded frames.
+    decoded_frames: u64,
+    /// Current sample rate.
+    sample_rate: u32,
+    /// Current channel count.
+    channels: u16,
+}
+
+/// Transition state for smooth audio transitions between variants.
+#[derive(Debug)]
+struct TransitionState {
+    /// Number of silence samples remaining to insert.
+    silence_samples_remaining: usize,
+    /// Number of fade-in samples remaining.
+    fade_in_samples_remaining: usize,
+    /// Total fade-in length in samples.
+    fade_in_length_samples: usize,
+    /// Whether transition is active.
+    active: bool,
+    /// Previous variant index.
+    previous_variant_index: Option<usize>,
+    /// Current variant index.
+    current_variant_index: Option<usize>,
+    /// Whether we're processing samples from the new variant yet.
+    processing_new_variant: bool,
+}
+
+/// Simple DC blocking filter to remove DC offset and prevent clicks.
+struct DcBlockingFilter {
+    /// Previous input sample.
+    prev_input: f32,
+    /// Previous output sample.
+    prev_output: f32,
+    /// Filter coefficient (0.995 is typical for 48kHz).
+    coefficient: f32,
+}
+
+impl DcBlockingFilter {
+    /// Create a new DC blocking filter with appropriate coefficient for sample rate.
+    fn new(sample_rate: u32) -> Self {
+        // Calculate coefficient for ~3Hz cutoff frequency
+        // fc = 3Hz, fs = sample_rate
+        // R = 1 - (2πfc/fs)
+        let fc = 3.0; // Cutoff frequency in Hz
+        let fs = sample_rate as f32;
+        let coefficient = 1.0 - (2.0 * std::f32::consts::PI * fc / fs);
+
+        Self {
+            prev_input: 0.0,
+            prev_output: 0.0,
+            coefficient: coefficient.max(0.9).min(0.999), // Clamp to reasonable range
+        }
+    }
+
+    /// Reset filter state (useful when switching variants).
+    fn reset(&mut self) {
+        self.prev_input = 0.0;
+        self.prev_output = 0.0;
+    }
+
+    /// Process samples with DC blocking filter.
+    fn process(&mut self, samples: &mut [f32]) {
+        // Simple first-order high-pass filter: y[n] = x[n] - x[n-1] + R * y[n-1]
+        let r = self.coefficient;
+
+        for sample in samples.iter_mut() {
+            let input = *sample;
+            let output = input - self.prev_input + r * self.prev_output;
+            self.prev_input = input;
+            self.prev_output = output;
+            *sample = output;
+        }
+    }
+}
+
+impl TransitionState {
+    fn new(fade_in_duration_ms: u32, sample_rate: u32, channels: u16) -> Self {
+        let fade_in_samples = ((fade_in_duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
+
+        Self {
+            silence_samples_remaining: 0,
+            fade_in_samples_remaining: 0,
+            fade_in_length_samples: fade_in_samples * channels as usize,
+            active: false,
+            previous_variant_index: None,
+            current_variant_index: None,
+            processing_new_variant: false,
+        }
+    }
+
+    /// Process samples, applying fade-in if transition is active.
+    /// Returns the number of samples processed.
+    fn process(
+        &mut self,
+        samples: &mut [f32],
+        _pcm_prod: &mut AsyncHeapProd<f32>,
+        _rt: &tokio::runtime::Runtime,
+        need_reopen: bool,
+    ) -> usize {
+        // If we need to reopen (new decoder), start transition
+        if need_reopen && !self.active {
+            debug!(
+                "TransitionState: starting fade-in for new decoder, fade_in_length_samples={}",
+                self.fade_in_length_samples
+            );
+            // No silence, only fade-in for smoother transition
+            self.silence_samples_remaining = 0;
+            self.fade_in_samples_remaining = self.fade_in_length_samples;
+            self.active = true;
+        }
+
+        if !self.active {
+            return samples.len();
+        }
+
+        let mut samples_processed = 0;
+        let total_samples = samples.len();
+
+        debug!(
+            "TransitionState: processing transition, active={}, silence_remaining={}, fade_remaining={}, total_samples={}",
+            self.active,
+            self.silence_samples_remaining,
+            self.fade_in_samples_remaining,
+            total_samples
+        );
+
+        // Apply fade-in to samples
+        if self.fade_in_samples_remaining > 0 {
+            let samples_remaining = total_samples - samples_processed;
+            let fade_to_apply = std::cmp::min(self.fade_in_samples_remaining, samples_remaining);
+
+            for i in 0..fade_to_apply {
+                let sample_index = samples_processed + i;
+                let fade_progress = 1.0
+                    - (self.fade_in_samples_remaining - i) as f32
+                        / self.fade_in_length_samples as f32;
+                let gain = fade_progress.max(0.0).min(1.0);
+                samples[sample_index] *= gain;
+            }
+
+            self.fade_in_samples_remaining -= fade_to_apply;
+            samples_processed += fade_to_apply;
+
+            // If we still have fade to apply, return
+            if self.fade_in_samples_remaining > 0 || samples_processed >= total_samples {
+                return samples_processed;
+            }
+        }
+
+        // Transition complete
+        if self.fade_in_samples_remaining == 0 {
+            debug!("TransitionState: fade-in complete");
+            self.active = false;
+            self.processing_new_variant = false;
+        }
+
+        // Process any remaining samples normally
+        samples_processed + (total_samples - samples_processed)
+    }
+
+    /// Update variant tracking and prepare for transition if needed.
+    /// Returns true if variant changed.
+    fn update_variant(
+        &mut self,
+        current_variant_index: Option<usize>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> bool {
+        let variant_changed = self.previous_variant_index != current_variant_index;
+
+        if variant_changed {
+            debug!(
+                "TransitionState: variant changed from {:?} to {:?}, sample_rate={}, channels={}",
+                self.previous_variant_index, current_variant_index, sample_rate, channels
+            );
+
+            self.previous_variant_index = self.current_variant_index;
+            self.current_variant_index = current_variant_index;
+
+            // Store fade-in length for transition
+            let fade_in_ms = 20;
+            self.fade_in_length_samples =
+                ((fade_in_ms as f32 / 1000.0) * sample_rate as f32) as usize * channels as usize;
+
+            debug!(
+                "TransitionState: fade_in_length_samples={} ({}ms)",
+                self.fade_in_length_samples, fade_in_ms
+            );
+
+            return true;
+        }
+
+        false
+    }
+}
+
+impl PlaybackState {
+    fn new(sample_rate: u32, channels: u16) -> Self {
+        Self {
+            total_playback_time: Duration::ZERO,
+            current_variant_index: None,
+            decoded_frames: 0,
+            sample_rate,
+            channels,
+        }
+    }
+
+    /// Update playback state with a new segment.
+    fn update_with_segment(&mut self, segment_duration: Duration, variant_index: Option<usize>) {
+        self.total_playback_time += segment_duration;
+        self.current_variant_index = variant_index;
+    }
+
+    /// Calculate approximate segment index based on playback time.
+    /// Returns (segment_index, time_offset_within_segment).
+    fn find_segment_position(&self, segment_duration: Duration) -> (u64, Duration) {
+        if segment_duration == Duration::ZERO {
+            return (0, Duration::ZERO);
+        }
+
+        let total_secs = self.total_playback_time.as_secs_f64();
+        let segment_secs = segment_duration.as_secs_f64();
+        let segment_index = (total_secs / segment_secs).floor() as u64;
+        let time_offset =
+            Duration::from_secs_f64(total_secs - (segment_index as f64 * segment_secs));
+
+        (segment_index, time_offset)
+    }
+}
+
 /// Runner wiring async producer and blocking decoder.
 ///
 /// Note: This is a skeleton; actual decode/probe/resample is implemented elsewhere.
@@ -139,7 +380,7 @@ pub struct PipelineRunner {
     pub pcm_prod: Option<AsyncHeapProd<f32>>,
     pub pcm_cons: Option<AsyncHeapCons<f32>>,
 
-    // Optional event callback to bubble up player events without tying to a hub here.
+    /// Optional event callback to bubble up player events without tying to a hub here.
     pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
 }
 
@@ -327,10 +568,13 @@ impl PipelineRunner {
         format: &mut Option<Box<dyn symphonia::core::formats::FormatReader + Send + Sync>>,
         decoder: &mut Option<Box<dyn symphonia::core::codecs::audio::AudioDecoder + Send + Sync>>,
         tmp: &mut Vec<f32>,
-        processors: &Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
+        processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
         output_spec: AudioSpec,
         rt: &tokio::runtime::Runtime,
         pcm_prod: &mut AsyncHeapProd<f32>,
+        dc_filter: &mut DcBlockingFilter,
+        transition_state: &mut TransitionState,
+        is_first_decode_after_reopen: &mut bool,
     ) {
         loop {
             // If format/decoder not ready, break to fetch next Packet.
@@ -364,10 +608,35 @@ impl PipelineRunner {
                                 }
                             }
 
+                            // Apply DC blocking filter to remove DC offset
+                            dc_filter.process(&mut tmp[..needed]);
+
+                            // Apply transition for smooth transitions
+                            debug!(
+                                "decode_available_packets: calling transition_state.process with need_reopen={}, samples={}",
+                                *is_first_decode_after_reopen, needed
+                            );
+                            let processed_samples = transition_state.process(
+                                &mut tmp[..needed],
+                                pcm_prod,
+                                rt,
+                                *is_first_decode_after_reopen,
+                            );
+                            debug!(
+                                "decode_available_packets: transition processed {} of {} samples",
+                                processed_samples, needed
+                            );
+
+                            // Reset the flag after first use
+                            *is_first_decode_after_reopen = false;
+
+                            // Only push processed samples (may be less than needed if silence was inserted)
+                            let samples_to_push = &tmp[..processed_samples];
+
                             // Push into PCM ring with backpressure (await space).
                             // We are in blocking thread; block_on push().
                             rt.block_on(async {
-                                for &s in &tmp[..needed] {
+                                for &s in samples_to_push {
                                     if pcm_prod.push(s).await.is_err() {
                                         break;
                                     }
@@ -438,6 +707,16 @@ impl PipelineRunner {
                 .build()
                 .expect("tokio rt for consumer");
 
+            // Initialize transition state for smooth transitions (fade-in on switch)
+            let mut transition_state = TransitionState::new(
+                20, // 20ms fade-in (longer for smoother transition)
+                output_spec.sample_rate,
+                output_spec.channels,
+            );
+
+            // Initialize DC blocking filter to remove DC offset
+            let mut dc_filter = DcBlockingFilter::new(output_spec.sample_rate);
+
             loop {
                 // Pull next packet (async). We are in blocking thread, so block_on.
                 let packet_opt = rt.block_on(byte_cons.pop());
@@ -452,7 +731,29 @@ impl PipelineRunner {
                 let new_hash = packet.init_hash;
                 let need_reopen = last_init_hash.map(|h| h != new_hash).unwrap_or(true);
 
+                // Update variant tracking
+                let variant_changed = transition_state.update_variant(
+                    packet.variant_index,
+                    output_spec.sample_rate,
+                    output_spec.channels,
+                );
+
+                if variant_changed {
+                    // Reset DC filter on variant change to prevent filter state mismatch
+                    dc_filter.reset();
+                    debug!(
+                        "PipelineRunner: variant changed to {:?}, need_reopen={}, init_hash={:?}->{:?}",
+                        packet.variant_index, need_reopen, last_init_hash, new_hash
+                    );
+                }
+
+                let mut is_first_decode_after_reopen = false;
+
                 if need_reopen {
+                    debug!(
+                        "PipelineRunner: need_reopen=true, last_init_hash={:?}, new_hash={:?}",
+                        last_init_hash, new_hash
+                    );
                     // New feeder and reader.
                     feeder = Arc::new(Mutex::new(Feeder::new()));
                     {
@@ -487,6 +788,12 @@ impl PipelineRunner {
                                         &rt,
                                         &mut pcm_prod,
                                     );
+                                    // This is the first decode after reopening
+                                    is_first_decode_after_reopen = true;
+                                    debug!(
+                                        "PipelineRunner: decoder reopened, is_first_decode_after_reopen={}",
+                                        is_first_decode_after_reopen
+                                    );
                                 }
                                 Err(e) => {
                                     if let Some(cb) = &on_event {
@@ -517,10 +824,13 @@ impl PipelineRunner {
                     &mut maybe_format,
                     &mut maybe_decoder,
                     &mut tmp,
-                    &processors,
+                    processors.clone(),
                     output_spec,
                     &rt,
                     &mut pcm_prod,
+                    &mut dc_filter,
+                    &mut transition_state,
+                    &mut is_first_decode_after_reopen,
                 );
             }
 

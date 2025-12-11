@@ -95,6 +95,8 @@ pub async fn run_http_packet_producer(url: &str, mut out: AsyncHeapProd<Packet>)
             init_bytes: Bytes::new(),
             media_bytes: Bytes::copy_from_slice(&tmp[..n]),
             variant_index: None,
+            segment_duration: std::time::Duration::ZERO,
+            segment_sequence: 0,
         };
 
         if out.push(pkt).await.is_err() {

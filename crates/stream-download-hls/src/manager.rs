@@ -195,10 +195,27 @@ impl HlsManager {
             .await?;
 
         let media_playlist = parse_media_playlist(&data, variant.id)?;
+
+        // Preserve playback position by keeping the same segment index
+        // This assumes variants are time-synchronized (standard HLS behavior)
+        // Ensure we don't exceed the bounds of the new playlist
+        let old_index = self.next_segment_index;
+        let next_segment_index =
+            std::cmp::min(self.next_segment_index, media_playlist.segments.len());
+
+        tracing::debug!(
+            "HlsManager: switching variant from {} to {} (index {} -> {}, segments: {})",
+            self.current_variant_index.unwrap_or(usize::MAX),
+            index,
+            old_index,
+            next_segment_index,
+            media_playlist.segments.len()
+        );
+
         self.current_media_playlist = Some(media_playlist);
         self.current_variant_index = Some(index);
         self.media_playlist_url = Some(media_playlist_url);
-        self.next_segment_index = 0;
+        self.next_segment_index = next_segment_index;
 
         Ok(())
     }

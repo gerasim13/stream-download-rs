@@ -1,5 +1,5 @@
 use tokio_util::sync::CancellationToken;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 use stream_download_hls::{
     AbrConfig, AbrController, Bytes, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
@@ -129,17 +129,26 @@ pub async fn run_hls_packet_producer(
                         let mut init_bytes: Bytes = Bytes::new();
                         if Some(seg.variant_id) != last_variant_id {
                             // Variant switched: fetch new init.
+                            debug!(
+                                "HLS(packet): variant switch detected: {:?} -> {:?}",
+                                last_variant_id, seg.variant_id
+                            );
                             match controller.inner_stream_mut().download_init_segment().await {
                                 Ok(Some(new_init)) => {
                                     let mut hasher = DefaultHasher::new();
                                     hasher.write(new_init.as_ref());
                                     init_hash = hasher.finish();
                                     last_init_hash = init_hash;
+                                    let init_size = new_init.len();
                                     init_bytes = Bytes::from(new_init);
+                                    debug!(
+                                        "HLS(packet): new init segment loaded, hash={}, size={}",
+                                        init_hash, init_size
+                                    );
                                 }
                                 Ok(None) => {
                                     // No init provided by the stream; keep previous hash and empty init.
-                                    trace!("HLS(packet): switched variant has no init segment");
+                                    debug!("HLS(packet): switched variant has no init segment");
                                 }
                                 Err(e) => {
                                     error!("HLS(packet): failed to download switched init: {e:?}");
@@ -158,12 +167,19 @@ pub async fn run_hls_packet_producer(
                         }
 
                         let variant_idx = seg.variant_id.0;
+                        let data_size = seg.data.len();
                         let pkt = Packet {
                             init_hash,
                             init_bytes,
                             media_bytes: seg.data,
                             variant_index: Some(variant_idx),
+                            segment_duration: seg.duration,
+                            segment_sequence: seg.sequence,
                         };
+                        debug!(
+                            "HLS(packet): sending packet variant={}, init_hash={}, seq={}, duration={:?}, size={}",
+                            variant_idx, init_hash, seg.sequence, seg.duration, data_size
+                        );
                         if out.push(pkt).await.is_err() {
                             trace!("HLS(packet): consumer dropped, stopping");
                             break;
@@ -194,12 +210,19 @@ pub async fn run_hls_packet_producer(
                             last_variant_id = Some(seg.variant_id);
                         }
                         let variant_idx = seg.variant_id.0;
+                        let data_size = seg.data.len();
                         let pkt = Packet {
                             init_hash: 0,
                             init_bytes: Bytes::new(),
                             media_bytes: seg.data,
                             variant_index: Some(variant_idx),
+                            segment_duration: seg.duration,
+                            segment_sequence: seg.sequence,
                         };
+                        debug!(
+                            "HLS(packet): sending packet (no init) variant={}, seq={}, duration={:?}, size={}",
+                            variant_idx, seg.sequence, seg.duration, data_size
+                        );
                         if out.push(pkt).await.is_err() {
                             trace!("HLS(packet): consumer dropped, stopping");
                             break;
