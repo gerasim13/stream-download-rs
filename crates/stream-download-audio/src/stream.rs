@@ -4,7 +4,7 @@ use async_ringbuf::{AsyncHeapCons, traits::*};
 use kanal as kchan;
 use tracing::trace;
 
-use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
+use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
 use crate::backends::hls::run_hls_packet_producer;
 use crate::backends::http::run_http_packet_producer;
 use crate::pipeline::PipelineRunner;
@@ -165,25 +165,6 @@ impl AudioStream {
         0
     }
 
-impl SampleSource for AudioStream {
-    // fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
-    //     // Best-effort async -> sync bridge using a local current-thread runtime when necessary.
-    //     // This avoids creating a multi-threaded runtime inside audio callback paths.
-    //     let n = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-    //         handle.block_on(self.pop_chunk_async(out))
-    //     } else {
-    //         let rt = tokio::runtime::Builder::new_current_thread()
-    //             .enable_all()
-    //             .build()
-    //             .expect("audio local rt");
-    //         rt.block_on(self.pop_chunk_async(out))
-    //     };
-    //     if n < out.len() {
-    //         trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
-    //     }
-    //     n
-    // }
-
     /// Internal: pop up to `out.len()` samples into `out`, returning the count.
     pub async fn pop_chunk_async(&mut self, out: &mut [f32]) -> usize {
         let mut n = 0usize;
@@ -200,7 +181,7 @@ impl SampleSource for AudioStream {
     }
 }
 
-impl FloatSampleSource for AudioStream {
+impl SampleSource for AudioStream {
     fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
         // Best-effort async -> sync bridge using a local current-thread runtime when necessary.
         // This avoids creating a multi-threaded runtime inside audio callback paths.

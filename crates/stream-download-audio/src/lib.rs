@@ -19,7 +19,7 @@ pub use stream_download_hls::{
 };
 
 // Public API re-exports.
-pub use crate::api::{AudioOptions, AudioProcessor, AudioSpec, FloatSampleSource, PlayerEvent};
+pub use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
 pub use crate::stream::AudioStream;
 
 #[cfg(feature = "rodio")]

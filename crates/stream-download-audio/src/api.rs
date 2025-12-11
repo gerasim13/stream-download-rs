@@ -20,7 +20,7 @@ pub struct AudioSpec {
 /// Trait representing a pull-based source of interleaved f32 PCM frames.
 ///
 /// This is the lowest common denominator for integrating with custom players.
-pub trait FloatSampleSource: Send {
+pub trait SampleSource: Send {
     /// Fill `out` with interleaved f32 samples. Returns the number of f32 written.
     /// Implementations should be non-blocking or block for short periods.
     fn read_interleaved(&mut self, out: &mut [f32]) -> usize;

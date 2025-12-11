@@ -5,7 +5,7 @@ use std::time::Duration;
 use rodio::Source;
 use tracing::trace;
 
-use crate::{AudioSpec, AudioStream, FloatSampleSource};
+use crate::{AudioSpec, AudioStream, SampleSource};
 
 /// Rodio adapter that implements `rodio::Source<Item = f32>` by pulling from an `AudioStream`.
 ///
