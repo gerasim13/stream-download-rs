@@ -7,8 +7,7 @@ use stream_download_hls::{
 };
 
 use crate::pipeline::Packet;
-use async_ringbuf::AsyncHeapProd;
-use async_ringbuf::traits::producer::AsyncProducer;
+use kanal::AsyncSender;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
@@ -62,7 +61,7 @@ pub async fn run_hls_packet_producer(
     hls_config: HlsConfig,
     abr_config: AbrConfig,
     selection: SelectionMode,
-    mut out: AsyncHeapProd<Packet>,
+    out: AsyncSender<Packet>,
     cancel: CancellationToken,
 ) {
     let downloader = ResourceDownloader::new(DownloaderConfig::default());
@@ -178,7 +177,7 @@ pub async fn run_hls_packet_producer(
                             "HLS(packet): sending packet variant={}, init_hash={}, seq={}, duration={:?}, size={}",
                             variant_idx, init_hash, seg.sequence, seg.duration, data_size
                         );
-                        if out.push(pkt).await.is_err() {
+                        if out.send(pkt).await.is_err() {
                             trace!("HLS(packet): consumer dropped, stopping");
                             break;
                         }
@@ -219,7 +218,7 @@ pub async fn run_hls_packet_producer(
                             "HLS(packet): sending packet (no init) variant={}, seq={}, duration={:?}, size={}",
                             variant_idx, seg.sequence, seg.duration, data_size
                         );
-                        if out.push(pkt).await.is_err() {
+                        if out.send(pkt).await.is_err() {
                             trace!("HLS(packet): consumer dropped, stopping");
                             break;
                         }

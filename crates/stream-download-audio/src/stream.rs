@@ -76,17 +76,14 @@ impl AudioStream {
         runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
         // Launch HLS packet producer (async) using the producer half from runner.
-        let byte_prod = runner
-            .byte_prod
-            .take()
-            .expect("byte producer already taken");
+        let byte_tx = runner.byte_tx.take().expect("byte producer already taken");
         let cancel = tokio_util::sync::CancellationToken::new();
         tokio::spawn(run_hls_packet_producer(
             url.clone(),
             hls_config.clone(),
             abr_config.clone(),
             opts.selection_mode,
-            byte_prod,
+            byte_tx,
             cancel.clone(),
         ));
 
@@ -127,13 +124,10 @@ impl AudioStream {
         runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
         // Launch HTTP packet producer (async) using the producer half from runner.
-        let byte_prod = runner
-            .byte_prod
-            .take()
-            .expect("byte producer already taken");
+        let byte_tx = runner.byte_tx.take().expect("byte producer already taken");
         let url_for_task = url.clone();
         tokio::spawn(async move {
-            let _ = run_http_packet_producer(url_for_task.as_str(), byte_prod).await;
+            let _ = run_http_packet_producer(url_for_task.as_str(), byte_tx).await;
         });
 
         // Launch decoder loop (spawn_blocking internally)

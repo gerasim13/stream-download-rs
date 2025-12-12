@@ -28,9 +28,8 @@
 //! - This is a building block; higher-level pipeline code should drive decoding,
 //!   resampling (rubato), and buffering.
 
-use async_ringbuf::AsyncHeapProd;
-use async_ringbuf::traits::producer::AsyncProducer;
 use bytes::Bytes;
+use kanal::AsyncSender;
 use std::io::Result as IoResult;
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
@@ -47,7 +46,7 @@ use crate::pipeline::Packet;
 /// and stream the incoming bytes as media_bytes chunks.
 ///
 /// The chunk size is implementation-defined; we use a moderate size to balance latency and throughput.
-pub async fn run_http_packet_producer(url: &str, mut out: AsyncHeapProd<Packet>) -> IoResult<()> {
+pub async fn run_http_packet_producer(url: &str, out: AsyncSender<Packet>) -> IoResult<()> {
     use stream_download::http::HttpStream;
     let parsed = reqwest::Url::parse(url).map_err(|e| io_other(&e.to_string()))?;
     let mut reader = match StreamDownload::new_http(
@@ -97,7 +96,7 @@ pub async fn run_http_packet_producer(url: &str, mut out: AsyncHeapProd<Packet>)
             variant_index: None,
         };
 
-        if out.push(pkt).await.is_err() {
+        if out.send(pkt).await.is_err() {
             // Consumer dropped.
             break;
         }

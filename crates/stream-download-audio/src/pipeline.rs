@@ -5,6 +5,7 @@ use tracing::debug;
 
 use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bytes::Bytes;
+use kanal::{AsyncReceiver, AsyncSender, ReceiveError};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -132,9 +133,9 @@ impl MediaSource for FeederMediaSource {
 ///
 /// Note: This is a skeleton; actual decode/probe/resample is implemented elsewhere.
 pub struct PipelineRunner {
-    // Async byte ring: producer -> decoder
-    pub byte_prod: Option<AsyncHeapProd<Packet>>,
-    pub byte_cons: Option<AsyncHeapCons<Packet>>,
+    // Async byte channel: producer -> decoder
+    pub byte_tx: Option<AsyncSender<Packet>>,
+    pub byte_rx: Option<AsyncReceiver<Packet>>,
 
     // PCM ring: decoder -> consumer (async)
     pub pcm_prod: Option<AsyncHeapProd<f32>>,
@@ -146,15 +147,14 @@ pub struct PipelineRunner {
 
 impl PipelineRunner {
     pub fn new(byte_capacity: usize, pcm_capacity: usize) -> Self {
-        let byte_rb = AsyncHeapRb::<Packet>::new(byte_capacity);
-        let (byte_prod, byte_cons) = byte_rb.split();
+        let (byte_tx, byte_rx) = kanal::bounded_async(byte_capacity);
 
         let pcm_rb = AsyncHeapRb::<f32>::new(pcm_capacity);
         let (pcm_prod, pcm_cons) = pcm_rb.split();
 
         Self {
-            byte_prod: Some(byte_prod),
-            byte_cons: Some(byte_cons),
+            byte_tx: Some(byte_tx),
+            byte_rx: Some(byte_rx),
             pcm_prod: Some(pcm_prod),
             pcm_cons: Some(pcm_cons),
             on_event: None,
@@ -191,11 +191,7 @@ impl PipelineRunner {
     }
 
     /// Helper to prebuffer additional packets into feeder to reduce initial underflow/glitches.
-    fn prebuffer_packets(
-        rt: &tokio::runtime::Runtime,
-        byte_cons: &mut AsyncHeapCons<Packet>,
-        feeder: &Arc<Mutex<Feeder>>,
-    ) {
+    fn prebuffer_packets(byte_rx: &AsyncReceiver<Packet>, feeder: &Arc<Mutex<Feeder>>) {
         let prebuffer_budget: usize = 64 * 1024; // bytes
         let start_prebuffer = std::time::Instant::now();
         loop {
@@ -207,19 +203,16 @@ impl PipelineRunner {
             if start_prebuffer.elapsed() > std::time::Duration::from_millis(10) {
                 break;
             }
-            // Try to fetch one more packet with a very short timeout.
-            let next_opt = rt.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_millis(1), byte_cons.pop()).await
-            });
-            match next_opt {
+            // Try to fetch one more packet with non-blocking receive.
+            match byte_rx.try_recv() {
                 Ok(Some(extra_pkt)) => {
                     if let Ok(mut guard) = feeder.lock() {
                         // Only media bytes; init_hash change will re-open on the next outer loop iteration.
                         guard.push_bytes(extra_pkt.media_bytes.clone());
                     }
                 }
-                Ok(None) => break, // producer closed
-                Err(_) => break,   // timeout
+                Ok(None) => break, // no data available
+                Err(_) => break,   // channel closed
             }
         }
     }
@@ -286,7 +279,6 @@ impl PipelineRunner {
         tmp: &mut Vec<f32>,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
         output_spec: AudioSpec,
-        rt: &tokio::runtime::Runtime,
         pcm_prod: &mut AsyncHeapProd<f32>,
         is_first_decode_after_reopen: &mut bool,
     ) {
@@ -329,7 +321,11 @@ impl PipelineRunner {
                             let samples_to_push = &tmp[..needed];
 
                             // Push into PCM ring with backpressure (await space).
-                            // We are in blocking thread; block_on push().
+                            // We are in blocking thread; create a small runtime for async operations.
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("pcm push runtime");
                             rt.block_on(async {
                                 for &s in samples_to_push {
                                     if pcm_prod.push(s).await.is_err() {
@@ -371,7 +367,7 @@ impl PipelineRunner {
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
     ) -> tokio::task::JoinHandle<()> {
         // Move required ring ends and settings into the decoding task.
-        let mut byte_cons = self.byte_cons.take().expect("byte_cons already taken");
+        let byte_rx = self.byte_rx.take().expect("byte_rx already taken");
         let mut pcm_prod = self.pcm_prod.take().expect("pcm_prod already taken");
         let on_event = self.on_event.clone();
 
@@ -395,20 +391,19 @@ impl PipelineRunner {
             // Temporary interleaved buffer for converted f32 samples.
             let mut tmp: Vec<f32> = Vec::new();
 
-            // Local runtime to block_on async ring operations from this blocking thread.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .thread_name("decoder_worker")
-                .enable_all()
-                .build()
-                .expect("tokio rt for consumer");
+            // Clone the async receiver to get a sync receiver for blocking thread
+            let sync_byte_rx = byte_rx.clone_sync();
 
             loop {
-                // Pull next packet (async). We are in blocking thread, so block_on.
-                let packet_opt = rt.block_on(byte_cons.pop());
-                let packet = match packet_opt {
-                    Some(pkt) => pkt,
-                    None => {
+                // Pull next packet using sync receiver (blocking).
+                let packet = match sync_byte_rx.recv() {
+                    Ok(pkt) => pkt,
+                    Err(ReceiveError::Closed) => {
                         // Producer closed.
+                        break;
+                    }
+                    Err(ReceiveError::SendClosed) => {
+                        // Sender closed.
                         break;
                     }
                 };
@@ -431,7 +426,7 @@ impl PipelineRunner {
                         guard.push_bytes(packet.media_bytes.clone());
                     }
                     // Prebuffer additional packets into feeder to reduce initial underflow/glitches.
-                    Self::prebuffer_packets(&rt, &mut byte_cons, &feeder);
+                    Self::prebuffer_packets(&byte_rx, &feeder);
 
                     match Self::open_reader(feeder.clone()) {
                         Ok((format, cn)) => {
@@ -489,7 +484,6 @@ impl PipelineRunner {
                     &mut tmp,
                     processors.clone(),
                     output_spec,
-                    &rt,
                     &mut pcm_prod,
                     &mut is_first_decode_after_reopen,
                 );
