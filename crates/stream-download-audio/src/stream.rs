@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use async_ringbuf::{AsyncHeapCons, traits::*};
 use kanal as kchan;
+use ringbuf::{HeapCons, traits::*};
 use tracing::trace;
 
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
@@ -44,7 +44,7 @@ impl EventHub {
 /// surface are implemented.
 pub struct AudioStream {
     spec: Arc<Mutex<AudioSpec>>,
-    pcm_cons: AsyncHeapCons<f32>,
+    pcm_cons: HeapCons<f32>,
     events: Arc<EventHub>,
 }
 
@@ -92,7 +92,6 @@ impl AudioStream {
         let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), processors);
 
         // Expose runner's PCM ring to AudioStream
-
         let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
 
         Self {
@@ -160,10 +159,10 @@ impl AudioStream {
     }
 
     /// Internal: pop up to `out.len()` samples into `out`, returning the count.
-    pub async fn pop_chunk_async(&mut self, out: &mut [f32]) -> usize {
+    pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
         let mut n = 0usize;
         while n < out.len() {
-            match self.pcm_cons.pop().await {
+            match self.pcm_cons.try_pop() {
                 Some(s) => {
                     out[n] = s;
                     n += 1;
@@ -177,17 +176,8 @@ impl AudioStream {
 
 impl SampleSource for AudioStream {
     fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
-        // Best-effort async -> sync bridge using a local current-thread runtime when necessary.
-        // This avoids creating a multi-threaded runtime inside audio callback paths.
-        let n = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(self.pop_chunk_async(out))
-        } else {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("audio local rt");
-            rt.block_on(self.pop_chunk_async(out))
-        };
+        // Use synchronous pop since we're now using sync ringbuf
+        let n = self.pop_chunk(out);
         if n < out.len() {
             trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
         }

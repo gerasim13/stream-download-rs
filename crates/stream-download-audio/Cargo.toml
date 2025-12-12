@@ -30,6 +30,7 @@ kanal = "0.1"
 
 # Lock-free ring buffer for PCM frames (SPSC)
 async-ringbuf = "0.3.4"
+ringbuf = "0.4.8"
 
 # High-quality resampling (runs asynchronously in a worker)
 rubato = "0.14"

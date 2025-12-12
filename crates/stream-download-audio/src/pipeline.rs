@@ -3,9 +3,12 @@ use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
-use async_ringbuf::{AsyncHeapCons, AsyncHeapProd, AsyncHeapRb, traits::*};
 use bytes::Bytes;
 use kanal::{AsyncReceiver, AsyncSender, ReceiveError};
+use ringbuf::{
+    HeapCons, HeapProd, HeapRb,
+    traits::{Producer, Split},
+};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -140,33 +143,6 @@ impl Pipeline {
         }
     }
 
-    /// Helper to prebuffer additional packets into feeder to reduce initial underflow/glitches.
-    pub fn prebuffer_packets(byte_rx: &AsyncReceiver<Packet>, feeder: &Arc<Mutex<Feeder>>) {
-        let prebuffer_budget: usize = 64 * 1024; // bytes
-        let start_prebuffer = std::time::Instant::now();
-        loop {
-            // Stop if enough bytes buffered.
-            if feeder.lock().unwrap().buffered_len >= prebuffer_budget {
-                break;
-            }
-            // Stop if we spent too much time prebuffering.
-            if start_prebuffer.elapsed() > std::time::Duration::from_millis(10) {
-                break;
-            }
-            // Try to fetch one more packet with non-blocking receive.
-            match byte_rx.try_recv() {
-                Ok(Some(extra_pkt)) => {
-                    if let Ok(mut guard) = feeder.lock() {
-                        // Only media bytes; init_hash change will re-open on the next outer loop iteration.
-                        guard.push_bytes(extra_pkt.media_bytes.clone());
-                    }
-                }
-                Ok(None) => break, // no data available
-                Err(_) => break,   // channel closed
-            }
-        }
-    }
-
     /// Create audio decoder from format and send format change events.
     pub fn create_audio_decoder(
         format: Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
@@ -226,7 +202,6 @@ impl Pipeline {
     pub fn process_packet(
         &mut self,
         packet: Packet,
-        byte_rx: &AsyncReceiver<Packet>,
         on_event: &Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
         output_spec: AudioSpec,
     ) -> Result<(), String> {
@@ -246,9 +221,6 @@ impl Pipeline {
                 guard.push_bytes(packet.init_bytes.clone());
                 guard.push_bytes(packet.media_bytes.clone());
             }
-
-            // Prebuffer additional packets into feeder to reduce initial underflow/glitches.
-            Self::prebuffer_packets(byte_rx, &self.feeder);
 
             // Reset pipeline state before opening new reader
             self.format = None;
@@ -307,7 +279,7 @@ impl Pipeline {
         &mut self,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
         output_spec: AudioSpec,
-        pcm_prod: &mut AsyncHeapProd<f32>,
+        pcm_prod: &mut HeapProd<f32>,
     ) {
         loop {
             // If format/decoder not ready, break to fetch next Packet.
@@ -347,19 +319,12 @@ impl Pipeline {
                             // Only push processed samples (may be less than needed if silence was inserted)
                             let samples_to_push = &self.tmp_buffer[..needed];
 
-                            // Push into PCM ring with backpressure (await space).
-                            // We are in blocking thread; create a small runtime for async operations.
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .expect("pcm push runtime");
-                            rt.block_on(async {
-                                for &s in samples_to_push {
-                                    if pcm_prod.push(s).await.is_err() {
-                                        break;
-                                    }
+                            // Push into PCM ring with backpressure (non-blocking).
+                            for &s in samples_to_push {
+                                if pcm_prod.try_push(s).is_err() {
+                                    break;
                                 }
-                            });
+                            }
                         }
                         Err(_) => {
                             // Decoder wants more bytes or encountered recoverable error; break to fetch next Packet.
@@ -385,26 +350,6 @@ impl Pipeline {
                 }
             }
         }
-    }
-
-    /// Check if pipeline is ready (has format and decoder)
-    pub fn is_ready(&self) -> bool {
-        self.format.is_some() && self.decoder.is_some()
-    }
-
-    /// Get the current container name
-    pub fn container_name(&self) -> Option<&String> {
-        self.container_name.as_ref()
-    }
-
-    /// Get the last init hash
-    pub fn last_init_hash(&self) -> Option<u64> {
-        self.last_init_hash
-    }
-
-    #[allow(dead_code)]
-    pub fn enable_seek(&mut self) {
-        self.seek_enabled = true;
     }
 }
 
@@ -460,9 +405,9 @@ pub struct PipelineRunner {
     pub byte_tx: Option<AsyncSender<Packet>>,
     pub byte_rx: Option<AsyncReceiver<Packet>>,
 
-    // PCM ring: decoder -> consumer (async)
-    pub pcm_prod: Option<AsyncHeapProd<f32>>,
-    pub pcm_cons: Option<AsyncHeapCons<f32>>,
+    // PCM ring: decoder -> consumer (sync)
+    pub pcm_prod: Option<HeapProd<f32>>,
+    pub pcm_cons: Option<HeapCons<f32>>,
 
     /// Optional event callback to bubble up player events without tying to a hub here.
     pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
@@ -472,7 +417,7 @@ impl PipelineRunner {
     pub fn new(byte_capacity: usize, pcm_capacity: usize) -> Self {
         let (byte_tx, byte_rx) = kanal::bounded_async(byte_capacity);
 
-        let pcm_rb = AsyncHeapRb::<f32>::new(pcm_capacity);
+        let pcm_rb = HeapRb::<f32>::new(pcm_capacity);
         let (pcm_prod, pcm_cons) = pcm_rb.split();
 
         Self {
@@ -517,7 +462,7 @@ impl PipelineRunner {
                 };
 
                 // Process the packet through pipeline
-                if let Err(e) = pipeline.process_packet(packet, &byte_rx, &on_event, output_spec) {
+                if let Err(e) = pipeline.process_packet(packet, &on_event, output_spec) {
                     if let Some(cb) = &on_event {
                         cb(PlayerEvent::Error { message: e });
                     }
