@@ -19,6 +19,7 @@ use async_trait::async_trait;
 
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
+use crate::traits::SegmentType;
 use crate::{HlsError, HlsResult, MediaStream, SegmentData};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -389,7 +390,7 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
         self.stream.select_variant(variant_id).await
     }
 
-    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>> {
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>> {
         // Update simple buffer estimate by accounting for wall-clock elapsed time
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_buffer_update).as_secs_f32();
@@ -413,14 +414,22 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
         let result = self.stream.next_segment().await;
         let duration = start_time.elapsed();
 
-        if let Ok(Some(segment_data)) = &result {
-            // 3. Feed the measurement to the bandwidth estimator.
-            self.bandwidth_estimator
-                .add_sample(duration.as_millis() as f64, segment_data.data.len() as u32);
+        if let Ok(Some(segment_type)) = &result {
+            match segment_type {
+                SegmentType::Init(segment_data) => {
+                    // For init segments, we don't update bandwidth estimator or buffer
+                    // because they don't contain media data
+                }
+                SegmentType::Media(segment_data) => {
+                    // 3. Feed the measurement to the bandwidth estimator.
+                    self.bandwidth_estimator
+                        .add_sample(duration.as_millis() as f64, segment_data.data.len() as u32);
 
-            // 4. Increase buffer estimate by the segment duration.
-            self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
-            self.last_buffer_update = Instant::now();
+                    // 4. Increase buffer estimate by the segment duration.
+                    self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
+                    self.last_buffer_update = Instant::now();
+                }
+            }
         }
 
         result

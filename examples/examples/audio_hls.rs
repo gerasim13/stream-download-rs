@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
     let manual_variant_idx = 0usize;
-    let selection_mode = SelectionMode::Auto;
+    let selection_mode = SelectionMode::Manual(VariantId(0));
 
     // Build audio stream
     let opts = AudioOptions::default().with_selection_mode(selection_mode);

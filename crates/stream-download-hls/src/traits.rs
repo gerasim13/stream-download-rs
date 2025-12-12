@@ -12,6 +12,16 @@ use bytes::Bytes;
 
 use crate::model::{CodecInfo, HlsResult, SegmentKey, VariantId, VariantStream};
 
+/// Type of segment returned by `next_segment`.
+#[derive(Debug, Clone)]
+pub enum SegmentType {
+    /// Initialization segment containing container headers and metadata.
+    /// Must be processed before any media segments from the same variant.
+    Init(SegmentData),
+    /// Media segment containing actual audio/video data.
+    Media(SegmentData),
+}
+
 /// A data package for a single media segment.
 ///
 /// This struct bundles the raw segment bytes with the necessary metadata for a
@@ -73,18 +83,20 @@ pub trait MediaStream {
     ///   one of the IDs present in the slice returned by `variants()`.
     async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()>;
 
-    /// Fetches the next media segment from the currently selected stream.
+    /// Fetches the next segment from the currently selected stream.
     ///
     /// This is the core method for a player's consumption loop.
+    /// Returns either an initialization segment or a media segment.
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(SegmentData))`: Successfully fetched the next segment.
+    /// * `Ok(Some(SegmentType::Init(...)))`: Initialization segment.
+    /// * `Ok(Some(SegmentType::Media(...)))`: Media segment.
     /// * `Ok(None)`: The stream has ended gracefully (e.g., an HLS playlist
     ///   with an `#EXT-X-ENDLIST` tag). No more segments will be produced.
     /// * `Err(HlsError)`: An error occurred while fetching or parsing.
     ///
     /// For live streams, an implementation may block internally (asynchronously)
     /// until a new segment becomes available in the playlist.
-    async fn next_segment(&mut self) -> HlsResult<Option<SegmentData>>;
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>>;
 }
