@@ -16,6 +16,7 @@ keywords.workspace = true
 [dependencies]
 stream-download = { version = "0.22.9", path = "../stream-download" }
 tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }

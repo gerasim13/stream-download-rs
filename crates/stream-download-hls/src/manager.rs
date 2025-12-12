@@ -26,8 +26,8 @@ use std::collections::HashMap;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{
-    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, VariantId,
-    VariantStream,
+    EncryptionMethod, HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment,
+    VariantId, VariantStream,
 };
 use crate::parser::{parse_master_playlist, parse_media_playlist};
 use crate::traits::{MediaStream, SegmentData};
@@ -277,8 +277,6 @@ impl HlsManager {
     /// - handle AES-128 decryption when applicable,
     /// - return the raw bytes to the caller.
     pub async fn download_segment(&mut self, segment: &MediaSegment) -> HlsResult<Vec<u8>> {
-        use crate::model::EncryptionMethod;
-
         // Resolve segment URL relative to media playlist
         let seg_url = self.resolve_url(&segment.uri)?;
         // Download segment bytes
@@ -353,8 +351,6 @@ impl HlsManager {
     /// - Ok(Some(Vec<u8>)) when an init segment exists and was fetched (decrypted if necessary)
     /// - Ok(None) when no init segment is present in the current media playlist
     pub async fn download_init_segment(&mut self) -> HlsResult<Option<Vec<u8>>> {
-        use crate::model::EncryptionMethod;
-
         let playlist = match &self.current_media_playlist {
             Some(p) => p,
             None => {

@@ -9,6 +9,7 @@
 //!           to avoid tail-probing during format detection and enable seeking post-probe.
 //! - `hls`:  streaming MediaSource that feeds init + media segments from `HlsManager` to
 //!           Symphonia in a blocking fashion (non-seekable for now).
+//! - `common`: Common utilities shared between packet producers.
 //!
 //! Additional backends (e.g., S3/opendal, process, async_read) can be added here in the future.
 
@@ -39,6 +40,7 @@ pub trait PacketProducer: Send + Sync {
     ) -> std::io::Result<()>;
 }
 
+pub mod common;
 pub mod hls;
 pub mod http;
 

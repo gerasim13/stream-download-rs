@@ -19,6 +19,7 @@
 //! - `abr`: A basic adaptive bitrate (ABR) controller.
 //! - `downloader`: A thin wrapper around `stream-download` for fetching resources.
 //! - `traits`: High-level traits for abstracting media stream sources.
+//! - `hls_stream`: HLS implementation of the `SourceStream` trait.
 //!
 //! This file (`lib.rs`) acts as a facade: it re-exports the main
 //! types and functions from the internal modules to form the public API
@@ -27,6 +28,7 @@
 mod abr;
 mod crypto;
 mod downloader;
+mod hls_stream;
 mod manager;
 mod model;
 mod parser;
@@ -34,6 +36,8 @@ mod traits;
 
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics, SelectionMode};
 pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
+
+pub use crate::hls_stream::{HlsStream, HlsStreamError, HlsStreamExt, HlsStreamParams};
 pub use crate::manager::HlsManager;
 pub use crate::model::{
     HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,

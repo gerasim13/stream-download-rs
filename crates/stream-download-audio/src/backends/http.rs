@@ -33,7 +33,9 @@ use bytes::Bytes;
 use kanal::AsyncSender;
 use std::io::Result as IoResult;
 
+use stream_download::http::HttpStream;
 use stream_download::source::DecodeError;
+
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use tokio_util::sync::CancellationToken;
@@ -49,50 +51,6 @@ impl HttpPacketProducer {
     /// Create a new HTTP packet producer.
     pub fn new(url: impl Into<String>) -> Self {
         Self { url: url.into() }
-    }
-
-    /// Blocking reading loop that runs in a separate thread.
-    /// Reads from StreamDownload and sends packets through a synchronous channel.
-    fn run_blocking_reading_loop(
-        mut reader: StreamDownload<TempStorageProvider>,
-        sync_out: kanal::Sender<Packet>,
-        cancel: Option<CancellationToken>,
-    ) -> IoResult<()> {
-        let mut buf = vec![0u8; 256 * 1024];
-
-        loop {
-            // Check for cancellation
-            if let Some(cancel_token) = &cancel {
-                if cancel_token.is_cancelled() {
-                    return Ok(());
-                }
-            }
-
-            use std::io::Read;
-            let n = match reader.read(&mut buf[..]) {
-                Ok(n) => n,
-                Err(e) => return Err(e),
-            };
-
-            if n == 0 {
-                break;
-            }
-
-            let pkt = Packet {
-                init_hash: 0,
-                init_bytes: Bytes::new(),
-                media_bytes: Bytes::copy_from_slice(&buf[..n]),
-                variant_index: None,
-            };
-
-            // Use synchronous send in blocking thread
-            if sync_out.send(pkt).is_err() {
-                // Consumer dropped.
-                break;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -112,32 +70,36 @@ impl crate::backends::PacketProducer for HttpPacketProducer {
         out: AsyncSender<Packet>,
         cancel: Option<CancellationToken>,
     ) -> IoResult<()> {
+        use crate::backends::common::{io_other, run_blocking_reading_loop};
+
         let parsed = reqwest::Url::parse(&self.url).map_err(|e| io_other(&e.to_string()))?;
         let reader = match StreamDownload::new_http(
             parsed,
             TempStorageProvider::default(),
-            Settings::<stream_download::http::HttpStream<reqwest::Client>>::default(),
+            Settings::<HttpStream<reqwest::Client>>::default(),
         )
         .await
         {
             Ok(r) => r,
             Err(e) => {
-                let msg = e.decode_error().await;
+                let msg: String = e.decode_error().await;
                 return Err(io_other(&msg));
             }
         };
 
-        // Run the entire reading loop in a spawn_blocking task
-        // This avoids blocking the async executor while reading from StreamDownload
+        // Run the blocking reading loop in a separate thread
         let sync_out = out.clone_sync();
         tokio::task::spawn_blocking(move || {
-            Self::run_blocking_reading_loop(reader, sync_out, cancel)
+            run_blocking_reading_loop(
+                reader,
+                sync_out,
+                cancel,
+                None,         // variant_index
+                0,            // init_hash
+                Bytes::new(), // init_bytes
+            )
         })
         .await
         .map_err(|join_err| io_other(&format!("join error: {join_err}")))?
     }
-}
-
-fn io_other(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, msg.to_string())
 }

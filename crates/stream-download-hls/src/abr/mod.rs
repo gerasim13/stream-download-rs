@@ -159,6 +159,11 @@ impl<S: MediaStream> AbrController<S> {
         &mut self.stream
     }
 
+    /// Consume the controller and return the underlying `MediaStream`.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
     /// Get the ID of the variant currently targeted by the controller.
     pub fn current_variant_id(&self) -> Option<VariantId> {
         self.current_variant_id
