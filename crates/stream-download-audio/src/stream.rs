@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use kanal as kchan;
-
+use kanal;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
@@ -12,7 +11,7 @@ use crate::pipeline::PipelineRunner;
 /// Simple broadcast hub for `PlayerEvent` using `kanal`.
 #[derive(Debug)]
 pub(crate) struct EventHub {
-    subs: Mutex<Vec<kchan::Sender<PlayerEvent>>>,
+    subs: Mutex<Vec<kanal::Sender<PlayerEvent>>>,
 }
 
 impl EventHub {
@@ -22,8 +21,8 @@ impl EventHub {
         }
     }
 
-    pub fn subscribe(&self) -> kchan::Receiver<PlayerEvent> {
-        let (tx, rx) = kchan::unbounded::<PlayerEvent>();
+    pub fn subscribe(&self) -> kanal::Receiver<PlayerEvent> {
+        let (tx, rx) = kanal::unbounded::<PlayerEvent>();
         self.subs.lock().unwrap().push(tx);
         rx
     }
@@ -104,7 +103,6 @@ impl AudioStream {
         abr_config: stream_download_hls::AbrConfig,
     ) -> Self {
         let producer = HlsPacketProducer::new(url, hls_config, abr_config, opts.selection_mode);
-
         Self::from_packet_producer(producer, opts, None).await
     }
 
@@ -117,7 +115,7 @@ impl AudioStream {
     }
 
     /// Subscribe to player events.
-    pub fn subscribe_events(&self) -> kchan::Receiver<PlayerEvent> {
+    pub fn subscribe_events(&self) -> kanal::Receiver<PlayerEvent> {
         self.events.subscribe()
     }
 

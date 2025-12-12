@@ -461,13 +461,13 @@ impl PipelineRunner {
         let mut pcm_prod = self.pcm_prod.take().expect("pcm_prod already taken");
         let on_event = self.on_event.clone();
 
+        // Clone the async receiver to get a sync receiver for blocking thread
+        let sync_byte_rx = byte_rx.clone_sync();
+
+        // Create pipeline instance
+        let mut pipeline = Pipeline::new();
+
         tokio::task::spawn_blocking(move || {
-            // Clone the async receiver to get a sync receiver for blocking thread
-            let sync_byte_rx = byte_rx.clone_sync();
-
-            // Create pipeline instance
-            let mut pipeline = Pipeline::new();
-
             loop {
                 // Pull next packet using sync receiver (blocking).
                 let packet = match sync_byte_rx.recv() {
