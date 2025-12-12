@@ -66,7 +66,7 @@ pub async fn run_http_packet_producer(url: &str, out: AsyncSender<Packet>) -> Io
     // Read a moderate chunk size; adjust if needed.
     loop {
         let (res, tmp, r_back) = tokio::task::spawn_blocking({
-            let mut buf_guard = vec![0u8; 64 * 1024];
+            let mut buf_guard = vec![0u8; 256 * 1024];
             let mut reader_inner = reader;
             move || {
                 // Note: StreamDownload Reader implements blocking Read; bridge via spawn_blocking.

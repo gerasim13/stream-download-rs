@@ -63,107 +63,57 @@ impl Feeder {
     }
 }
 
-/// A minimal blocking MediaSource over Feeder
-pub struct FeederMediaSource {
-    inner: Arc<Mutex<Feeder>>,
-    // optional: gating seek until probe is complete
+/// Pipeline containing the decoding logic
+pub struct Pipeline {
+    /// Current feeder for media data
+    feeder: Arc<Mutex<Feeder>>,
+    /// Current format reader
+    format: Option<Box<dyn symphonia::core::formats::FormatReader + Send + Sync>>,
+    /// Current audio decoder
+    decoder: Option<Box<dyn symphonia::core::codecs::audio::AudioDecoder + Send + Sync>>,
+    /// Container name of current stream
+    container_name: Option<String>,
+    /// Last init hash to detect changes
+    last_init_hash: Option<u64>,
+    /// Temporary buffer for converted samples
+    tmp_buffer: Vec<f32>,
+    /// Flag indicating first decode after reopening
+    is_first_decode_after_reopen: bool,
+    /// Optional: gating seek until probe is complete
     seek_enabled: bool,
 }
 
-impl FeederMediaSource {
-    pub fn new(inner: Arc<Mutex<Feeder>>) -> Self {
+impl Pipeline {
+    pub fn new() -> Self {
         Self {
-            inner,
+            feeder: Arc::new(Mutex::new(Feeder::new())),
+            format: None,
+            decoder: None,
+            container_name: None,
+            last_init_hash: None,
+            tmp_buffer: Vec::new(),
+            is_first_decode_after_reopen: false,
             seek_enabled: false,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn enable_seek(&mut self) {
-        self.seek_enabled = true;
-    }
-}
-
-impl Read for FeederMediaSource {
-    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
-        let mut guard = self.inner.lock().unwrap();
-
-        loop {
-            guard.pop_front_if_empty();
-            if guard.queue.is_empty() {
-                if guard.eof {
-                    return Ok(0);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "no data available",
-                ));
-            } else {
-                break;
-            }
-        }
-
-        let front = guard.queue.front().unwrap();
-        let start = guard.pos_in_front;
-        let n = std::cmp::min(buf.len(), front.len() - start);
-        buf[..n].copy_from_slice(&front.slice(start..start + n));
-        guard.pos_in_front += n;
-        guard.buffered_len = guard.buffered_len.saturating_sub(n);
-        Ok(n)
-    }
-}
-
-impl Seek for FeederMediaSource {
-    fn seek(&mut self, _pos: SeekFrom) -> IoResult<u64> {
-        unimplemented!()
-    }
-}
-
-impl MediaSource for FeederMediaSource {
-    fn is_seekable(&self) -> bool {
-        self.seek_enabled
+    /// Create a MediaSource from this pipeline's feeder
+    pub fn as_media_source(&self) -> Box<dyn MediaSource> {
+        Box::new(Pipeline {
+            feeder: self.feeder.clone(),
+            format: None,
+            decoder: None,
+            container_name: None,
+            last_init_hash: None,
+            tmp_buffer: Vec::new(),
+            is_first_decode_after_reopen: false,
+            seek_enabled: false,
+        })
     }
 
-    fn byte_len(&self) -> Option<u64> {
-        None
-    }
-}
-
-/// Runner wiring async producer and blocking decoder.
-///
-/// Note: This is a skeleton; actual decode/probe/resample is implemented elsewhere.
-pub struct PipelineRunner {
-    // Async byte channel: producer -> decoder
-    pub byte_tx: Option<AsyncSender<Packet>>,
-    pub byte_rx: Option<AsyncReceiver<Packet>>,
-
-    // PCM ring: decoder -> consumer (async)
-    pub pcm_prod: Option<AsyncHeapProd<f32>>,
-    pub pcm_cons: Option<AsyncHeapCons<f32>>,
-
-    /// Optional event callback to bubble up player events without tying to a hub here.
-    pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
-}
-
-impl PipelineRunner {
-    pub fn new(byte_capacity: usize, pcm_capacity: usize) -> Self {
-        let (byte_tx, byte_rx) = kanal::bounded_async(byte_capacity);
-
-        let pcm_rb = AsyncHeapRb::<f32>::new(pcm_capacity);
-        let (pcm_prod, pcm_cons) = pcm_rb.split();
-
-        Self {
-            byte_tx: Some(byte_tx),
-            byte_rx: Some(byte_rx),
-            pcm_prod: Some(pcm_prod),
-            pcm_cons: Some(pcm_cons),
-            on_event: None,
-        }
-    }
-
-    /// Helper to probe a new reader from fresh feeder with init+first media bytes.
-    fn open_reader(
-        feeder_arc: Arc<Mutex<Feeder>>,
+    /// Helper to probe a new reader from current feeder.
+    pub fn open_reader(
+        &self,
     ) -> Result<
         (
             Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
@@ -172,7 +122,7 @@ impl PipelineRunner {
         symphonia::core::errors::Error,
     > {
         let mss = symphonia::core::io::MediaSourceStream::new(
-            Box::new(FeederMediaSource::new(feeder_arc)) as Box<dyn MediaSource>,
+            self.as_media_source(),
             symphonia::core::io::MediaSourceStreamOptions::default(),
         );
         let hint = Hint::new();
@@ -191,7 +141,7 @@ impl PipelineRunner {
     }
 
     /// Helper to prebuffer additional packets into feeder to reduce initial underflow/glitches.
-    fn prebuffer_packets(byte_rx: &AsyncReceiver<Packet>, feeder: &Arc<Mutex<Feeder>>) {
+    pub fn prebuffer_packets(byte_rx: &AsyncReceiver<Packet>, feeder: &Arc<Mutex<Feeder>>) {
         let prebuffer_budget: usize = 64 * 1024; // bytes
         let start_prebuffer = std::time::Instant::now();
         loop {
@@ -218,7 +168,7 @@ impl PipelineRunner {
     }
 
     /// Create audio decoder from format and send format change events.
-    fn create_audio_decoder(
+    pub fn create_audio_decoder(
         format: Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
         container_name: &str,
         packet: &Packet,
@@ -272,19 +222,96 @@ impl PipelineRunner {
         }
     }
 
+    /// Process a packet: handle init hash changes and feed data to decoder
+    pub fn process_packet(
+        &mut self,
+        packet: Packet,
+        byte_rx: &AsyncReceiver<Packet>,
+        on_event: &Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
+        output_spec: AudioSpec,
+    ) -> Result<(), String> {
+        let new_hash = packet.init_hash;
+        let need_reopen = self.last_init_hash.map(|h| h != new_hash).unwrap_or(true);
+
+        if need_reopen {
+            debug!(
+                "Pipeline: need_reopen=true, last_init_hash={:?}, new_hash={:?}",
+                self.last_init_hash, new_hash
+            );
+
+            // New feeder and reader.
+            self.feeder = Arc::new(Mutex::new(Feeder::new()));
+            {
+                let mut guard = self.feeder.lock().unwrap();
+                guard.push_bytes(packet.init_bytes.clone());
+                guard.push_bytes(packet.media_bytes.clone());
+            }
+
+            // Prebuffer additional packets into feeder to reduce initial underflow/glitches.
+            Self::prebuffer_packets(byte_rx, &self.feeder);
+
+            // Reset pipeline state before opening new reader
+            self.format = None;
+            self.decoder = None;
+            self.container_name = None;
+            self.last_init_hash = None;
+            self.is_first_decode_after_reopen = false;
+            self.seek_enabled = false;
+
+            match self.open_reader() {
+                Ok((format, cn)) => {
+                    self.container_name = Some(cn.clone());
+
+                    // Select default audio track and build decoder.
+                    match Self::create_audio_decoder(
+                        format,
+                        &cn,
+                        &packet,
+                        output_spec.sample_rate,
+                        output_spec.channels,
+                        &AudioDecoderOptions::default(),
+                        on_event,
+                    ) {
+                        Ok((format, dec)) => {
+                            self.decoder = Some(dec);
+                            self.format = Some(format);
+                            self.last_init_hash = Some(new_hash);
+                            self.is_first_decode_after_reopen = true;
+
+                            debug!(
+                                "Pipeline: decoder reopened, is_first_decode_after_reopen={}",
+                                self.is_first_decode_after_reopen
+                            );
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("probe failed: {e}"));
+                }
+            }
+        } else {
+            // Same init: just append media bytes into feeder.
+            if let Ok(mut guard) = self.feeder.lock() {
+                guard.push_bytes(packet.media_bytes.clone());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Decode available packets from format/decoder.
-    fn decode_available_packets(
-        format: &mut Option<Box<dyn symphonia::core::formats::FormatReader + Send + Sync>>,
-        decoder: &mut Option<Box<dyn symphonia::core::codecs::audio::AudioDecoder + Send + Sync>>,
-        tmp: &mut Vec<f32>,
+    pub fn decode_available_packets(
+        &mut self,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
         output_spec: AudioSpec,
         pcm_prod: &mut AsyncHeapProd<f32>,
-        is_first_decode_after_reopen: &mut bool,
     ) {
         loop {
             // If format/decoder not ready, break to fetch next Packet.
-            let (format, decoder) = match (format.as_mut(), decoder.as_mut()) {
+            let (format, decoder) = match (self.format.as_mut(), self.decoder.as_mut()) {
                 (Some(f), Some(d)) => (f, d),
                 _ => break,
             };
@@ -302,23 +329,23 @@ impl PipelineRunner {
                             }
 
                             // Resize temp buffer and convert to interleaved f32.
-                            tmp.resize(needed, 0.0);
-                            gab.copy_to_slice_interleaved::<f32, _>(&mut tmp[..needed]);
+                            self.tmp_buffer.resize(needed, 0.0);
+                            gab.copy_to_slice_interleaved::<f32, _>(&mut self.tmp_buffer[..needed]);
 
                             // TODO: resample if input != output_spec (pass-through for now).
 
                             // Apply processors chain (in-place).
                             if let Ok(procs) = processors.lock() {
                                 for p in procs.iter() {
-                                    let _ = p.process(&mut tmp[..needed], output_spec);
+                                    let _ = p.process(&mut self.tmp_buffer[..needed], output_spec);
                                 }
                             }
 
                             // Reset the flag after first use
-                            *is_first_decode_after_reopen = false;
+                            self.is_first_decode_after_reopen = false;
 
                             // Only push processed samples (may be less than needed if silence was inserted)
-                            let samples_to_push = &tmp[..needed];
+                            let samples_to_push = &self.tmp_buffer[..needed];
 
                             // Push into PCM ring with backpressure (await space).
                             // We are in blocking thread; create a small runtime for async operations.
@@ -360,7 +387,104 @@ impl PipelineRunner {
         }
     }
 
-    /// Blocking decoder loop that pulls Packets, (re)probes on init change and pushes PCM.
+    /// Check if pipeline is ready (has format and decoder)
+    pub fn is_ready(&self) -> bool {
+        self.format.is_some() && self.decoder.is_some()
+    }
+
+    /// Get the current container name
+    pub fn container_name(&self) -> Option<&String> {
+        self.container_name.as_ref()
+    }
+
+    /// Get the last init hash
+    pub fn last_init_hash(&self) -> Option<u64> {
+        self.last_init_hash
+    }
+
+    #[allow(dead_code)]
+    pub fn enable_seek(&mut self) {
+        self.seek_enabled = true;
+    }
+}
+
+impl Read for Pipeline {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        let mut guard = self.feeder.lock().unwrap();
+
+        loop {
+            guard.pop_front_if_empty();
+            if guard.queue.is_empty() {
+                if guard.eof {
+                    return Ok(0);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "no data available",
+                ));
+            } else {
+                break;
+            }
+        }
+
+        let front = guard.queue.front().unwrap();
+        let start = guard.pos_in_front;
+        let n = std::cmp::min(buf.len(), front.len() - start);
+        buf[..n].copy_from_slice(&front.slice(start..start + n));
+        guard.pos_in_front += n;
+        guard.buffered_len = guard.buffered_len.saturating_sub(n);
+        Ok(n)
+    }
+}
+
+impl Seek for Pipeline {
+    fn seek(&mut self, _pos: SeekFrom) -> IoResult<u64> {
+        unimplemented!()
+    }
+}
+
+impl MediaSource for Pipeline {
+    fn is_seekable(&self) -> bool {
+        self.seek_enabled
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Runner wiring async producer and blocking decoder.
+/// Orchestrates the pipeline and contains the main decoding loop.
+pub struct PipelineRunner {
+    // Async byte channel: producer -> decoder
+    pub byte_tx: Option<AsyncSender<Packet>>,
+    pub byte_rx: Option<AsyncReceiver<Packet>>,
+
+    // PCM ring: decoder -> consumer (async)
+    pub pcm_prod: Option<AsyncHeapProd<f32>>,
+    pub pcm_cons: Option<AsyncHeapCons<f32>>,
+
+    /// Optional event callback to bubble up player events without tying to a hub here.
+    pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
+}
+
+impl PipelineRunner {
+    pub fn new(byte_capacity: usize, pcm_capacity: usize) -> Self {
+        let (byte_tx, byte_rx) = kanal::bounded_async(byte_capacity);
+
+        let pcm_rb = AsyncHeapRb::<f32>::new(pcm_capacity);
+        let (pcm_prod, pcm_cons) = pcm_rb.split();
+
+        Self {
+            byte_tx: Some(byte_tx),
+            byte_rx: Some(byte_rx),
+            pcm_prod: Some(pcm_prod),
+            pcm_cons: Some(pcm_cons),
+            on_event: None,
+        }
+    }
+
+    /// Blocking decoder loop that pulls Packets, orchestrates the pipeline and pushes PCM.
     pub fn spawn_decoder_loop(
         &mut self,
         output_spec: AudioSpec,
@@ -372,27 +496,11 @@ impl PipelineRunner {
         let on_event = self.on_event.clone();
 
         tokio::task::spawn_blocking(move || {
-            let mut last_init_hash: Option<u64> = None;
-            let mut feeder = Arc::new(Mutex::new(Feeder::new()));
-            let mut _container_name: Option<String>;
-
-            let current_sample_rate = output_spec.sample_rate;
-            let current_channels = output_spec.channels;
-
-            // State for current format/decoder.
-            let mut maybe_format: Option<
-                Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
-            > = None;
-            let mut maybe_decoder: Option<
-                Box<dyn symphonia::core::codecs::audio::AudioDecoder + Send + Sync>,
-            > = None;
-            let dec_opts = AudioDecoderOptions::default();
-
-            // Temporary interleaved buffer for converted f32 samples.
-            let mut tmp: Vec<f32> = Vec::new();
-
             // Clone the async receiver to get a sync receiver for blocking thread
             let sync_byte_rx = byte_rx.clone_sync();
+
+            // Create pipeline instance
+            let mut pipeline = Pipeline::new();
 
             loop {
                 // Pull next packet using sync receiver (blocking).
@@ -408,85 +516,16 @@ impl PipelineRunner {
                     }
                 };
 
-                let new_hash = packet.init_hash;
-                let need_reopen = last_init_hash.map(|h| h != new_hash).unwrap_or(true);
-
-                let mut is_first_decode_after_reopen = false;
-
-                if need_reopen {
-                    debug!(
-                        "PipelineRunner: need_reopen=true, last_init_hash={:?}, new_hash={:?}",
-                        last_init_hash, new_hash
-                    );
-                    // New feeder and reader.
-                    feeder = Arc::new(Mutex::new(Feeder::new()));
-                    {
-                        let mut guard = feeder.lock().unwrap();
-                        guard.push_bytes(packet.init_bytes.clone());
-                        guard.push_bytes(packet.media_bytes.clone());
+                // Process the packet through pipeline
+                if let Err(e) = pipeline.process_packet(packet, &byte_rx, &on_event, output_spec) {
+                    if let Some(cb) = &on_event {
+                        cb(PlayerEvent::Error { message: e });
                     }
-                    // Prebuffer additional packets into feeder to reduce initial underflow/glitches.
-                    Self::prebuffer_packets(&byte_rx, &feeder);
-
-                    match Self::open_reader(feeder.clone()) {
-                        Ok((format, cn)) => {
-                            _container_name = Some(cn.clone());
-                            // Select default audio track and build decoder.
-                            match Self::create_audio_decoder(
-                                format,
-                                &cn,
-                                &packet,
-                                current_sample_rate,
-                                current_channels,
-                                &dec_opts,
-                                &on_event,
-                            ) {
-                                Ok((format, dec)) => {
-                                    maybe_decoder = Some(dec);
-                                    maybe_format = Some(format);
-                                    last_init_hash = Some(new_hash);
-
-                                    // This is the first decode after reopening
-                                    is_first_decode_after_reopen = true;
-                                    debug!(
-                                        "PipelineRunner: decoder reopened, is_first_decode_after_reopen={}",
-                                        is_first_decode_after_reopen
-                                    );
-                                }
-                                Err(e) => {
-                                    if let Some(cb) = &on_event {
-                                        cb(PlayerEvent::Error { message: e });
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(cb) = &on_event {
-                                cb(PlayerEvent::Error {
-                                    message: format!("probe failed: {e}"),
-                                });
-                            }
-                            return;
-                        }
-                    }
-                } else {
-                    // Same init: just append media bytes into feeder.
-                    if let Ok(mut guard) = feeder.lock() {
-                        guard.push_bytes(packet.media_bytes.clone());
-                    }
+                    return;
                 }
 
                 // Decode available packets until format needs more bytes or EOF.
-                Self::decode_available_packets(
-                    &mut maybe_format,
-                    &mut maybe_decoder,
-                    &mut tmp,
-                    processors.clone(),
-                    output_spec,
-                    &mut pcm_prod,
-                    &mut is_first_decode_after_reopen,
-                );
+                pipeline.decode_available_packets(processors.clone(), output_spec, &mut pcm_prod);
             }
 
             // End-of-stream
