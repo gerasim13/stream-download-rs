@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use kanal::AsyncSender;
 use std::io::Result as IoResult;
+
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
@@ -50,37 +51,15 @@ impl HttpPacketProducer {
         Self { url: url.into() }
     }
 
-    /// Async HTTP packet producer for the unified pipeline.
-    /// Emits self-contained Packet { init_hash, init_bytes, media_bytes } into `out`.
-    ///
-    /// For plain HTTP, we don't have a formal init segment. We synthesize:
-    /// - init_hash = 0,
-    /// - init_bytes = empty,
-    /// and stream the incoming bytes as media_bytes chunks.
-    ///
-    /// The chunk size is implementation-defined; we use a moderate size to balance latency and throughput.
-    async fn run_impl(
-        &mut self,
-        out: AsyncSender<Packet>,
+    /// Blocking reading loop that runs in a separate thread.
+    /// Reads from StreamDownload and sends packets through a synchronous channel.
+    fn run_blocking_reading_loop(
+        mut reader: StreamDownload<TempStorageProvider>,
+        sync_out: kanal::Sender<Packet>,
         cancel: Option<CancellationToken>,
     ) -> IoResult<()> {
-        use stream_download::http::HttpStream;
-        let parsed = reqwest::Url::parse(&self.url).map_err(|e| io_other(&e.to_string()))?;
-        let mut reader = match StreamDownload::new_http(
-            parsed,
-            TempStorageProvider::default(),
-            Settings::<HttpStream<reqwest::Client>>::default(),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.decode_error().await;
-                return Err(io_other(&msg));
-            }
-        };
+        let mut buf = vec![0u8; 256 * 1024];
 
-        // Read a moderate chunk size; adjust if needed.
         loop {
             // Check for cancellation
             if let Some(cancel_token) = &cancel {
@@ -89,22 +68,8 @@ impl HttpPacketProducer {
                 }
             }
 
-            let (res, tmp, r_back) = tokio::task::spawn_blocking({
-                let mut buf_guard = vec![0u8; 256 * 1024];
-                let mut reader_inner = reader;
-                move || {
-                    // Note: StreamDownload Reader implements blocking Read; bridge via spawn_blocking.
-                    // We use a separate buffer to avoid aliasing issues.
-                    use std::io::Read;
-                    let res = reader_inner.read(&mut buf_guard[..]);
-                    (res, buf_guard, reader_inner)
-                }
-            })
-            .await
-            .map_err(|join_err| io_other(&format!("join error: {join_err}")))?;
-            reader = r_back;
-
-            let n = match res {
+            use std::io::Read;
+            let n = match reader.read(&mut buf[..]) {
                 Ok(n) => n,
                 Err(e) => return Err(e),
             };
@@ -116,11 +81,12 @@ impl HttpPacketProducer {
             let pkt = Packet {
                 init_hash: 0,
                 init_bytes: Bytes::new(),
-                media_bytes: Bytes::copy_from_slice(&tmp[..n]),
+                media_bytes: Bytes::copy_from_slice(&buf[..n]),
                 variant_index: None,
             };
 
-            if out.send(pkt).await.is_err() {
+            // Use synchronous send in blocking thread
+            if sync_out.send(pkt).is_err() {
                 // Consumer dropped.
                 break;
             }
@@ -132,12 +98,43 @@ impl HttpPacketProducer {
 
 #[async_trait]
 impl crate::backends::PacketProducer for HttpPacketProducer {
+    /// Async HTTP packet producer for the unified pipeline.
+    /// Emits self-contained Packet { init_hash, init_bytes, media_bytes } into `out`.
+    ///
+    /// For plain HTTP, we don't have a formal init segment. We synthesize:
+    /// - init_hash = 0,
+    /// - init_bytes = empty,
+    /// and stream the incoming bytes as media_bytes chunks.
+    ///
+    /// The chunk size is implementation-defined; we use a moderate size to balance latency and throughput.
     async fn run(
         &mut self,
         out: AsyncSender<Packet>,
         cancel: Option<CancellationToken>,
     ) -> IoResult<()> {
-        self.run_impl(out, cancel).await
+        let parsed = reqwest::Url::parse(&self.url).map_err(|e| io_other(&e.to_string()))?;
+        let reader = match StreamDownload::new_http(
+            parsed,
+            TempStorageProvider::default(),
+            Settings::<stream_download::http::HttpStream<reqwest::Client>>::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.decode_error().await;
+                return Err(io_other(&msg));
+            }
+        };
+
+        // Run the entire reading loop in a spawn_blocking task
+        // This avoids blocking the async executor while reading from StreamDownload
+        let sync_out = out.clone_sync();
+        tokio::task::spawn_blocking(move || {
+            Self::run_blocking_reading_loop(reader, sync_out, cancel)
+        })
+        .await
+        .map_err(|join_err| io_other(&format!("join error: {join_err}")))?
     }
 }
 
