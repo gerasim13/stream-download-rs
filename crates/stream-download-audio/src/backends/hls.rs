@@ -173,8 +173,6 @@ pub async fn run_hls_packet_producer(
                             init_bytes,
                             media_bytes: seg.data,
                             variant_index: Some(variant_idx),
-                            segment_duration: seg.duration,
-                            segment_sequence: seg.sequence,
                         };
                         debug!(
                             "HLS(packet): sending packet variant={}, init_hash={}, seq={}, duration={:?}, size={}",
@@ -216,8 +214,6 @@ pub async fn run_hls_packet_producer(
                             init_bytes: Bytes::new(),
                             media_bytes: seg.data,
                             variant_index: Some(variant_idx),
-                            segment_duration: seg.duration,
-                            segment_sequence: seg.sequence,
                         };
                         debug!(
                             "HLS(packet): sending packet (no init) variant={}, seq={}, duration={:?}, size={}",

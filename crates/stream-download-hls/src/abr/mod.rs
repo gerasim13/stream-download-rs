@@ -21,7 +21,7 @@ use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
 use crate::{HlsError, HlsResult, MediaStream, SegmentData};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
 mod bandwidth_estimator;
 mod ewma;
@@ -249,7 +249,7 @@ impl<S: MediaStream> AbrController<S> {
             }
         };
 
-        info!(
+        debug!(
             "ABR: current_bw={:.0}bps, est={:.0}bps, adj={:.0}bps, buffer={:.2}s, candidate_bw={:.0}bps, candidate_id={:?}",
             current_bw,
             estimated_bandwidth,
@@ -280,7 +280,7 @@ impl<S: MediaStream> AbrController<S> {
                 let up_allowed = buffer_ok && headroom_ok && can_switch_time;
 
                 if up_allowed && Some(new_id) != self.current_variant_id {
-                    info!(
+                    debug!(
                         "ABR: switching UP {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2})",
                         self.current_variant_id,
                         new_id,
@@ -312,7 +312,7 @@ impl<S: MediaStream> AbrController<S> {
                     && (can_switch_time || urgent_down)
                     && Some(new_id) != self.current_variant_id
                 {
-                    info!(
+                    debug!(
                         "ABR: switching DOWN {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2}, urgent={})",
                         self.current_variant_id,
                         new_id,
