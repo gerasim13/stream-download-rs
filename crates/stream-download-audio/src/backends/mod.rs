@@ -18,9 +18,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::pipeline::Packet;
 
-pub mod hls;
-pub mod http;
-
 /// Trait for packet producers that generate audio data packets.
 ///
 /// Packet producers are responsible for fetching audio data from a source
@@ -42,88 +39,9 @@ pub trait PacketProducer: Send + Sync {
     ) -> std::io::Result<()>;
 }
 
-/// HTTP packet producer implementation.
-pub struct HttpPacketProducer {
-    url: String,
-}
+pub mod hls;
+pub mod http;
 
-impl HttpPacketProducer {
-    /// Create a new HTTP packet producer.
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
-    }
-}
-
-#[async_trait]
-impl PacketProducer for HttpPacketProducer {
-    async fn run(
-        &mut self,
-        out: AsyncSender<Packet>,
-        cancel: Option<CancellationToken>,
-    ) -> std::io::Result<()> {
-        use crate::backends::http::run_http_packet_producer;
-
-        // Check for cancellation before starting
-        if let Some(cancel_token) = &cancel {
-            if cancel_token.is_cancelled() {
-                return Ok(());
-            }
-        }
-
-        // Run the HTTP packet producer
-        run_http_packet_producer(&self.url, out).await
-    }
-}
-
-/// HLS packet producer implementation.
-pub struct HlsPacketProducer {
-    url: String,
-    hls_config: stream_download_hls::HlsConfig,
-    abr_config: stream_download_hls::AbrConfig,
-    selection_mode: stream_download_hls::SelectionMode,
-}
-
-impl HlsPacketProducer {
-    /// Create a new HLS packet producer.
-    pub fn new(
-        url: impl Into<String>,
-        hls_config: stream_download_hls::HlsConfig,
-        abr_config: stream_download_hls::AbrConfig,
-        selection_mode: stream_download_hls::SelectionMode,
-    ) -> Self {
-        Self {
-            url: url.into(),
-            hls_config,
-            abr_config,
-            selection_mode,
-        }
-    }
-}
-
-#[async_trait]
-impl PacketProducer for HlsPacketProducer {
-    async fn run(
-        &mut self,
-        out: AsyncSender<Packet>,
-        cancel: Option<CancellationToken>,
-    ) -> std::io::Result<()> {
-        use crate::backends::hls::run_hls_packet_producer;
-
-        // Create cancellation token if not provided
-        let cancel_token = cancel.unwrap_or_else(CancellationToken::new);
-
-        // Run the HLS packet producer (it doesn't return a Result)
-        run_hls_packet_producer(
-            self.url.clone(),
-            self.hls_config.clone(),
-            self.abr_config.clone(),
-            self.selection_mode,
-            out,
-            cancel_token,
-        )
-        .await;
-
-        // Always return Ok since run_hls_packet_producer doesn't return a Result
-        Ok(())
-    }
-}
+// Re-export the concrete implementations for convenience
+pub use self::hls::HlsPacketProducer;
+pub use self::http::HttpPacketProducer;

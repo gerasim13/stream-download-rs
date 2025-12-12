@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
-use crate::backends::PacketProducer;
+use crate::backends::{HlsPacketProducer, HttpPacketProducer, PacketProducer};
 use crate::pipeline::PipelineRunner;
 
 /// Simple broadcast hub for `PlayerEvent` using `kanal`.
@@ -103,8 +103,6 @@ impl AudioStream {
         hls_config: stream_download_hls::HlsConfig,
         abr_config: stream_download_hls::AbrConfig,
     ) -> Self {
-        use crate::backends::HlsPacketProducer;
-
         let producer = HlsPacketProducer::new(url, hls_config, abr_config, opts.selection_mode);
 
         Self::from_packet_producer(producer, opts, None).await
@@ -114,8 +112,6 @@ impl AudioStream {
     ///
     /// This path opens the HTTP MediaSourceStream, then starts a unified decode worker.
     pub async fn from_http(url: impl Into<String>, opts: AudioOptions) -> Self {
-        use crate::backends::HttpPacketProducer;
-
         let producer = HttpPacketProducer::new(url);
         Self::from_packet_producer(producer, opts, None).await
     }
