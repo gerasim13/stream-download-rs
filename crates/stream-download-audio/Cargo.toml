@@ -28,6 +28,9 @@ stream-download-hls = { version = "0.0.1", path = "../stream-download-hls", feat
 # Concurrency primitives
 kanal = "0.1"
 
+# Async trait support
+async-trait = "0.1"
+
 # Lock-free ring buffer for PCM frames (SPSC)
 async-ringbuf = "0.3.4"
 ringbuf = "0.4.8"

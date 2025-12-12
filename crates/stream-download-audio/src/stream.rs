@@ -1,14 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use kanal as kchan;
-use ringbuf::{HeapCons, traits::*};
+
+use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
-use crate::backends::hls::run_hls_packet_producer;
-use crate::backends::http::run_http_packet_producer;
+use crate::backends::PacketProducer;
 use crate::pipeline::PipelineRunner;
-use stream_download_hls::{AbrConfig, HlsConfig};
 
 /// Simple broadcast hub for `PlayerEvent` using `kanal`.
 #[derive(Debug)]
@@ -44,103 +43,81 @@ impl EventHub {
 /// surface are implemented.
 pub struct AudioStream {
     spec: Arc<Mutex<AudioSpec>>,
-    pcm_cons: HeapCons<f32>,
+    runner: PipelineRunner,
     events: Arc<EventHub>,
 }
 
 impl AudioStream {
-    /// Create an AudioStream from an HLS master playlist URL.
+    /// Create an AudioStream from a generic packet producer.
     ///
-    /// This path opens the HLS MediaSourceStream, then starts a unified decode worker.
-    pub async fn from_hls(
-        url: impl Into<String>,
+    /// This is a unified constructor that works with any backend implementing
+    /// the `PacketProducer` trait.
+    pub async fn from_packet_producer(
+        mut producer: impl PacketProducer + 'static,
         opts: AudioOptions,
-        hls_config: HlsConfig,
-        abr_config: AbrConfig,
+        cancel: Option<CancellationToken>,
     ) -> Self {
-        let url = url.into();
         let spec = Arc::new(Mutex::new(AudioSpec {
             sample_rate: opts.target_sample_rate,
             channels: opts.target_channels,
         }));
         let events = Arc::new(EventHub::new());
+
         let byte_capacity = 8usize;
         let pcm_capacity = opts
             .ring_capacity_frames
             .saturating_mul(opts.target_channels as usize)
             .max(1);
+
         let mut runner = PipelineRunner::new(byte_capacity, pcm_capacity);
 
         // Wire events from pipeline to this AudioStream's EventHub.
         let events_clone = events.clone();
         runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
-        // Launch HLS packet producer (async) using the producer half from runner.
+        // Launch packet producer (async) using the producer half from runner.
         let byte_tx = runner.byte_tx.take().expect("byte producer already taken");
-        let cancel = tokio_util::sync::CancellationToken::new();
-        tokio::spawn(run_hls_packet_producer(
-            url.clone(),
-            hls_config.clone(),
-            abr_config.clone(),
-            opts.selection_mode,
-            byte_tx,
-            cancel.clone(),
-        ));
-
-        // Launch decoder loop (spawn_blocking internally)
-        let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
-        let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), processors);
-
-        // Expose runner's PCM ring to AudioStream
-        let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
-
-        Self {
-            spec,
-            pcm_cons,
-            events,
-        }
-    }
-
-    /// Create an AudioStream from a regular HTTP URL (e.g., MP3/AAC/FLAC).
-    ///
-    /// This path opens the HTTP MediaSourceStream, then starts a unified decode worker.
-    pub async fn from_http(url: impl Into<String>, opts: AudioOptions) -> Self {
-        let url = url.into();
-        let spec = Arc::new(Mutex::new(AudioSpec {
-            sample_rate: opts.target_sample_rate,
-            channels: opts.target_channels,
-        }));
-        let events = Arc::new(EventHub::new());
-        let byte_capacity = 8usize;
-        let pcm_capacity = opts
-            .ring_capacity_frames
-            .saturating_mul(opts.target_channels as usize)
-            .max(1);
-        let mut runner = PipelineRunner::new(byte_capacity, pcm_capacity);
-
-        // Wire events from pipeline to this AudioStream's EventHub.
-        let events_clone = events.clone();
-        runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
-
-        // Launch HTTP packet producer (async) using the producer half from runner.
-        let byte_tx = runner.byte_tx.take().expect("byte producer already taken");
-        let url_for_task = url.clone();
         tokio::spawn(async move {
-            let _ = run_http_packet_producer(url_for_task.as_str(), byte_tx).await;
+            if let Err(e) = producer.run(byte_tx, cancel).await {
+                trace!("Packet producer error: {:?}", e);
+            }
         });
 
         // Launch decoder loop (spawn_blocking internally)
         let processors = Arc::new(Mutex::new(Vec::<Arc<dyn AudioProcessor>>::new()));
         let _decoder = runner.spawn_decoder_loop(*spec.lock().unwrap(), processors);
 
-        // Expose runner's PCM ring to AudioStream
-        let pcm_cons = runner.pcm_cons.take().expect("pcm consumer already taken");
-
         Self {
             spec,
-            pcm_cons,
+            runner,
             events,
         }
+    }
+
+    /// Create an AudioStream from an HLS master playlist URL.
+    ///
+    /// This path opens the HLS MediaSourceStream, then starts a unified decode worker.
+    pub async fn from_hls(
+        url: impl Into<String>,
+        opts: AudioOptions,
+        hls_config: stream_download_hls::HlsConfig,
+        abr_config: stream_download_hls::AbrConfig,
+    ) -> Self {
+        use crate::backends::HlsPacketProducer;
+
+        let producer = HlsPacketProducer::new(url, hls_config, abr_config, opts.selection_mode);
+
+        Self::from_packet_producer(producer, opts, None).await
+    }
+
+    /// Create an AudioStream from a regular HTTP URL (e.g., MP3/AAC/FLAC).
+    ///
+    /// This path opens the HTTP MediaSourceStream, then starts a unified decode worker.
+    pub async fn from_http(url: impl Into<String>, opts: AudioOptions) -> Self {
+        use crate::backends::HttpPacketProducer;
+
+        let producer = HttpPacketProducer::new(url);
+        Self::from_packet_producer(producer, opts, None).await
     }
 
     /// Subscribe to player events.
@@ -153,24 +130,9 @@ impl AudioStream {
         *self.spec.lock().unwrap()
     }
 
-    /// Push helper for tests or manual feeding (not part of final API necessarily).
-    pub async fn push_samples_for_test(&mut self, _samples: &[f32]) -> usize {
-        0
-    }
-
     /// Internal: pop up to `out.len()` samples into `out`, returning the count.
     pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
-        let mut n = 0usize;
-        while n < out.len() {
-            match self.pcm_cons.try_pop() {
-                Some(s) => {
-                    out[n] = s;
-                    n += 1;
-                }
-                None => break,
-            }
-        }
-        n
+        self.runner.pop_chunk(out)
     }
 }
 

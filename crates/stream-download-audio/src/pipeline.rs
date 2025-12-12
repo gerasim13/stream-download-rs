@@ -7,7 +7,7 @@ use bytes::Bytes;
 use kanal::{AsyncReceiver, AsyncSender, ReceiveError};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
-    traits::{Producer, Split},
+    traits::{Consumer, Producer, Split},
 };
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -427,6 +427,27 @@ impl PipelineRunner {
             pcm_cons: Some(pcm_cons),
             on_event: None,
         }
+    }
+
+    /// Pop up to `out.len()` samples from the PCM ring buffer.
+    /// Returns the number of samples actually popped.
+    pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
+        let mut n = 0usize;
+        while n < out.len() {
+            match self
+                .pcm_cons
+                .as_mut()
+                .expect("pcm_consumer already taken")
+                .try_pop()
+            {
+                Some(s) => {
+                    out[n] = s;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
     }
 
     /// Blocking decoder loop that pulls Packets, orchestrates the pipeline and pushes PCM.
