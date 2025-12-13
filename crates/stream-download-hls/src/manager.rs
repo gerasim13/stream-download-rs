@@ -23,11 +23,12 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
+use tracing::instrument;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{
-    EncryptionMethod, HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment,
-    SegmentKey, VariantId, VariantStream,
+    EncryptionMethod, HlsConfig, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist,
+    MediaSegment, SegmentKey, VariantId, VariantStream,
 };
 use crate::parser::{parse_master_playlist, parse_media_playlist};
 use crate::traits::{MediaStream, SegmentData};
@@ -70,6 +71,17 @@ pub struct HlsManager {
     init_segment_sent: bool,
     /// Cache of fetched AES-128 keys by absolute URI.
     key_cache: HashMap<String, Bytes>,
+    /// Cache of downloaded init segments by absolute URI.
+    init_segment_cache: HashMap<String, Bytes>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct PlaylistSnapshot {
+    end_list: bool,
+    last_seq: u64,
+    target_duration: Option<std::time::Duration>,
+    current_segment: Option<MediaSegment>,
 }
 
 impl HlsManager {
@@ -94,6 +106,7 @@ impl HlsManager {
             next_segment_index: 0,
             init_segment_sent: false,
             key_cache: HashMap::new(),
+            init_segment_cache: HashMap::new(),
         }
     }
 
@@ -156,6 +169,122 @@ impl HlsManager {
 
     fn current_codec_info(&self) -> HlsResult<Option<crate::model::CodecInfo>> {
         Ok(self.current_variant()?.codec.clone())
+    }
+
+    #[allow(dead_code)]
+    fn current_variant_info(&self) -> HlsResult<(VariantId, Option<crate::model::CodecInfo>)> {
+        let variant = self.current_variant()?;
+        Ok((variant.id, variant.codec.clone()))
+    }
+
+    #[allow(dead_code)]
+    fn playlist_snapshot(&self) -> HlsResult<PlaylistSnapshot> {
+        let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
+            HlsError::Message("no media playlist loaded; call select_variant first".to_string())
+        })?;
+
+        let last_seq = pl
+            .segments
+            .last()
+            .map(|s| s.sequence)
+            .unwrap_or_else(|| pl.media_sequence.saturating_sub(1));
+
+        let current_segment = pl.segments.get(self.next_segment_index).cloned();
+
+        Ok(PlaylistSnapshot {
+            end_list: pl.end_list,
+            last_seq,
+            target_duration: pl.target_duration,
+            current_segment,
+        })
+    }
+
+    async fn live_refresh_cycle(
+        &mut self,
+        last_seq: u64,
+        target_duration: Option<std::time::Duration>,
+    ) -> HlsResult<(Option<usize>, usize, bool, std::time::Duration)> {
+        self.refresh_media_playlist().await?;
+
+        let (found_new_idx, new_total, new_end_list) = {
+            let new_pl = self
+                .current_media_playlist
+                .as_ref()
+                .expect("playlist just refreshed");
+
+            let found_new_idx = new_pl.segments.iter().position(|s| s.sequence > last_seq);
+
+            (found_new_idx, new_pl.segments.len(), new_pl.end_list)
+        };
+
+        let interval = self
+            .config
+            .live_refresh_interval
+            .or(target_duration.map(|d| d / 2))
+            .unwrap_or(std::time::Duration::from_secs(2))
+            .max(std::time::Duration::from_millis(500));
+
+        Ok((found_new_idx, new_total, new_end_list, interval))
+    }
+
+    /// Return the currently cached master playlist, if any.
+    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<crate::traits::SegmentType>> {
+        let init_opt = self
+            .current_media_playlist
+            .as_ref()
+            .and_then(|p| p.init_segment.as_ref())
+            .cloned();
+
+        if let Some(init_segment) = init_opt {
+            let (variant_id, codec_info) = self.current_variant_info()?;
+            let resolved_uri = self.resolve_url(&init_segment.uri)?;
+
+            let data = if let Some(cached) = self.init_segment_cache.get(&resolved_uri) {
+                cached.clone()
+            } else {
+                let downloaded = bytes::Bytes::from(
+                    self.download_segment(&init_segment.uri, init_segment.key.as_ref(), None)
+                        .await?,
+                );
+                self.init_segment_cache
+                    .insert(resolved_uri.clone(), downloaded.clone());
+                downloaded
+            };
+
+            return Ok(Some(crate::traits::SegmentType::Init(SegmentData {
+                data,
+                variant_id,
+                codec_info,
+                key: init_segment.key,
+                sequence: 0,
+                duration: std::time::Duration::from_secs(0),
+            })));
+        }
+
+        Ok(None)
+    }
+
+    async fn emit_media_segment(
+        &mut self,
+        seg: MediaSegment,
+    ) -> HlsResult<crate::traits::SegmentType> {
+        let codec_info = self.current_codec_info()?;
+
+        let data = Bytes::from(
+            self.download_segment(&seg.uri, seg.key.as_ref(), Some(seg.sequence))
+                .await?,
+        );
+
+        self.next_segment_index += 1;
+
+        Ok(crate::traits::SegmentType::Media(SegmentData {
+            data,
+            variant_id: seg.variant_id,
+            codec_info,
+            key: seg.key,
+            sequence: seg.sequence,
+            duration: seg.duration,
+        }))
     }
 
     /// Return the currently cached master playlist, if any.
@@ -303,79 +432,89 @@ impl HlsManager {
     /// Download data by URI with optional encryption key.
     /// Handles AES-128 decryption if needed.
     /// sequence is used for IV generation for media segments (None for init segments).
+    fn finalize_key_url(&self, abs_key_url: &str) -> HlsResult<String> {
+        if let Some(params) = &self.config.key_query_params {
+            let mut url = url::Url::parse(abs_key_url).map_err(|e| HlsError::Io(e.to_string()))?;
+            {
+                let mut qp = url.query_pairs_mut();
+                for (k, v) in params {
+                    qp.append_pair(k, v);
+                }
+            }
+            Ok(url.to_string())
+        } else {
+            Ok(abs_key_url.to_string())
+        }
+    }
+
+    async fn fetch_key_bytes(&mut self, final_key_url: &str) -> HlsResult<Bytes> {
+        if let Some(cached) = self.key_cache.get(final_key_url) {
+            return Ok(cached.clone());
+        }
+
+        let mut kb = self.downloader.download_bytes(final_key_url, None).await?;
+        if let Some(cb) = &self.config.key_processor_cb {
+            kb = (cb)(kb);
+        }
+
+        if kb.len() != 16 {
+            return Err(HlsError::Message(format!(
+                "invalid AES-128 key length: expected 16, got {}",
+                kb.len()
+            )));
+        }
+
+        self.key_cache.insert(final_key_url.to_string(), kb.clone());
+
+        Ok(kb)
+    }
+
+    fn compute_iv(key_info: &KeyInfo, sequence: Option<u64>) -> [u8; 16] {
+        if let Some(iv) = key_info.iv {
+            iv
+        } else if let Some(seq) = sequence {
+            let mut iv = [0u8; 16];
+            iv[8..].copy_from_slice(&seq.to_be_bytes());
+            iv
+        } else {
+            [0u8; 16]
+        }
+    }
+
+    async fn decrypt_segment_if_needed(
+        &mut self,
+        data: Bytes,
+        key: Option<&SegmentKey>,
+        sequence: Option<u64>,
+    ) -> HlsResult<Bytes> {
+        if let Some(seg_key) = key {
+            if matches!(seg_key.method, EncryptionMethod::Aes128) {
+                if let Some(ref key_info) = seg_key.key_info {
+                    if let Some(key_uri) = &key_info.uri {
+                        let abs_key_url = self.resolve_url(key_uri)?;
+                        let final_key_url = self.finalize_key_url(&abs_key_url)?;
+                        let key_bytes = self.fetch_key_bytes(&final_key_url).await?;
+                        let iv = Self::compute_iv(key_info, sequence);
+                        let decrypted =
+                            crate::crypto::decrypt_aes128_cbc_full(key_bytes.as_ref(), &iv, data)?;
+                        return Ok(decrypted);
+                    }
+                }
+            }
+        }
+
+        Ok(data)
+    }
+
     async fn download_segment(
         &mut self,
         uri: &str,
         key: Option<&SegmentKey>,
         sequence: Option<u64>,
     ) -> HlsResult<Vec<u8>> {
-        // Resolve URL relative to media playlist
         let resolved_url = self.resolve_url(uri)?;
-        // Download bytes
-        let mut data = self.downloader.download_bytes(&resolved_url, None).await?;
-
-        // If encrypted with AES-128 and key URI is present, fetch key and (optionally) decrypt.
-        if let Some(seg_key) = key {
-            if matches!(seg_key.method, EncryptionMethod::Aes128) {
-                if let Some(ref key_info) = seg_key.key_info {
-                    if let Some(key_uri) = &key_info.uri {
-                        // Resolve key URL relative to media playlist URL
-                        let abs_key_url = self.resolve_url(key_uri)?;
-
-                        // Apply query params if configured
-                        let final_key_url = if let Some(params) = &self.config.key_query_params {
-                            let mut url = url::Url::parse(&abs_key_url)
-                                .map_err(|e| HlsError::Io(e.to_string()))?;
-                            {
-                                let mut qp = url.query_pairs_mut();
-                                for (k, v) in params {
-                                    qp.append_pair(k, v);
-                                }
-                            }
-                            url.to_string()
-                        } else {
-                            abs_key_url
-                        };
-
-                        // Fetch key (with cache)
-                        let key_bytes = if let Some(cached) = self.key_cache.get(&final_key_url) {
-                            cached.clone()
-                        } else {
-                            let mut kb =
-                                self.downloader.download_bytes(&final_key_url, None).await?;
-                            // Process key via callback if provided
-                            if let Some(cb) = &self.config.key_processor_cb {
-                                kb = (cb)(kb);
-                            }
-                            if kb.len() != 16 {
-                                return Err(HlsError::Message(format!(
-                                    "invalid AES-128 key length: expected 16, got {}",
-                                    kb.len()
-                                )));
-                            }
-                            self.key_cache.insert(final_key_url.clone(), kb.clone());
-                            kb
-                        };
-
-                        // Compute IV: use explicit IV if provided; otherwise, generate from sequence
-                        // Init segments use zero IV, media segments use sequence-based IV
-                        let iv = if let Some(iv) = key_info.iv {
-                            iv
-                        } else if let Some(seq) = sequence {
-                            let mut iv = [0u8; 16];
-                            iv[8..].copy_from_slice(&seq.to_be_bytes());
-                            iv
-                        } else {
-                            [0u8; 16] // Zero IV for init segments
-                        };
-
-                        data =
-                            crate::crypto::decrypt_aes128_cbc_full(key_bytes.as_ref(), &iv, data)?;
-                    }
-                }
-            }
-        }
-
+        let data = self.downloader.download_bytes(&resolved_url, None).await?;
+        let data = self.decrypt_segment_if_needed(data, key, sequence).await?;
         Ok(data.to_vec())
     }
 }
@@ -397,82 +536,29 @@ impl MediaStream for HlsManager {
         self.select_variant(variant_id.0).await
     }
 
+    #[instrument(skip(self), fields(variant_index = ?self.current_variant_index, next_segment_index = self.next_segment_index))]
     async fn next_segment(&mut self) -> HlsResult<Option<crate::traits::SegmentType>> {
         loop {
             // --- Phase 0: ensure we have a playlist selected ---
-            let (end_list, last_seq, target_duration, seg_opt) = {
-                let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
-                    HlsError::Message(
-                        "no media playlist loaded; call select_variant first".to_string(),
-                    )
-                })?;
-
-                let last_seq = pl
-                    .segments
-                    .last()
-                    .map(|s| s.sequence)
-                    .unwrap_or_else(|| pl.media_sequence.saturating_sub(1));
-
-                (
-                    pl.end_list,
-                    last_seq,
-                    pl.target_duration,
-                    pl.segments.get(self.next_segment_index).cloned(),
-                )
-            };
+            let PlaylistSnapshot {
+                end_list,
+                last_seq,
+                target_duration,
+                current_segment: seg_opt,
+            } = self.playlist_snapshot()?;
 
             // --- Phase 1: init segment (at most once per variant selection) ---
-            if !self.init_segment_sent {
-                let init_opt = self
-                    .current_media_playlist
-                    .as_ref()
-                    .and_then(|p| p.init_segment.as_ref())
-                    .cloned();
-
-                if let Some(init_segment) = init_opt {
-                    let variant_id = self.current_variant_id()?;
-                    let codec_info = self.current_codec_info()?;
-
-                    let data = bytes::Bytes::from(
-                        self.download_segment(&init_segment.uri, init_segment.key.as_ref(), None)
-                            .await?,
-                    );
-
-                    self.init_segment_sent = true;
-
-                    return Ok(Some(crate::traits::SegmentType::Init(SegmentData {
-                        data,
-                        variant_id,
-                        codec_info,
-                        key: init_segment.key,
-                        sequence: 0,
-                        duration: std::time::Duration::from_secs(0),
-                    })));
-                }
-
-                // No init segment in playlist.
+            if !self.init_segment_sent
+                && let Some(init_seg) = self.try_emit_init_segment().await?
+            {
+                // Mark even if absent to avoid re-checking on subsequent calls
                 self.init_segment_sent = true;
+                return Ok(Some(init_seg));
             }
 
             // --- Phase 2: media segment available right now ---
             if let Some(seg) = seg_opt {
-                let codec_info = self.current_codec_info()?;
-
-                let data = Bytes::from(
-                    self.download_segment(&seg.uri, seg.key.as_ref(), Some(seg.sequence))
-                        .await?,
-                );
-
-                self.next_segment_index += 1;
-
-                return Ok(Some(crate::traits::SegmentType::Media(SegmentData {
-                    data,
-                    variant_id: seg.variant_id,
-                    codec_info,
-                    key: seg.key,
-                    sequence: seg.sequence,
-                    duration: seg.duration,
-                })));
+                return Ok(Some(self.emit_media_segment(seg).await?));
             }
 
             // --- Phase 3: no segment at current index ---
@@ -486,18 +572,8 @@ impl MediaStream for HlsManager {
             }
 
             // --- Phase 4: LIVE state machine (refresh -> find new segment -> sleep) ---
-            self.refresh_media_playlist().await?;
-
-            let (found_new_idx, new_total, new_end_list) = {
-                let new_pl = self
-                    .current_media_playlist
-                    .as_ref()
-                    .expect("playlist just refreshed");
-
-                let found_new_idx = new_pl.segments.iter().position(|s| s.sequence > last_seq);
-
-                (found_new_idx, new_pl.segments.len(), new_pl.end_list)
-            };
+            let (found_new_idx, new_total, new_end_list, interval) =
+                self.live_refresh_cycle(last_seq, target_duration).await?;
 
             if let Some(idx) = found_new_idx {
                 tracing::debug!(
@@ -517,13 +593,6 @@ impl MediaStream for HlsManager {
                     new_total
                 );
             }
-
-            let interval = self
-                .config
-                .live_refresh_interval
-                .or(target_duration.map(|d| d / 2))
-                .unwrap_or(std::time::Duration::from_secs(2))
-                .max(std::time::Duration::from_millis(500));
 
             tracing::debug!(
                 "HlsManager: LIVE no new segments yet. last_seq={} total_segments={} sleep={:?}",

@@ -17,7 +17,6 @@ use bytes::Bytes;
 use futures_util::{Future, Stream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use tokio::task::yield_now;
 use tracing::{instrument, trace};
 
 use crate::{

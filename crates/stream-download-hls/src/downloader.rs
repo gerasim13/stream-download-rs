@@ -78,10 +78,16 @@ impl ResourceDownloader {
 
         let buffer = tokio::task::spawn_blocking(move || {
             let mut r = reader;
-            let mut buf = Vec::new();
-            match r.read_to_end(&mut buf) {
-                Ok(_) => Ok(buf),
-                Err(e) => Err(HlsError::Io(e.to_string())),
+            let mut buf = Vec::with_capacity(128 * 1024);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break Ok(buf),
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) => break Err(HlsError::Io(e.to_string())),
+                }
             }
         })
         .await

@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
 use crate::traits::SegmentType;
-use crate::{HlsError, HlsResult, MediaStream, SegmentData};
+use crate::{HlsError, HlsResult, MediaStream};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -416,7 +416,7 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
 
         if let Ok(Some(segment_type)) = &result {
             match segment_type {
-                SegmentType::Init(segment_data) => {
+                SegmentType::Init(_) => {
                     // For init segments, we don't update bandwidth estimator or buffer
                     // because they don't contain media data
                 }

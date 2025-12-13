@@ -127,12 +127,22 @@ pub fn decrypt_aes128_cbc_full(
             iv.len()
         )));
     }
-    let mut key_arr = [0u8; 16];
-    let mut iv_arr = [0u8; 16];
-    key_arr.copy_from_slice(key);
-    iv_arr.copy_from_slice(iv);
+    #[cfg(feature = "aes-decrypt")]
+    {
+        let mut key_arr = [0u8; 16];
+        let mut iv_arr = [0u8; 16];
+        key_arr.copy_from_slice(key);
+        iv_arr.copy_from_slice(iv);
 
-    let mut dec = Aes128CbcDecryptor::new(key_arr, iv_arr);
-    dec.update(&ciphertext);
-    dec.finalize()
+        let mut dec = Aes128CbcDecryptor::new(key_arr, iv_arr);
+        dec.update(&ciphertext);
+        return dec.finalize();
+    }
+
+    #[cfg(not(feature = "aes-decrypt"))]
+    {
+        // Without AES support, return the original ciphertext without extra copies.
+        // Length checks above still validate the provided key/iv sizes.
+        return Ok(ciphertext);
+    }
 }
