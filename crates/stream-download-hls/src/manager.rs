@@ -372,7 +372,7 @@ impl HlsManager {
         self.current_variant_index = Some(index);
         self.media_playlist_url = Some(media_playlist_url);
         self.next_segment_index = next_segment_index;
-        self.init_segment_sent = false; // Reset init segment flag when switching variants
+        self.init_segment_sent = false;
 
         Ok(())
     }

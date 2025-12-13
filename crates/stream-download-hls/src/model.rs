@@ -215,6 +215,8 @@ pub struct HlsConfig {
     /// If not set, `target_duration` from the playlist should be used.
     pub live_refresh_interval: Option<Duration>,
 
+    pub retry_timeout: Duration,
+
     /// Optional callback to post-process a fetched AES key before use (e.g., unwrap DRM).
     ///
     /// Not Debug to keep HlsConfig debuggable without requiring function pointers to implement Debug.
@@ -223,6 +225,9 @@ pub struct HlsConfig {
     pub key_query_params: Option<HashMap<String, String>>,
     /// Optional headers added to key fetch requests.
     pub key_request_headers: Option<HashMap<String, String>>,
+    /// Number of segments to prefetch in the buffer (default: 2).
+    /// Larger values improve streaming smoothness but use more memory.
+    pub prefetch_buffer_size: usize,
 }
 impl Debug for HlsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,6 +235,7 @@ impl Debug for HlsConfig {
             .field("live_refresh_interval", &self.live_refresh_interval)
             .field("key_query_params", &self.key_query_params)
             .field("key_request_headers", &self.key_request_headers)
+            .field("prefetch_buffer_size", &self.prefetch_buffer_size)
             .finish()
     }
 }
@@ -238,9 +244,11 @@ impl Default for HlsConfig {
     fn default() -> Self {
         Self {
             live_refresh_interval: None,
+            retry_timeout: Duration::from_secs(5),
             key_processor_cb: None,
             key_query_params: None,
             key_request_headers: None,
+            prefetch_buffer_size: 2,
         }
     }
 }

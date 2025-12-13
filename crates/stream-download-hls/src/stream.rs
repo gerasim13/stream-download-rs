@@ -6,22 +6,32 @@
 //! The stream produces raw bytes from HLS media segments, including init segments
 //! when available. The stream concatenates init segment data with media segment data
 //! to ensure proper decoding.
+//!
+//! # Performance Considerations for Mobile Devices
+//!
+//! - Uses `Arc` for shared configuration to avoid deep cloning
+//! - Minimizes string allocations in hot paths
+//! - Uses bounded channels for backpressure control
+//! - Implements proper cancellation with `CancellationToken`
+//! - Avoids mutex in poll_next for better async performance
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{self, Poll};
 
 use bytes::Bytes;
-use futures_util::{Future, Stream};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::{self, Permit};
+use futures_util::Stream;
+use tokio::sync::mpsc::{self, error::SendError};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
 use crate::{
     AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
-    ResourceDownloader, SelectionMode,
+    ResourceDownloader, SegmentType, SelectionMode,
 };
 use stream_download::source::{DecodeError, SourceStream};
 use stream_download::storage::ContentLength;
@@ -30,11 +40,11 @@ use stream_download::storage::ContentLength;
 #[derive(Debug, Clone)]
 pub struct HlsStreamParams {
     /// The URL of the HLS master playlist.
-    pub url: String,
+    pub url: Arc<str>,
     /// Configuration for HLS playback.
-    pub hls_config: HlsConfig,
+    pub hls_config: Arc<HlsConfig>,
     /// Configuration for adaptive bitrate control.
-    pub abr_config: AbrConfig,
+    pub abr_config: Arc<AbrConfig>,
     /// Selection mode for variants (auto or manual).
     pub selection_mode: SelectionMode,
 }
@@ -42,15 +52,15 @@ pub struct HlsStreamParams {
 impl HlsStreamParams {
     /// Create new HLS stream parameters.
     pub fn new(
-        url: impl Into<String>,
-        hls_config: HlsConfig,
-        abr_config: AbrConfig,
+        url: impl Into<Arc<str>>,
+        hls_config: impl Into<Arc<HlsConfig>>,
+        abr_config: impl Into<Arc<AbrConfig>>,
         selection_mode: SelectionMode,
     ) -> Self {
         Self {
             url: url.into(),
-            hls_config,
-            abr_config,
+            hls_config: hls_config.into(),
+            abr_config: abr_config.into(),
             selection_mode,
         }
     }
@@ -60,19 +70,54 @@ impl HlsStreamParams {
 #[derive(Debug)]
 pub enum HlsStreamError {
     /// IO error occurred.
-    Io(String),
+    Io(Arc<io::Error>),
     /// HLS-specific error occurred.
-    Hls(String),
+    Hls(HlsErrorKind),
     /// Invalid parameters provided.
-    InvalidParams(String),
+    InvalidParams(&'static str),
+    /// Stream was cancelled.
+    Cancelled,
+}
+
+/// Specific HLS error kinds to avoid string allocations.
+#[derive(Debug)]
+pub enum HlsErrorKind {
+    /// Failed to load master playlist.
+    MasterPlaylistLoad(crate::model::HlsError),
+    /// No variants available in master playlist.
+    NoVariants,
+    /// Failed to initialize ABR controller.
+    ControllerInit(crate::model::HlsError),
+    /// Failed to send seek command.
+    SeekFailed,
+    /// Streaming loop not initialized.
+    StreamingLoopNotInitialized,
+    /// Backward seek not supported.
+    BackwardSeekNotSupported,
 }
 
 impl Display for HlsStreamError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            HlsStreamError::Io(msg) => write!(f, "IO error: {}", msg),
-            HlsStreamError::Hls(msg) => write!(f, "HLS error: {}", msg),
+            HlsStreamError::Io(err) => write!(f, "IO error: {}", err),
+            HlsStreamError::Hls(kind) => match kind {
+                HlsErrorKind::MasterPlaylistLoad(e) => {
+                    write!(f, "Failed to load master playlist: {}", e)
+                }
+                HlsErrorKind::NoVariants => write!(f, "No variants available in master playlist"),
+                HlsErrorKind::ControllerInit(e) => {
+                    write!(f, "Failed to initialize ABR controller: {}", e)
+                }
+                HlsErrorKind::SeekFailed => write!(f, "Failed to send seek command"),
+                HlsErrorKind::StreamingLoopNotInitialized => {
+                    write!(f, "Streaming loop not initialized")
+                }
+                HlsErrorKind::BackwardSeekNotSupported => {
+                    write!(f, "Backward seek not supported")
+                }
+            },
             HlsStreamError::InvalidParams(msg) => write!(f, "Invalid parameters: {}", msg),
+            HlsStreamError::Cancelled => write!(f, "Stream was cancelled"),
         }
     }
 }
@@ -85,18 +130,16 @@ impl DecodeError for HlsStreamError {
     }
 }
 
-/// Commands that can be sent to the streaming loop.
+impl From<io::Error> for HlsStreamError {
+    fn from(err: io::Error) -> Self {
+        HlsStreamError::Io(Arc::new(err))
+    }
+}
 
-/// Internal state of the HLS stream.
-struct HlsStreamState {
-    /// Whether the stream has finished (end of VOD stream reached).
-    finished: bool,
-    /// Channel receiver for stream data.
-    data_receiver: Option<mpsc::Receiver<Bytes>>,
-    /// Channel sender for seek commands to the streaming loop.
-    seek_sender: Option<mpsc::Sender<u64>>,
-    /// Task handle for background streaming.
-    streaming_task: Option<tokio::task::JoinHandle<()>>,
+impl From<SendError<u64>> for HlsStreamError {
+    fn from(_: SendError<u64>) -> Self {
+        HlsStreamError::Hls(HlsErrorKind::SeekFailed)
+    }
 }
 
 /// HLS implementation of the [`SourceStream`] trait.
@@ -111,16 +154,16 @@ struct HlsStreamState {
 /// The stream produces raw bytes from HLS media segments. Higher-level components
 /// are responsible for handling init segments and variant switching metadata.
 pub struct HlsStream {
-    /// Internal state protected by a mutex for async access.
-    state: Mutex<HlsStreamState>,
-    /// The URL of the master playlist.
-    url: String,
-    /// HLS configuration.
-    config: HlsConfig,
-    /// ABR configuration.
-    abr_config: AbrConfig,
-    /// Selection mode.
-    selection_mode: SelectionMode,
+    /// Channel receiver for stream data.
+    data_receiver: mpsc::Receiver<Bytes>,
+    /// Channel sender for seek commands to the streaming loop.
+    seek_sender: mpsc::Sender<u64>,
+    /// Cancellation token for graceful shutdown.
+    cancel_token: CancellationToken,
+    /// Task handle for background streaming.
+    streaming_task: tokio::task::JoinHandle<()>,
+    /// Whether the stream has finished (end of VOD stream reached).
+    finished: bool,
 }
 
 impl HlsStream {
@@ -132,60 +175,51 @@ impl HlsStream {
     /// * `abr_config` - ABR configuration
     /// * `selection_mode` - Selection mode for variants
     pub async fn new(
-        url: impl Into<String>,
-        config: HlsConfig,
-        abr_config: AbrConfig,
+        url: impl Into<Arc<str>>,
+        config: Arc<HlsConfig>,
+        abr_config: Arc<AbrConfig>,
         selection_mode: SelectionMode,
     ) -> Result<Self, HlsStreamError> {
         let url = url.into();
 
         // Create channels for data and commands
-        // Use bounded channel for data to control backpressure (2 segments buffer)
-        let (data_sender, data_receiver) = mpsc::channel(2);
+        // Use bounded channel for data to control backpressure with configurable buffer size
+        let buffer_size = config.prefetch_buffer_size;
+        let (data_sender, data_receiver) = mpsc::channel(buffer_size);
         let (seek_sender, seek_receiver) = mpsc::channel(1);
+        let cancel_token = CancellationToken::new();
 
-        let state = HlsStreamState {
-            finished: false,
-            data_receiver: Some(data_receiver),
-            seek_sender: Some(seek_sender),
-            streaming_task: None,
-        };
-
-        let stream = Self {
-            state: Mutex::new(state),
+        // Start background streaming task
+        let streaming_task = Self::start_streaming_task(
             url,
             config,
             abr_config,
             selection_mode,
-        };
+            data_sender,
+            seek_receiver,
+            cancel_token.clone(),
+        )
+        .await?;
 
-        // Start background streaming task
-        stream
-            .start_streaming_task(data_sender, seek_receiver)
-            .await?;
-
-        Ok(stream)
+        Ok(Self {
+            data_receiver,
+            seek_sender,
+            cancel_token,
+            streaming_task,
+            finished: false,
+        })
     }
 
     /// Start the background streaming task.
     async fn start_streaming_task(
-        &self,
+        url: Arc<str>,
+        config: Arc<HlsConfig>,
+        abr_config: Arc<AbrConfig>,
+        selection_mode: SelectionMode,
         data_sender: mpsc::Sender<Bytes>,
-        mut seek_receiver: mpsc::Receiver<u64>,
-    ) -> Result<(), HlsStreamError> {
-        let mut state = self.state.lock().await;
-
-        if state.streaming_task.is_some() {
-            // Task already running
-            return Ok(());
-        }
-
-        // Clone necessary data for the background task
-        let url = self.url.clone();
-        let config = self.config.clone();
-        let abr_config = self.abr_config.clone();
-        let selection_mode = self.selection_mode;
-
+        seek_receiver: mpsc::Receiver<u64>,
+        cancel_token: CancellationToken,
+    ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
         let task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
             if let Err(e) = Self::streaming_loop(
@@ -195,47 +229,53 @@ impl HlsStream {
                 selection_mode,
                 data_sender,
                 seek_receiver,
+                cancel_token,
             )
             .await
             {
-                tracing::error!("HLS streaming loop error: {}", e);
+                match e {
+                    HlsStreamError::Cancelled => {
+                        tracing::trace!("HLS streaming task cancelled")
+                    }
+                    _ => tracing::error!("HLS streaming loop error: {}", e),
+                }
             }
             tracing::trace!("HLS streaming task finished");
         });
 
-        state.streaming_task = Some(task);
-        Ok(())
+        Ok(task)
     }
 
     /// Main streaming loop that runs in a background task.
     async fn streaming_loop(
-        url: String,
-        config: HlsConfig,
-        abr_config: AbrConfig,
+        url: Arc<str>,
+        config: Arc<HlsConfig>,
+        abr_config: Arc<AbrConfig>,
         selection_mode: SelectionMode,
         data_sender: mpsc::Sender<Bytes>,
         mut seek_receiver: mpsc::Receiver<u64>,
+        cancel_token: CancellationToken,
     ) -> Result<(), HlsStreamError> {
         let downloader = ResourceDownloader::new(DownloaderConfig::default());
-        let mut manager = HlsManager::new(url.clone(), config.clone(), downloader);
+        let mut manager = HlsManager::new(
+            url.as_ref().to_string(),
+            config.as_ref().clone(),
+            downloader,
+        );
 
-        if let Err(e) = manager.load_master().await {
-            return Err(HlsStreamError::Hls(format!(
-                "Failed to load master playlist: {}",
-                e
-            )));
-        }
+        manager
+            .load_master()
+            .await
+            .map_err(|e| HlsStreamError::Hls(HlsErrorKind::MasterPlaylistLoad(e)))?;
 
-        let master = manager.master().ok_or_else(|| {
-            HlsStreamError::Hls("Master playlist not available after load_master()".to_string())
-        })?;
+        let master = manager
+            .master()
+            .ok_or_else(|| HlsStreamError::Hls(HlsErrorKind::StreamingLoopNotInitialized))?;
 
-        // Choose initial variant (simplified - always first variant for now)
+        // Choose initial variant
         let initial_variant_index = {
             if master.variants.is_empty() {
-                return Err(HlsStreamError::Hls(
-                    "No variants available in master playlist".to_string(),
-                ));
+                return Err(HlsStreamError::Hls(HlsErrorKind::NoVariants));
             }
             match selection_mode {
                 SelectionMode::Auto => manager.current_variant_index().unwrap_or(0),
@@ -249,167 +289,111 @@ impl HlsStream {
 
         let mut controller = AbrController::new(
             manager,
-            abr_config.clone(),
+            abr_config.as_ref().clone(),
             selection_mode,
             initial_variant_index,
             init_bw,
         );
 
-        if let Err(e) = controller.init().await {
-            return Err(HlsStreamError::Hls(format!(
-                "Failed to initialize ABR controller: {}",
-                e
-            )));
-        }
+        controller
+            .init()
+            .await
+            .map_err(|e| HlsStreamError::Hls(HlsErrorKind::ControllerInit(e)))?;
 
         // Track current byte position and bytes to skip
         let mut current_position: u64 = 0;
         let mut bytes_to_skip: u64 = 0;
 
-        // Helper function to send data with skip logic
-        async fn send_data_with_skip(
-            data: Bytes,
-            bytes_to_skip: &mut u64,
-            current_position: &mut u64,
-            data_sender: &mpsc::Sender<Bytes>,
-            is_init_segment: bool,
-            reserved_permit: Option<Permit<'_, Bytes>>,
-        ) -> Result<(), ()> {
-            let data_size = data.len() as u64;
-            let mut reserved_permit = reserved_permit;
-
-            // Handle skipping within data
-            if *bytes_to_skip > 0 {
-                if *bytes_to_skip >= data_size {
-                    // Skip entire data
-                    *bytes_to_skip -= data_size;
-                    *current_position += data_size;
-                    return Ok(());
-                } else {
-                    // Skip part of data
-                    // For init segment, we must send it completely if skip is inside it
-                    if is_init_segment {
-                        // Send full init segment (cannot send partially)
-                        let permit = match reserved_permit.take() {
-                            Some(p) => p,
-                            None => data_sender.reserve().await.map_err(|_| ())?,
-                        };
-                        permit.send(data);
-                        *current_position += data_size;
-                        *bytes_to_skip = 0;
-                        return Ok(());
-                    } else {
-                        // For media segments, skip part and send remaining
-                        let skip_bytes = *bytes_to_skip as usize;
-                        let remaining_data = if skip_bytes < data.len() {
-                            data.slice(skip_bytes..)
-                        } else {
-                            Bytes::new()
-                        };
-
-                        if !remaining_data.is_empty() {
-                            let permit = match reserved_permit.take() {
-                                Some(p) => p,
-                                None => data_sender.reserve().await.map_err(|_| ())?,
-                            };
-                            permit.send(remaining_data);
-                        }
-
-                        *current_position += data_size;
-                        *bytes_to_skip = 0;
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Send full data
-            let permit = match reserved_permit {
-                Some(p) => p,
-                None => data_sender.reserve().await.map_err(|_| ())?,
-            };
-            permit.send(data);
-            *current_position += data_size;
-            Ok(())
-        }
-
         // Main streaming loop
         loop {
-            // Wait for downstream capacity before fetching the next segment to avoid over-prefetching.
-            let mut reserved_permit = match data_sender.reserve().await {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    tracing::trace!("HLS stream: receiver dropped before reserve");
-                    break;
+            // Wait for downstream capacity before fetching the next segment
+            let reserved_permit = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    return Err(HlsStreamError::Cancelled);
+                }
+                permit = data_sender.reserve() => {
+                    match permit {
+                        Ok(p) => p,
+                        Err(_) => {
+                            tracing::trace!("HLS stream: receiver dropped before reserve");
+                            break;
+                        }
+                    }
                 }
             };
 
+            let next_chunk = timeout(config.retry_timeout, controller.next_segment());
             tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    return Err(HlsStreamError::Cancelled);
+                }
                 seek = seek_receiver.recv() => {
                     if let Some(position) = seek {
                         tracing::trace!("HLS streaming loop: received seek to position {}", position);
                         if position >= current_position {
                             bytes_to_skip = position - current_position;
                         } else {
-                            tracing::warn!(
-                                "HLS streaming loop: seeking backward not fully supported, resetting to beginning"
-                            );
-                            bytes_to_skip = position;
-                            current_position = 0;
+                            // Backward seek not supported - return error
+                            tracing::warn!("HLS streaming loop: backward seek not supported");
+                            return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
                         }
                         // Drop reserved permit for this iteration and continue to next loop
-                        drop(reserved_permit.take());
+                        drop(reserved_permit);
                         continue;
                     } else {
                         tracing::trace!("HLS stream: seek channel closed");
                     }
                 }
-                next_seg = controller.next_segment() => {
-                    match next_seg {
-                        Ok(Some(segment_type)) => {
-                            match segment_type {
-                                crate::traits::SegmentType::Init(segment_data) => {
-                                    if let Err(_) = send_data_with_skip(
-                                        segment_data.data,
-                                        &mut bytes_to_skip,
-                                        &mut current_position,
-                                        &data_sender,
-                                        true, // is_init_segment
-                                        reserved_permit.take(),
-                                    )
-                                    .await
-                                    {
-                                        tracing::trace!("HLS stream: receiver dropped during init segment");
-                                        break;
+                next_seg = next_chunk => {
+                    if let Ok(next_seg) = next_seg {
+                        match next_seg {
+                            Ok(Some(segment_type)) => {
+                                match segment_type {
+                                    SegmentType::Init(segment_data) => {
+                                        if let Err(_) = Self::send_data_with_skip(
+                                            segment_data.data,
+                                            &mut bytes_to_skip,
+                                            &mut current_position,
+                                            &data_sender,
+                                            true, // is_init_segment
+                                            Some(reserved_permit),
+                                        )
+                                        .await
+                                        {
+                                            tracing::trace!("HLS stream: receiver dropped during media segment");
+                                            break;
+                                        }
                                     }
-                                }
-                                crate::traits::SegmentType::Media(segment_data) => {
-                                    if let Err(_) = send_data_with_skip(
-                                        segment_data.data,
-                                        &mut bytes_to_skip,
-                                        &mut current_position,
-                                        &data_sender,
-                                        false, // is_init_segment
-                                        reserved_permit.take(),
-                                    )
-                                    .await
-                                    {
-                                        tracing::trace!("HLS stream: receiver dropped, stopping");
-                                        break;
+                                    SegmentType::Media(segment_data) => {
+                                        if let Err(_) = Self::send_data_with_skip(
+                                            segment_data.data,
+                                            &mut bytes_to_skip,
+                                            &mut current_position,
+                                            &data_sender,
+                                            false, // is_init_segment
+                                            Some(reserved_permit),
+                                        )
+                                        .await
+                                        {
+                                            tracing::trace!("HLS stream: receiver dropped, stopping");
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            tracing::trace!("HLS stream: end of stream, closing channel and exiting");
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to get next segment: {}", e);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            drop(reserved_permit.take());
-                            continue;
+                            Ok(None) => {
+                                tracing::trace!("HLS stream: end of stream, closing channel and exiting");
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to get next segment: {}", e);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                drop(reserved_permit);
+                                continue;
+                            }
                         }
                     }
+
                 }
             }
         }
@@ -417,22 +401,87 @@ impl HlsStream {
         Ok(())
     }
 
+    /// Helper function to send data with skip logic.
+    async fn send_data_with_skip(
+        data: Bytes,
+        bytes_to_skip: &mut u64,
+        current_position: &mut u64,
+        data_sender: &mpsc::Sender<Bytes>,
+        is_init_segment: bool,
+        reserved_permit: Option<mpsc::Permit<'_, Bytes>>,
+    ) -> Result<(), ()> {
+        let data_size = data.len() as u64;
+        let mut reserved_permit = reserved_permit;
+
+        // Handle skipping within data
+        if *bytes_to_skip > 0 {
+            if *bytes_to_skip >= data_size {
+                // Skip entire data
+                *bytes_to_skip -= data_size;
+                *current_position += data_size;
+                return Ok(());
+            } else {
+                // Skip part of data
+                // For init segment, we must send it completely if skip is inside it
+                if is_init_segment {
+                    // Send full init segment (cannot send partially)
+                    let permit = match reserved_permit.take() {
+                        Some(p) => p,
+                        None => data_sender.reserve().await.map_err(|_| ())?,
+                    };
+                    permit.send(data);
+                    *current_position += data_size;
+                    *bytes_to_skip = 0;
+                    return Ok(());
+                } else {
+                    // For media segments, skip part and send remaining
+                    let skip_bytes = *bytes_to_skip as usize;
+                    let remaining_data = if skip_bytes < data.len() {
+                        data.slice(skip_bytes..)
+                    } else {
+                        Bytes::new()
+                    };
+
+                    if !remaining_data.is_empty() {
+                        let permit = match reserved_permit.take() {
+                            Some(p) => p,
+                            None => data_sender.reserve().await.map_err(|_| ())?,
+                        };
+                        permit.send(remaining_data);
+                    }
+
+                    *current_position += data_size;
+                    *bytes_to_skip = 0;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Send full data
+        let permit = match reserved_permit {
+            Some(p) => p,
+            None => data_sender.reserve().await.map_err(|_| ())?,
+        };
+        permit.send(data);
+        *current_position += data_size;
+        Ok(())
+    }
+
     /// Seek to a specific position in the stream.
     async fn seek_internal(&self, position: u64) -> Result<(), HlsStreamError> {
-        let state = self.state.lock().await;
+        self.seek_sender.send(position).await?;
+        Ok(())
+    }
+}
 
-        // Send seek command to the streaming loop
-        if let Some(seek_sender) = &state.seek_sender {
-            if seek_sender.send(position).await.is_err() {
-                return Err(HlsStreamError::Hls(
-                    "Failed to send seek command to streaming loop".to_string(),
-                ));
-            }
-            Ok(())
-        } else {
-            Err(HlsStreamError::Hls(
-                "Streaming loop not initialized".to_string(),
-            ))
+impl Drop for HlsStream {
+    fn drop(&mut self) {
+        // Cancel the streaming task
+        self.cancel_token.cancel();
+
+        // Abort the task if it's still running
+        if !self.streaming_task.is_finished() {
+            self.streaming_task.abort();
         }
     }
 }
@@ -482,54 +531,25 @@ impl SourceStream for HlsStream {
 impl Stream for HlsStream {
     type Item = io::Result<Bytes>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(_) => {
-                // Lock is held by another task, try again later
-                return Poll::Pending;
-            }
-        };
-
-        if let Some(receiver) = &mut state.data_receiver {
-            match receiver.poll_recv(cx) {
-                Poll::Ready(Some(data)) => {
-                    tracing::debug!("HlsStream::poll_next: returning {} bytes", data.len());
-                    Poll::Ready(Some(Ok(data)))
-                }
-                Poll::Ready(None) => {
-                    tracing::debug!("HlsStream::poll_next: channel closed");
-                    // Channel closed
-                    state.data_receiver = None;
-                    state.finished = true;
-                    Poll::Ready(None)
-                }
-                Poll::Pending => {
-                    tracing::debug!("HlsStream::poll_next: no data available, pending");
-                    // No data available yet
-                    Poll::Pending
-                }
-            }
-        } else {
-            tracing::trace!("HlsStream::poll_next: no receiver, stream finished");
-            // No receiver, stream finished
-            Poll::Ready(None)
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
         }
-    }
-}
 
-/// Extension trait for creating HLS streams.
-pub trait HlsStreamExt {
-    /// Create a new HLS stream with the given parameters.
-    fn new_hls(
-        params: HlsStreamParams,
-    ) -> impl Future<Output = Result<HlsStream, HlsStreamError>> + Send;
-}
-
-impl HlsStreamExt for HlsStream {
-    fn new_hls(
-        params: HlsStreamParams,
-    ) -> impl Future<Output = Result<HlsStream, HlsStreamError>> + Send {
-        Self::create(params)
+        match self.data_receiver.poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                tracing::debug!("HlsStream::poll_next: returning {} bytes", data.len());
+                Poll::Ready(Some(Ok(data)))
+            }
+            Poll::Ready(None) => {
+                tracing::debug!("HlsStream::poll_next: channel closed");
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                tracing::debug!("HlsStream::poll_next: no data available, pending");
+                Poll::Pending
+            }
+        }
     }
 }
