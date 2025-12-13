@@ -34,8 +34,8 @@ aws-sdk-s3 = { workspace = true, optional = true }
 
 [features]
 mpv = ["dep:libmpv2"]
-hls = ["dep:stream-download-hls"]
 audio = ["dep:stream-download-audio"]
+hls = ["dep:stream-download-hls"]
 opendal = [
   "dep:stream-download-opendal",
   "dep:testcontainers-modules",
@@ -50,6 +50,10 @@ required-features = ["mpv"]
 [[example]]
 name = "s3"
 required-features = ["opendal"]
+
+[[example]]
+name = "stream_hls"
+required-features = ["hls"]
 
 [[example]]
 name = "audio_hls"

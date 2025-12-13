@@ -360,8 +360,8 @@ impl HlsManager {
             std::cmp::min(self.next_segment_index, media_playlist.segments.len());
 
         tracing::debug!(
-            "HlsManager: switching variant from {} to {} (index {} -> {}, segments: {})",
-            self.current_variant_index.unwrap_or(usize::MAX),
+            "HlsManager: switching variant from {:?} to {} (index {:?} -> {}, segments: {})",
+            self.current_variant_index,
             index,
             old_index,
             next_segment_index,
@@ -563,7 +563,7 @@ impl MediaStream for HlsManager {
 
             // --- Phase 3: no segment at current index ---
             if end_list {
-                tracing::debug!(
+                tracing::trace!(
                     "HlsManager: returning None (EOF). end_list=true last_seq={} next_segment_index={}",
                     last_seq,
                     self.next_segment_index
@@ -576,7 +576,7 @@ impl MediaStream for HlsManager {
                 self.live_refresh_cycle(last_seq, target_duration).await?;
 
             if let Some(idx) = found_new_idx {
-                tracing::debug!(
+                tracing::trace!(
                     "HlsManager: LIVE refresh produced new segment: last_seq={} first_new_idx={}",
                     last_seq,
                     idx
@@ -587,14 +587,14 @@ impl MediaStream for HlsManager {
 
             // If the stream ended between refreshes, the next loop iteration will return EOF.
             if new_end_list {
-                tracing::debug!(
+                tracing::trace!(
                     "HlsManager: LIVE refresh indicates end_list=true (no new segments). last_seq={} total_segments={}",
                     last_seq,
                     new_total
                 );
             }
 
-            tracing::debug!(
+            tracing::trace!(
                 "HlsManager: LIVE no new segments yet. last_seq={} total_segments={} sleep={:?}",
                 last_seq,
                 new_total,
