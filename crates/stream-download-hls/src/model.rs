@@ -41,6 +41,23 @@ pub enum HlsError {
     /// types from `stream-download` or `reqwest` if needed.
     #[error("I/O error: {0}")]
     Io(String),
+
+    /// Operation was cancelled.
+    #[error("operation cancelled")]
+    Cancelled,
+
+    /// HTTP request failed.
+    #[error("HTTP error: {status} for {url}")]
+    HttpError {
+        /// HTTP status code
+        status: u16,
+        /// URL that failed
+        url: String,
+    },
+
+    /// Request timed out.
+    #[error("request timeout for {0}")]
+    Timeout(String),
 }
 
 impl HlsError {

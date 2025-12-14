@@ -25,10 +25,10 @@ use std::task::{self, Poll};
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::sync::mpsc::{self, error::SendError};
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
+use crate::traits::NextSegmentResult;
 use crate::{
     AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
     ResourceDownloader, SegmentType, SelectionMode,
@@ -47,6 +47,9 @@ pub struct HlsStreamParams {
     pub abr_config: Arc<AbrConfig>,
     /// Selection mode for variants (auto or manual).
     pub selection_mode: SelectionMode,
+    /// Optional configuration for the resource downloader.
+    /// If not provided, uses optimized defaults.
+    pub downloader_config: Option<DownloaderConfig>,
 }
 
 impl HlsStreamParams {
@@ -62,6 +65,7 @@ impl HlsStreamParams {
             hls_config: hls_config.into(),
             abr_config: abr_config.into(),
             selection_mode,
+            downloader_config: None,
         }
     }
 }
@@ -180,6 +184,24 @@ impl HlsStream {
         abr_config: Arc<AbrConfig>,
         selection_mode: SelectionMode,
     ) -> Result<Self, HlsStreamError> {
+        Self::new_with_config(url, config, abr_config, selection_mode, None).await
+    }
+
+    /// Create a new HLS stream with custom downloader configuration.
+    ///
+    /// # Arguments
+    /// * `url` - URL of the HLS master playlist
+    /// * `config` - HLS configuration
+    /// * `abr_config` - ABR configuration
+    /// * `selection_mode` - Selection mode for variants
+    /// * `downloader_config` - Optional custom downloader configuration
+    pub async fn new_with_config(
+        url: impl Into<Arc<str>>,
+        config: Arc<HlsConfig>,
+        abr_config: Arc<AbrConfig>,
+        selection_mode: SelectionMode,
+        downloader_config: Option<DownloaderConfig>,
+    ) -> Result<Self, HlsStreamError> {
         let url = url.into();
 
         // Create channels for data and commands
@@ -195,6 +217,7 @@ impl HlsStream {
             config,
             abr_config,
             selection_mode,
+            downloader_config,
             data_sender,
             seek_receiver,
             cancel_token.clone(),
@@ -216,6 +239,7 @@ impl HlsStream {
         config: Arc<HlsConfig>,
         abr_config: Arc<AbrConfig>,
         selection_mode: SelectionMode,
+        downloader_config: Option<DownloaderConfig>,
         data_sender: mpsc::Sender<Bytes>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
@@ -227,6 +251,7 @@ impl HlsStream {
                 config,
                 abr_config,
                 selection_mode,
+                downloader_config,
                 data_sender,
                 seek_receiver,
                 cancel_token,
@@ -247,21 +272,27 @@ impl HlsStream {
     }
 
     /// Main streaming loop that runs in a background task.
+    ///
+    /// This loop uses non-blocking segment fetching with proper cancellation
+    /// support via `tokio::select!`. No `spawn_blocking` or hidden sleeps.
     async fn streaming_loop(
         url: Arc<str>,
         config: Arc<HlsConfig>,
         abr_config: Arc<AbrConfig>,
         selection_mode: SelectionMode,
+        downloader_config: Option<DownloaderConfig>,
         data_sender: mpsc::Sender<Bytes>,
         mut seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
     ) -> Result<(), HlsStreamError> {
-        let downloader = ResourceDownloader::new(DownloaderConfig::default());
-        let mut manager = HlsManager::new(
-            url.as_ref().to_string(),
-            config.as_ref().clone(),
-            downloader,
-        );
+        let downloader_config = downloader_config.unwrap_or_default();
+        let downloader = ResourceDownloader::new(downloader_config);
+
+        let mut manager = HlsManager::new(url, config, downloader);
+
+        // Exponential backoff for retry logic
+        let mut retry_delay = std::time::Duration::from_millis(100);
+        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
         manager
             .load_master()
@@ -308,6 +339,7 @@ impl HlsStream {
         loop {
             // Wait for downstream capacity before fetching the next segment
             let reserved_permit = tokio::select! {
+                biased;
                 _ = cancel_token.cancelled() => {
                     return Err(HlsStreamError::Cancelled);
                 }
@@ -322,8 +354,22 @@ impl HlsStream {
                 }
             };
 
-            let next_chunk = timeout(config.retry_timeout, controller.next_segment());
-            tokio::select! {
+            // Check for seek commands first (non-blocking)
+            if let Ok(position) = seek_receiver.try_recv() {
+                tracing::trace!("HLS streaming loop: received seek to position {}", position);
+                if position >= current_position {
+                    bytes_to_skip = position - current_position;
+                } else {
+                    tracing::warn!("HLS streaming loop: backward seek not supported");
+                    return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
+                }
+                drop(reserved_permit);
+                continue;
+            }
+
+            // Fetch next segment using non-blocking method
+            let next_result = tokio::select! {
+                biased;
                 _ = cancel_token.cancelled() => {
                     return Err(HlsStreamError::Cancelled);
                 }
@@ -333,67 +379,93 @@ impl HlsStream {
                         if position >= current_position {
                             bytes_to_skip = position - current_position;
                         } else {
-                            // Backward seek not supported - return error
                             tracing::warn!("HLS streaming loop: backward seek not supported");
                             return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
                         }
-                        // Drop reserved permit for this iteration and continue to next loop
                         drop(reserved_permit);
                         continue;
                     } else {
                         tracing::trace!("HLS stream: seek channel closed");
+                        break;
                     }
                 }
-                next_seg = next_chunk => {
-                    if let Ok(next_seg) = next_seg {
-                        match next_seg {
-                            Ok(Some(segment_type)) => {
-                                match segment_type {
-                                    SegmentType::Init(segment_data) => {
-                                        if let Err(_) = Self::send_data_with_skip(
-                                            segment_data.data,
-                                            &mut bytes_to_skip,
-                                            &mut current_position,
-                                            &data_sender,
-                                            true, // is_init_segment
-                                            Some(reserved_permit),
-                                        )
-                                        .await
-                                        {
-                                            tracing::trace!("HLS stream: receiver dropped during media segment");
-                                            break;
-                                        }
-                                    }
-                                    SegmentType::Media(segment_data) => {
-                                        if let Err(_) = Self::send_data_with_skip(
-                                            segment_data.data,
-                                            &mut bytes_to_skip,
-                                            &mut current_position,
-                                            &data_sender,
-                                            false, // is_init_segment
-                                            Some(reserved_permit),
-                                        )
-                                        .await
-                                        {
-                                            tracing::trace!("HLS stream: receiver dropped, stopping");
-                                            break;
-                                        }
-                                    }
+                result = controller.next_segment_nonblocking() => result,
+            };
+
+            match next_result {
+                Ok(NextSegmentResult::Segment(segment_type)) => {
+                    // Reset retry delay on success
+                    retry_delay = std::time::Duration::from_millis(100);
+
+                    let (data, is_init) = match segment_type {
+                        SegmentType::Init(segment_data) => (segment_data.data, true),
+                        SegmentType::Media(segment_data) => (segment_data.data, false),
+                    };
+
+                    if Self::send_data_with_skip(
+                        data,
+                        &mut bytes_to_skip,
+                        &mut current_position,
+                        &data_sender,
+                        is_init,
+                        Some(reserved_permit),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::trace!("HLS stream: receiver dropped, stopping");
+                        break;
+                    }
+                }
+                Ok(NextSegmentResult::EndOfStream) => {
+                    tracing::trace!("HLS stream: end of stream");
+                    break;
+                }
+                Ok(NextSegmentResult::NeedsRefresh { wait }) => {
+                    // Live stream needs to wait for new segments
+                    // Use select! for proper cancellation during wait
+                    drop(reserved_permit);
+
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            return Err(HlsStreamError::Cancelled);
+                        }
+                        seek = seek_receiver.recv() => {
+                            if let Some(position) = seek {
+                                tracing::trace!("HLS streaming loop: received seek during wait");
+                                if position >= current_position {
+                                    bytes_to_skip = position - current_position;
+                                } else {
+                                    return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
                                 }
                             }
-                            Ok(None) => {
-                                tracing::trace!("HLS stream: end of stream, closing channel and exiting");
-                                break;
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to get next segment: {}", e);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                drop(reserved_permit);
-                                continue;
-                            }
+                            // Continue to next iteration regardless
+                        }
+                        _ = tokio::time::sleep(wait) => {
+                            tracing::trace!("HLS stream: live refresh wait completed");
                         }
                     }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to get next segment: {}, retrying in {:?}",
+                        e,
+                        retry_delay
+                    );
+                    drop(reserved_permit);
 
+                    // Wait with cancellation support
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            return Err(HlsStreamError::Cancelled);
+                        }
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+
+                    // Exponential backoff with max limit
+                    retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
                 }
             }
         }
@@ -491,11 +563,12 @@ impl SourceStream for HlsStream {
     type StreamCreationError = HlsStreamError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
-        Self::new(
+        Self::new_with_config(
             params.url,
             params.hls_config,
             params.abr_config,
             params.selection_mode,
+            params.downloader_config,
         )
         .await
     }
@@ -538,16 +611,19 @@ impl Stream for HlsStream {
 
         match self.data_receiver.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
-                tracing::debug!("HlsStream::poll_next: returning {} bytes", data.len());
+                #[cfg(debug_assertions)]
+                tracing::trace!("HlsStream::poll_next: returning {} bytes", data.len());
                 Poll::Ready(Some(Ok(data)))
             }
             Poll::Ready(None) => {
-                tracing::debug!("HlsStream::poll_next: channel closed");
+                #[cfg(debug_assertions)]
+                tracing::trace!("HlsStream::poll_next: channel closed");
                 self.finished = true;
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                tracing::debug!("HlsStream::poll_next: no data available, pending");
+                #[cfg(debug_assertions)]
+                tracing::trace!("HlsStream::poll_next: no data available, pending");
                 Poll::Pending
             }
         }

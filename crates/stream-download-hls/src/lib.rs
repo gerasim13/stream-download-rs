@@ -44,7 +44,7 @@ pub use crate::model::{
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::stream::{HlsStream, HlsStreamError, HlsStreamParams};
-pub use crate::traits::{MediaStream, SegmentData, SegmentType};
+pub use crate::traits::{MediaStream, NextSegmentResult, SegmentData, SegmentType};
 
 pub use bytes::Bytes;
 pub use std::time::Duration;

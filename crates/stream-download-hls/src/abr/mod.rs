@@ -19,7 +19,7 @@ use async_trait::async_trait;
 
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::model::{VariantId, VariantStream};
-use crate::traits::SegmentType;
+use crate::traits::{NextSegmentResult, SegmentType};
 use crate::{HlsError, HlsResult, MediaStream};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -391,6 +391,19 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
     }
 
     async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>> {
+        // Blocking version: loop until we get a segment or end of stream
+        loop {
+            match self.next_segment_nonblocking().await? {
+                NextSegmentResult::Segment(seg) => return Ok(Some(seg)),
+                NextSegmentResult::EndOfStream => return Ok(None),
+                NextSegmentResult::NeedsRefresh { wait } => {
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult> {
         // Update simple buffer estimate by accounting for wall-clock elapsed time
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_buffer_update).as_secs_f32();
@@ -409,29 +422,36 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
         // 1. Run the ABR logic to decide if we should switch streams.
         self.maybe_switch(&metrics).await?;
 
-        // 2. Fetch the next segment, measuring the time it takes.
+        // 2. Fetch the next segment using non-blocking method, measuring the time it takes.
         let start_time = Instant::now();
-        let result = self.stream.next_segment().await;
+        let result = self.stream.next_segment_nonblocking().await?;
         let duration = start_time.elapsed();
 
-        if let Ok(Some(segment_type)) = &result {
-            match segment_type {
-                SegmentType::Init(_) => {
-                    // For init segments, we don't update bandwidth estimator or buffer
-                    // because they don't contain media data
-                }
-                SegmentType::Media(segment_data) => {
-                    // 3. Feed the measurement to the bandwidth estimator.
-                    self.bandwidth_estimator
-                        .add_sample(duration.as_millis() as f64, segment_data.data.len() as u32);
+        match &result {
+            NextSegmentResult::Segment(segment_type) => {
+                match segment_type {
+                    SegmentType::Init(_) => {
+                        // For init segments, we don't update bandwidth estimator or buffer
+                        // because they don't contain media data
+                    }
+                    SegmentType::Media(segment_data) => {
+                        // 3. Feed the measurement to the bandwidth estimator.
+                        self.bandwidth_estimator.add_sample(
+                            duration.as_millis() as f64,
+                            segment_data.data.len() as u32,
+                        );
 
-                    // 4. Increase buffer estimate by the segment duration.
-                    self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
-                    self.last_buffer_update = Instant::now();
+                        // 4. Increase buffer estimate by the segment duration.
+                        self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
+                        self.last_buffer_update = Instant::now();
+                    }
                 }
+            }
+            NextSegmentResult::EndOfStream | NextSegmentResult::NeedsRefresh { .. } => {
+                // No segment to process
             }
         }
 
-        result
+        Ok(result)
     }
 }
