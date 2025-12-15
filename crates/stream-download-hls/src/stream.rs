@@ -58,8 +58,6 @@ pub struct HlsStream {
     cancel_token: CancellationToken,
     /// Task handle for background streaming.
     streaming_task: tokio::task::JoinHandle<()>,
-    /// Whether the stream has finished (end of VOD stream reached).
-    finished: bool,
     /// Event broadcaster for out-of-band stream events.
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
 }
@@ -119,7 +117,6 @@ impl HlsStream {
             seek_sender,
             cancel_token,
             streaming_task,
-            finished: false,
             event_sender,
         })
     }
@@ -140,16 +137,21 @@ impl HlsStream {
     ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
         let task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
-            if let Err(e) = Self::streaming_loop(
-                url,
-                settings,
-                data_sender,
-                seek_receiver,
-                cancel_token,
-                event_sender.clone(),
-            )
-            .await
-            {
+            let result = async {
+                let worker = HlsStreamWorker::new(
+                    url,
+                    settings,
+                    data_sender,
+                    seek_receiver,
+                    cancel_token,
+                    event_sender,
+                )
+                .await?;
+                worker.run().await
+            }
+            .await;
+
+            if let Err(e) = result {
                 match e {
                     HlsStreamError::Cancelled => {
                         tracing::trace!("HLS streaming task cancelled")
@@ -161,30 +163,6 @@ impl HlsStream {
         });
 
         Ok(task)
-    }
-
-    /// Main streaming loop that runs in a background task.
-    ///
-    /// This loop uses non-blocking segment fetching with proper cancellation
-    /// support via `tokio::select!`. No `spawn_blocking` or hidden sleeps.
-    async fn streaming_loop(
-        url: Arc<str>,
-        settings: Arc<crate::HlsSettings>,
-        data_sender: mpsc::Sender<Bytes>,
-        seek_receiver: mpsc::Receiver<u64>,
-        cancel_token: CancellationToken,
-        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-    ) -> Result<(), HlsStreamError> {
-        let worker = HlsStreamWorker::new(
-            url,
-            settings,
-            data_sender,
-            seek_receiver,
-            cancel_token,
-            event_sender,
-        )
-        .await?;
-        worker.run().await
     }
 
     /// Seek to a specific position in the stream.
@@ -250,10 +228,6 @@ impl Stream for HlsStream {
     type Item = io::Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.finished {
-            return Poll::Ready(None);
-        }
-
         match self.data_receiver.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 #[cfg(debug_assertions)]
@@ -263,7 +237,6 @@ impl Stream for HlsStream {
             Poll::Ready(None) => {
                 #[cfg(debug_assertions)]
                 tracing::trace!("HlsStream::poll_next: channel closed");
-                self.finished = true;
                 Poll::Ready(None)
             }
             Poll::Pending => {

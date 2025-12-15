@@ -10,12 +10,17 @@ use crate::{
     MediaStream, ResourceDownloader, StreamEvent, StreamMiddleware, apply_middlewares,
 };
 
+enum RaceOutcome<T> {
+    Completed(T),
+    Seek(u64),
+    ChannelClosed,
+}
+
 pub struct HlsStreamWorker {
     data_sender: mpsc::Sender<Bytes>,
     seek_receiver: mpsc::Receiver<u64>,
     cancel_token: CancellationToken,
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-    streaming_downloader: ResourceDownloader,
     controller: AbrController<HlsManager>,
     current_position: u64,
     bytes_to_skip: u64,
@@ -166,20 +171,22 @@ impl HlsStreamWorker {
         &mut self,
         wait: std::time::Duration,
     ) -> Result<(), HlsStreamError> {
-        tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => {
-                return Err(HlsStreamError::Cancelled);
-            }
-            seek = self.seek_receiver.recv() => {
-                if let Some(position) = seek {
-                    tracing::trace!("HLS streaming loop: received seek during wait");
-                    self.apply_seek_position(position).await?;
-                }
-                // Continue regardless
-            }
-            _ = tokio::time::sleep(wait) => {
+        match Self::race_with_seek(
+            &self.cancel_token,
+            &mut self.seek_receiver,
+            tokio::time::sleep(wait),
+        )
+        .await?
+        {
+            RaceOutcome::Completed(_) => {
                 tracing::trace!("HLS stream: live refresh wait completed");
+            }
+            RaceOutcome::Seek(position) => {
+                tracing::trace!("HLS streaming loop: received seek during wait");
+                self.apply_seek_position(position).await?;
+            }
+            RaceOutcome::ChannelClosed => {
+                // Seek channel closed; continue loop
             }
         }
         Ok(())
@@ -199,6 +206,39 @@ impl HlsStreamWorker {
         Ok(())
     }
 
+    #[instrument(skip(cancel, seeks, fut))]
+    async fn race_with_seek<F, T>(
+        cancel: &CancellationToken,
+        seeks: &mut mpsc::Receiver<u64>,
+        fut: F,
+    ) -> Result<RaceOutcome<T>, HlsStreamError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::pin!(fut);
+        let res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err(HlsStreamError::Cancelled);
+            }
+            seek = seeks.recv() => {
+                if let Some(mut position) = seek {
+                    // Coalesce burst seeks: drain pending messages to keep only the latest position
+                    while let Ok(next) = seeks.try_recv() {
+                        position = next;
+                    }
+                    Ok(RaceOutcome::Seek(position))
+                } else {
+                    Ok(RaceOutcome::ChannelClosed)
+                }
+            }
+            out = &mut fut => {
+                Ok(RaceOutcome::Completed(out))
+            }
+        };
+        res
+    }
+
     /// Pump bytes from a segment stream to downstream with backpressure, cancellation and seek handling.
     #[instrument(skip(self, stream))]
     async fn pump_stream_chunks(
@@ -209,24 +249,21 @@ impl HlsStreamWorker {
         let mut first_permit: Option<tokio::sync::mpsc::Permit<Bytes>> = None;
 
         loop {
-            tokio::select! {
-                biased;
-                _ = self.cancel_token.cancelled() => {
-                    return Err(HlsStreamError::Cancelled);
+            let next_fut = futures_util::StreamExt::next(&mut stream);
+            match Self::race_with_seek(&self.cancel_token, &mut self.seek_receiver, next_fut)
+                .await?
+            {
+                RaceOutcome::Seek(position) => {
+                    tracing::trace!("HLS streaming loop: received seek during streaming");
+                    self.apply_seek_position(position).await?;
+                    // break to apply new position on next iteration
+                    break;
                 }
-                // Concurrently react to a seek during streaming a segment
-                seek = self.seek_receiver.recv() => {
-                    if let Some(position) = seek {
-                        tracing::trace!("HLS streaming loop: received seek during streaming");
-                        self.apply_seek_position(position).await?;
-                        // break to apply new position on next iteration
-                        break;
-                    } else {
-                        tracing::trace!("HLS stream: seek channel closed");
-                        break;
-                    }
+                RaceOutcome::ChannelClosed => {
+                    tracing::trace!("HLS stream: seek channel closed");
+                    break;
                 }
-                item = futures_util::StreamExt::next(&mut stream) => {
+                RaceOutcome::Completed(item) => {
                     match item {
                         Some(Ok(chunk)) => {
                             // Send chunk
@@ -234,7 +271,10 @@ impl HlsStreamWorker {
                                 Some(p) => p,
                                 None => match self.data_sender.reserve().await {
                                     Ok(p) => p,
-                                    Err(_) => { tracing::trace!("HLS stream: receiver dropped, stopping"); break; }
+                                    Err(_) => {
+                                        tracing::trace!("HLS stream: receiver dropped, stopping");
+                                        break;
+                                    }
                                 },
                             };
                             let len = chunk.len() as u64;
@@ -242,7 +282,11 @@ impl HlsStreamWorker {
                             self.current_position = self.current_position.saturating_add(len);
                         }
                         Some(Err(e)) => {
-                            tracing::error!("Error reading segment chunk: {}, retrying in {:?}", e, self.retry_delay);
+                            tracing::error!(
+                                "Error reading segment chunk: {}, retrying in {:?}",
+                                e,
+                                self.retry_delay
+                            );
                             self.backoff_sleep().await?;
                             break;
                         }
@@ -293,12 +337,18 @@ impl HlsStreamWorker {
         let stream_res = if self.bytes_to_skip > 0 && !desc.is_init {
             let start = self.bytes_to_skip;
             self.bytes_to_skip = 0;
-            self.streaming_downloader
+            self.controller
+                .inner_stream()
+                .downloader()
                 .stream_segment_range(&desc.uri, start, None)
                 .await
         } else {
             // For init segments, we always send the full segment even if skip is inside it
-            self.streaming_downloader.stream_segment(&desc.uri).await
+            self.controller
+                .inner_stream()
+                .downloader()
+                .stream_segment(&desc.uri)
+                .await
         };
 
         let stream = match stream_res {
@@ -333,7 +383,7 @@ impl HlsStreamWorker {
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     ) -> Result<Self, HlsStreamError> {
-        // Build dedicated downloaders from flattened settings
+        // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
             settings.request_timeout,
             settings.max_retries,
@@ -341,12 +391,6 @@ impl HlsStreamWorker {
             settings.max_retry_delay,
         );
 
-        let streaming_downloader = ResourceDownloader::new(
-            request_timeout,
-            max_retries,
-            retry_base_delay,
-            max_retry_delay,
-        );
         let manager_downloader = ResourceDownloader::new(
             request_timeout,
             max_retries,
@@ -408,7 +452,6 @@ impl HlsStreamWorker {
             seek_receiver,
             cancel_token,
             event_sender,
-            streaming_downloader,
             controller,
             current_position: 0,
             bytes_to_skip: 0,
@@ -420,24 +463,26 @@ impl HlsStreamWorker {
     pub async fn run(mut self) -> Result<(), HlsStreamError> {
         let mut last_variant_id: Option<crate::model::VariantId> = None;
         loop {
-            // Fetch next segment descriptor using non-blocking method
-            let next_desc = tokio::select! {
-                biased;
-                _ = self.cancel_token.cancelled() => {
-                    return Err(HlsStreamError::Cancelled);
+            // Fetch next segment descriptor using non-blocking method with unified race
+            let next_desc = match Self::race_with_seek(
+                &self.cancel_token,
+                &mut self.seek_receiver,
+                self.controller
+                    .inner_stream_mut()
+                    .next_segment_descriptor_nonblocking(),
+            )
+            .await?
+            {
+                RaceOutcome::Completed(result) => result,
+                RaceOutcome::Seek(position) => {
+                    tracing::trace!("HLS streaming loop: received seek to position {}", position);
+                    self.apply_seek_position(position).await?;
+                    continue;
                 }
-                seek = self.seek_receiver.recv() => {
-                    if let Some(position) = seek {
-                        tracing::trace!("HLS streaming loop: received seek to position {}", position);
-                        self.apply_seek_position(position).await?;
-                        // no pre-reserved permit; continue
-                        continue;
-                    } else {
-                        tracing::trace!("HLS stream: seek channel closed");
-                        break;
-                    }
+                RaceOutcome::ChannelClosed => {
+                    tracing::trace!("HLS stream: seek channel closed");
+                    break;
                 }
-                result = self.controller.inner_stream_mut().next_segment_descriptor_nonblocking() => result,
             };
 
             match next_desc {
