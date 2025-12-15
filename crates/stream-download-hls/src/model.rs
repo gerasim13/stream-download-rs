@@ -10,17 +10,139 @@
 //! - A small helper (`diff_playlists`) for detecting new segments in live
 //!   playlists.
 
-use std::fmt::Debug;
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter};
+use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
+use stream_download::source::DecodeError;
+use tokio::sync::mpsc::error::SendError;
 
 /// A boxed stream of HLS byte chunks.
 pub type HlsByteStream = BoxStream<'static, Result<Bytes, HlsError>>;
 
 /// Result type used by this crate.
 pub type HlsResult<T> = Result<T, HlsError>;
+
+/// HLS implementation of the [`SourceStream`] trait.
+///
+/// This stream handles HLS playback including:
+/// - Master playlist parsing
+/// - Media playlist updates
+/// - Segment downloading
+/// - Adaptive bitrate switching
+/// - Limited seeking support
+///
+/// The stream produces raw bytes from HLS media segments. Higher-level components
+/// are responsible for handling init segments and variant switching metadata.
+/// Events emitted by the HLS streaming pipeline (out-of-band metadata).
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+    /// ABR: a new variant (rendition) has been selected. Emitted before the init segment.
+    VariantChanged {
+        variant_id: VariantId,
+        codec_info: Option<CodecInfo>,
+    },
+    /// Beginning of an init segment in the main byte stream.
+    /// byte_len may be None when exact length is unknown (e.g., due to DRM/middleware).
+    InitStart {
+        variant_id: VariantId,
+        codec_info: Option<CodecInfo>,
+        byte_len: Option<u64>,
+    },
+    /// End of the init segment in the main byte stream.
+    InitEnd { variant_id: VariantId },
+    /// Optional: media segment boundaries (useful for metrics).
+    SegmentStart {
+        sequence: u64,
+        variant_id: VariantId,
+        byte_len: Option<u64>,
+        duration: std::time::Duration,
+    },
+    SegmentEnd {
+        sequence: u64,
+        variant_id: VariantId,
+    },
+}
+
+/// Error type for HLS stream creation and operations.
+#[derive(Debug)]
+pub enum HlsStreamError {
+    /// IO error occurred.
+    Io(Arc<io::Error>),
+    /// HLS-specific error occurred.
+    Hls(HlsErrorKind),
+    /// Invalid parameters provided.
+    InvalidParams(&'static str),
+    /// Stream was cancelled.
+    Cancelled,
+}
+
+/// Specific HLS error kinds to avoid string allocations.
+#[derive(Debug)]
+pub enum HlsErrorKind {
+    /// Failed to load master playlist.
+    MasterPlaylistLoad(crate::model::HlsError),
+    /// No variants available in master playlist.
+    NoVariants,
+    /// Failed to initialize ABR controller.
+    ControllerInit(crate::model::HlsError),
+    /// Failed to send seek command.
+    SeekFailed,
+    /// Streaming loop not initialized.
+    StreamingLoopNotInitialized,
+    /// Backward seek not supported.
+    BackwardSeekNotSupported,
+}
+
+impl Display for HlsStreamError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HlsStreamError::Io(err) => write!(f, "IO error: {}", err),
+            HlsStreamError::Hls(kind) => match kind {
+                HlsErrorKind::MasterPlaylistLoad(e) => {
+                    write!(f, "Failed to load master playlist: {}", e)
+                }
+                HlsErrorKind::NoVariants => write!(f, "No variants available in master playlist"),
+                HlsErrorKind::ControllerInit(e) => {
+                    write!(f, "Failed to initialize ABR controller: {}", e)
+                }
+                HlsErrorKind::SeekFailed => write!(f, "Failed to send seek command"),
+                HlsErrorKind::StreamingLoopNotInitialized => {
+                    write!(f, "Streaming loop not initialized")
+                }
+                HlsErrorKind::BackwardSeekNotSupported => {
+                    write!(f, "Backward seek not supported")
+                }
+            },
+            HlsStreamError::InvalidParams(msg) => write!(f, "Invalid parameters: {}", msg),
+            HlsStreamError::Cancelled => write!(f, "Stream was cancelled"),
+        }
+    }
+}
+
+impl Error for HlsStreamError {}
+
+impl DecodeError for HlsStreamError {
+    async fn decode_error(self) -> String {
+        self.to_string()
+    }
+}
+
+impl From<io::Error> for HlsStreamError {
+    fn from(err: io::Error) -> Self {
+        HlsStreamError::Io(Arc::new(err))
+    }
+}
+
+impl From<SendError<u64>> for HlsStreamError {
+    fn from(_: SendError<u64>) -> Self {
+        HlsStreamError::Hls(HlsErrorKind::SeekFailed)
+    }
+}
 
 /// Error type for the HLS extension crate.
 ///

@@ -33,20 +33,22 @@ mod parser;
 mod settings;
 mod stream;
 mod traits;
+mod worker;
 
-pub use crate::abr::{AbrController, PlaybackMetrics};
+pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
 pub use crate::downloader::ResourceDownloader;
 pub use crate::manager::HlsManager;
 pub use crate::model::{
-    HlsByteStream, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
-    VariantId, VariantStream, diff_playlists,
+    HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,
+    MediaPlaylist, MediaSegment, NewSegment, StreamEvent, VariantId, VariantStream,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
-pub use crate::stream::{HlsStream, HlsStreamError, HlsStreamParams};
+pub use crate::stream::{HlsStream, HlsStreamParams};
 pub use crate::traits::{
     MediaStream, NextSegmentResult, SegmentData, SegmentType, StreamMiddleware, apply_middlewares,
 };
+pub use crate::worker::HlsStreamWorker;
 
 #[cfg(feature = "aes-decrypt")]
 mod crypto;
