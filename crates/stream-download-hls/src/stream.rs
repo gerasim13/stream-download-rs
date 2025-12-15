@@ -305,9 +305,6 @@ impl HlsStream {
             settings.retry_base_delay,
             settings.max_retry_delay,
         );
-        // Keep reset clones for backward seek reinitialization
-        let reset_url = url.clone();
-        let reset_settings = settings.clone();
         // Use a dedicated streaming downloader built from flattened settings
         let streaming_downloader = ResourceDownloader::new(
             request_timeout,
@@ -564,7 +561,7 @@ impl HlsStream {
                         streaming_downloader.stream_segment(&desc.uri).await
                     };
 
-                    let mut stream = match stream_res {
+                    let stream = match stream_res {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(
@@ -584,9 +581,12 @@ impl HlsStream {
                     };
                     // Apply streaming middlewares (DRM, etc.)
                     let mut middlewares: Vec<Arc<dyn StreamMiddleware>> = Vec::new();
+
+                    #[cfg(feature = "aes-decrypt")]
                     if let Some((key, iv)) = drm_params_opt {
                         middlewares.push(Arc::new(Aes128CbcMiddleware::new(key, iv)));
                     }
+
                     let mut stream = apply_middlewares(stream, &middlewares);
 
                     // Send incoming chunks, interleaving cancellation and seek handling
@@ -740,72 +740,6 @@ impl HlsStream {
             }
         }
 
-        Ok(())
-    }
-
-    /// Helper function to send data with skip logic.
-    async fn send_data_with_skip(
-        data: Bytes,
-        bytes_to_skip: &mut u64,
-        current_position: &mut u64,
-        data_sender: &mpsc::Sender<Bytes>,
-        is_init_segment: bool,
-        reserved_permit: Option<mpsc::Permit<'_, Bytes>>,
-    ) -> Result<(), ()> {
-        let data_size = data.len() as u64;
-        let mut reserved_permit = reserved_permit;
-
-        // Handle skipping within data
-        if *bytes_to_skip > 0 {
-            if *bytes_to_skip >= data_size {
-                // Skip entire data
-                *bytes_to_skip -= data_size;
-                *current_position += data_size;
-                return Ok(());
-            } else {
-                // Skip part of data
-                // For init segment, we must send it completely if skip is inside it
-                if is_init_segment {
-                    // Send full init segment (cannot send partially)
-                    let permit = match reserved_permit.take() {
-                        Some(p) => p,
-                        None => data_sender.reserve().await.map_err(|_| ())?,
-                    };
-                    permit.send(data);
-                    *current_position += data_size;
-                    *bytes_to_skip = 0;
-                    return Ok(());
-                } else {
-                    // For media segments, skip part and send remaining
-                    let skip_bytes = *bytes_to_skip as usize;
-                    let remaining_data = if skip_bytes < data.len() {
-                        data.slice(skip_bytes..)
-                    } else {
-                        Bytes::new()
-                    };
-
-                    if !remaining_data.is_empty() {
-                        let permit = match reserved_permit.take() {
-                            Some(p) => p,
-                            None => data_sender.reserve().await.map_err(|_| ())?,
-                        };
-                        permit.send(remaining_data);
-                    }
-
-                    *current_position += data_size;
-                    *bytes_to_skip = 0;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Send full data
-        let permit = match reserved_permit {
-            Some(p) => p,
-            None => data_sender.reserve().await.map_err(|_| ())?,
-        };
-        permit.send(data);
-        *current_position += data_size;
         Ok(())
     }
 

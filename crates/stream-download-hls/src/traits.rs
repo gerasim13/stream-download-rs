@@ -12,12 +12,13 @@
 //! returns [`NextSegmentResult::NeedsRefresh`] with a suggested wait duration,
 //! allowing the caller to handle waiting with proper cancellation support.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::model::{CodecInfo, HlsResult, SegmentKey, VariantId, VariantStream};
+use crate::model::{CodecInfo, HlsByteStream, HlsResult, SegmentKey, VariantId, VariantStream};
 
 /// Type of segment returned by `next_segment`.
 #[derive(Debug, Clone)]
@@ -184,4 +185,28 @@ pub trait MediaStream {
     /// }
     /// ```
     async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult>;
+}
+
+/// Trait for transforming a stream of `Bytes` in a composable manner.
+///
+/// This trait is object-safe and can be used behind a `Box<dyn StreamMiddleware>`.
+/// It consumes an input `HlsByteStream` and returns a new transformed stream.
+pub trait StreamMiddleware: Send + Sync {
+    fn apply(&self, input: HlsByteStream) -> HlsByteStream;
+}
+
+/// Apply a list of middlewares to an input stream in order.
+///
+/// This function consumes the input stream and returns the transformed stream.
+/// If `middlewares` is empty, the input stream is returned unchanged.
+///
+/// Middlewares are applied left-to-right: `out = mN(...(m2(m1(input))))`
+pub fn apply_middlewares(
+    mut input: HlsByteStream,
+    middlewares: &[Arc<dyn StreamMiddleware>],
+) -> HlsByteStream {
+    for mw in middlewares {
+        input = mw.apply(input);
+    }
+    input
 }

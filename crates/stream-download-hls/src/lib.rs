@@ -26,10 +26,8 @@
 //! of the `stream-download-hls` crate.
 
 mod abr;
-mod crypto;
 mod downloader;
 mod manager;
-mod middleware;
 mod model;
 mod parser;
 mod settings;
@@ -38,19 +36,22 @@ mod traits;
 
 pub use crate::abr::{AbrController, PlaybackMetrics};
 pub use crate::downloader::ResourceDownloader;
-
 pub use crate::manager::HlsManager;
-pub use crate::middleware::{
-    Aes128CbcMiddleware, HlsByteStream, NoopMiddleware, StreamMiddleware, apply_middlewares,
-};
 pub use crate::model::{
-    HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment, VariantId,
-    VariantStream, diff_playlists,
+    HlsByteStream, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
+    VariantId, VariantStream, diff_playlists,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
 pub use crate::stream::{HlsStream, HlsStreamError, HlsStreamParams};
-pub use crate::traits::{MediaStream, NextSegmentResult, SegmentData, SegmentType};
+pub use crate::traits::{
+    MediaStream, NextSegmentResult, SegmentData, SegmentType, StreamMiddleware, apply_middlewares,
+};
+
+#[cfg(feature = "aes-decrypt")]
+mod crypto;
+#[cfg(feature = "aes-decrypt")]
+pub use crate::crypto::Aes128CbcMiddleware;
 
 pub use bytes::Bytes;
 pub use std::time::Duration;

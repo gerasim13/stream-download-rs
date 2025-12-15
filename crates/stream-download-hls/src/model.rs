@@ -11,10 +11,13 @@
 //!   playlists.
 
 use std::fmt::Debug;
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::stream::BoxStream;
 
-use std::time::Duration;
+/// A boxed stream of HLS byte chunks.
+pub type HlsByteStream = BoxStream<'static, Result<Bytes, HlsError>>;
 
 /// Result type used by this crate.
 pub type HlsResult<T> = Result<T, HlsError>;

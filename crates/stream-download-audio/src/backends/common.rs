@@ -4,10 +4,9 @@
 //! such as the blocking reading loop and error handling utilities.
 
 use bytes::Bytes;
-use kanal::{AsyncSender, Sender};
+use kanal::Sender;
 use std::io::{self, Read, Result as IoResult};
 use stream_download::StreamDownload;
-use stream_download::storage::temp::TempStorageProvider;
 use tokio_util::sync::CancellationToken;
 
 use crate::pipeline::Packet;
@@ -104,77 +103,4 @@ where
 /// Create an IO error with the Other kind.
 pub fn io_other(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg.to_string())
-}
-
-/// Trait for stream creation that can be used by packet producers.
-///
-/// This trait abstracts the creation of StreamDownload instances for different
-/// source types (HTTP, HLS, etc.).
-#[async_trait::async_trait]
-pub trait StreamCreator {
-    /// The source stream type.
-    type SourceStream: stream_download::source::SourceStream;
-
-    /// The parameters needed to create the source stream.
-    type Params;
-
-    /// Create a new StreamDownload instance.
-    async fn create_stream_download(
-        params: Self::Params,
-    ) -> io::Result<StreamDownload<TempStorageProvider>>;
-}
-
-/// Generic packet producer implementation using a StreamCreator.
-///
-/// This struct provides a generic implementation of PacketProducer that
-/// works with any StreamCreator.
-pub struct GenericPacketProducer<C: StreamCreator> {
-    params: C::Params,
-}
-
-impl<C: StreamCreator> Clone for GenericPacketProducer<C>
-where
-    C::Params: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            params: self.params.clone(),
-        }
-    }
-}
-
-impl<C: StreamCreator> GenericPacketProducer<C> {
-    /// Create a new generic packet producer.
-    pub fn new(params: C::Params) -> Self {
-        Self { params }
-    }
-}
-
-#[async_trait::async_trait]
-impl<C: StreamCreator> crate::backends::PacketProducer for GenericPacketProducer<C>
-where
-    C::Params: Clone + Send + Sync,
-{
-    async fn run(
-        &mut self,
-        out: AsyncSender<Packet>,
-        cancel: Option<CancellationToken>,
-    ) -> io::Result<()> {
-        let reader = C::create_stream_download(self.params.clone()).await?;
-
-        // Run the blocking reading loop in a separate thread
-        let sync_out = out.clone_sync();
-        tokio::task::spawn_blocking(move || {
-            run_blocking_reading_loop(
-                reader,
-                sync_out,
-                cancel,
-                None,         // variant_index
-                0,            // init_hash
-                Bytes::new(), // init_bytes
-            )
-        })
-        .await
-        .map_err(|join_err| io_other(&format!("join error: {join_err}")))?
-    }
 }

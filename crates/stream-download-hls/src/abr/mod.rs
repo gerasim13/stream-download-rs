@@ -50,7 +50,7 @@ pub struct PlaybackMetrics {
 /// This is intentionally small. The idea is to expose just enough knobs
 /// for experimentation in the PoC without committing to a complex API.
 #[derive(Debug, Clone)]
-pub(crate) struct AbrConfig {
+pub struct AbrConfig {
     /// Minimum buffer (in seconds) above which the controller allows up-switching.
     pub min_buffer_for_up_switch: f32,
     /// Buffer (in seconds) below which the controller will be aggressive in down-switching.
@@ -98,10 +98,8 @@ pub struct AbrController<S: MediaStream> {
     /// The variant that the controller is currently targeting.
     current_variant_id: Option<VariantId>,
     initial_variant_index: usize,
-
     /// When set, controller is locked to a specific variant (manual mode).
     manual_variant_id: Option<VariantId>,
-
     /// Simple wall-clock based buffer estimate (seconds).
     buffer_seconds_estimate: f32,
     /// Last time the buffer estimate was updated.
