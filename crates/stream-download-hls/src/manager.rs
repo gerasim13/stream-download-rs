@@ -417,10 +417,7 @@ impl HlsManager {
     /// In the final implementation this will:
     /// - download the latest media playlist,
     /// - parse it with `parse_media_playlist`,
-    /// - update `current_media_playlist`,
-    /// - be used by higher layers to compute new segments (via `diff_playlists`).
-    ///
-    /// For now this is a stub that returns an error.
+    /// - update `current_media_playlist`.
     pub async fn refresh_media_playlist(&mut self) -> HlsResult<&MediaPlaylist> {
         // Ensure we have a selected variant and a media playlist URL to refresh
         let media_url = self.media_playlist_url.clone().ok_or_else(|| {

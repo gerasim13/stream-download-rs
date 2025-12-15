@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
-    let manual_variant_idx = 3;
+    let manual_variant_idx = 0;
     let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
     let params = HlsStreamParams::new(url, settings);
 

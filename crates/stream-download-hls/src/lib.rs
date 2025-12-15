@@ -40,7 +40,7 @@ pub use crate::downloader::ResourceDownloader;
 pub use crate::manager::HlsManager;
 pub use crate::model::{
     HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,
-    MediaPlaylist, MediaSegment, NewSegment, StreamEvent, VariantId, VariantStream,
+    MediaPlaylist, MediaSegment, StreamEvent, VariantId, VariantStream,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
