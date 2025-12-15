@@ -56,6 +56,10 @@ name = "stream_hls"
 required-features = ["hls"]
 
 [[example]]
+name = "stream_hls_seek"
+required-features = ["hls"]
+
+[[example]]
 name = "audio_hls"
 required-features = ["audio"]
 

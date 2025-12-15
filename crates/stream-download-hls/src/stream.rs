@@ -170,6 +170,7 @@ impl HlsStream {
     /// Position is an absolute byte offset from the beginning of the concatenated stream.
     /// Supports forward and backward seeks. Backward seek will reset the internal controller
     /// state and replay from the start using byte-range where possible.
+    #[inline(always)]
     async fn seek_internal(&self, position: u64) -> Result<(), HlsStreamError> {
         self.seek_sender.send(position).await?;
         Ok(())
