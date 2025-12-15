@@ -28,9 +28,10 @@ use tokio::sync::mpsc::{self, error::SendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
+use crate::abr::AbrConfig;
 use crate::{
-    AbrConfig, AbrController, Aes128CbcMiddleware, DownloaderConfig, HlsConfig, HlsManager,
-    MediaStream, ResourceDownloader, SelectionMode, StreamMiddleware, apply_middlewares,
+    AbrController, Aes128CbcMiddleware, HlsManager, MediaStream, ResourceDownloader,
+    StreamMiddleware, apply_middlewares,
 };
 use stream_download::source::{DecodeError, SourceStream};
 use stream_download::storage::ContentLength;
@@ -40,31 +41,16 @@ use stream_download::storage::ContentLength;
 pub struct HlsStreamParams {
     /// The URL of the HLS master playlist.
     pub url: Arc<str>,
-    /// Configuration for HLS playback.
-    pub hls_config: Arc<HlsConfig>,
-    /// Configuration for adaptive bitrate control.
-    pub abr_config: Arc<AbrConfig>,
-    /// Selection mode for variants (auto or manual).
-    pub selection_mode: SelectionMode,
-    /// Optional configuration for the resource downloader.
-    /// If not provided, uses optimized defaults.
-    pub downloader_config: Option<DownloaderConfig>,
+    /// Unified settings for HLS playback and downloader behavior.
+    pub settings: Arc<crate::HlsSettings>,
 }
 
 impl HlsStreamParams {
     /// Create new HLS stream parameters.
-    pub fn new(
-        url: impl Into<Arc<str>>,
-        hls_config: impl Into<Arc<HlsConfig>>,
-        abr_config: impl Into<Arc<AbrConfig>>,
-        selection_mode: SelectionMode,
-    ) -> Self {
+    pub fn new(url: impl Into<Arc<str>>, settings: impl Into<Arc<crate::HlsSettings>>) -> Self {
         Self {
             url: url.into(),
-            hls_config: hls_config.into(),
-            abr_config: abr_config.into(),
-            selection_mode,
-            downloader_config: None,
+            settings: settings.into(),
         }
     }
 }
@@ -211,11 +197,9 @@ impl HlsStream {
     /// * `selection_mode` - Selection mode for variants
     pub async fn new(
         url: impl Into<Arc<str>>,
-        config: Arc<HlsConfig>,
-        abr_config: Arc<AbrConfig>,
-        selection_mode: SelectionMode,
+        settings: Arc<crate::HlsSettings>,
     ) -> Result<Self, HlsStreamError> {
-        Self::new_with_config(url, config, abr_config, selection_mode, None).await
+        Self::new_with_config(url, settings).await
     }
 
     /// Create a new HLS stream with custom downloader configuration.
@@ -228,16 +212,13 @@ impl HlsStream {
     /// * `downloader_config` - Optional custom downloader configuration
     pub async fn new_with_config(
         url: impl Into<Arc<str>>,
-        config: Arc<HlsConfig>,
-        abr_config: Arc<AbrConfig>,
-        selection_mode: SelectionMode,
-        downloader_config: Option<DownloaderConfig>,
+        settings: Arc<crate::HlsSettings>,
     ) -> Result<Self, HlsStreamError> {
         let url = url.into();
 
         // Create channels for data and commands
         // Use bounded channel for data to control backpressure with configurable buffer size
-        let buffer_size = config.prefetch_buffer_size;
+        let buffer_size = settings.prefetch_buffer_size;
         let (data_sender, data_receiver) = mpsc::channel(buffer_size);
         let (seek_sender, seek_receiver) = mpsc::channel(1);
         let cancel_token = CancellationToken::new();
@@ -248,10 +229,7 @@ impl HlsStream {
         // Start background streaming task
         let streaming_task = Self::start_streaming_task(
             url,
-            config,
-            abr_config,
-            selection_mode,
-            downloader_config,
+            settings,
             data_sender,
             seek_receiver,
             cancel_token.clone(),
@@ -277,10 +255,7 @@ impl HlsStream {
     /// Start the background streaming task.
     async fn start_streaming_task(
         url: Arc<str>,
-        config: Arc<HlsConfig>,
-        abr_config: Arc<AbrConfig>,
-        selection_mode: SelectionMode,
-        downloader_config: Option<DownloaderConfig>,
+        settings: Arc<crate::HlsSettings>,
         data_sender: mpsc::Sender<Bytes>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
@@ -290,10 +265,7 @@ impl HlsStream {
             tracing::trace!("HLS streaming task started");
             if let Err(e) = Self::streaming_loop(
                 url,
-                config,
-                abr_config,
-                selection_mode,
-                downloader_config,
+                settings,
                 data_sender,
                 seek_receiver,
                 cancel_token,
@@ -320,26 +292,38 @@ impl HlsStream {
     /// support via `tokio::select!`. No `spawn_blocking` or hidden sleeps.
     async fn streaming_loop(
         url: Arc<str>,
-        config: Arc<HlsConfig>,
-        abr_config: Arc<AbrConfig>,
-        selection_mode: SelectionMode,
-        downloader_config: Option<DownloaderConfig>,
+        settings: Arc<crate::HlsSettings>,
         data_sender: mpsc::Sender<Bytes>,
         mut seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     ) -> Result<(), HlsStreamError> {
-        let downloader_config = downloader_config.unwrap_or_default();
+        // Use flattened downloader settings from HlsSettings
+        let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
+            settings.request_timeout,
+            settings.max_retries,
+            settings.retry_base_delay,
+            settings.max_retry_delay,
+        );
         // Keep reset clones for backward seek reinitialization
         let reset_url = url.clone();
-        let reset_config = config.clone();
-        let reset_downloader_config = downloader_config.clone();
-        // Use a dedicated streaming downloader (avoid moving reset config)
-        let streaming_downloader = ResourceDownloader::new(downloader_config.clone());
+        let reset_settings = settings.clone();
+        // Use a dedicated streaming downloader built from flattened settings
+        let streaming_downloader = ResourceDownloader::new(
+            request_timeout,
+            max_retries,
+            retry_base_delay,
+            max_retry_delay,
+        );
         // Separate downloader instance for manager to avoid moving the streaming downloader
-        let manager_downloader = ResourceDownloader::new(downloader_config);
+        let manager_downloader = ResourceDownloader::new(
+            request_timeout,
+            max_retries,
+            retry_base_delay,
+            max_retry_delay,
+        );
 
-        let mut manager = HlsManager::new(url, config, manager_downloader);
+        let mut manager = HlsManager::new(url, settings.clone(), manager_downloader);
 
         // Exponential backoff for retry logic
         let mut retry_delay = std::time::Duration::from_millis(100);
@@ -359,9 +343,9 @@ impl HlsStream {
             if master.variants.is_empty() {
                 return Err(HlsStreamError::Hls(HlsErrorKind::NoVariants));
             }
-            match selection_mode {
-                SelectionMode::Auto => manager.current_variant_index().unwrap_or(0),
-                SelectionMode::Manual(index) => index.0,
+            match settings.selection_manual_variant_id {
+                None => manager.current_variant_index().unwrap_or(0),
+                Some(index) => index.0,
             }
         };
 
@@ -369,10 +353,19 @@ impl HlsStream {
             .bandwidth
             .unwrap_or(0) as f64;
 
+        let abr_cfg = AbrConfig {
+            min_buffer_for_up_switch: settings.abr_min_buffer_for_up_switch,
+            down_switch_buffer: settings.abr_down_switch_buffer,
+            throughput_safety_factor: settings.abr_throughput_safety_factor,
+            up_hysteresis_ratio: settings.abr_up_hysteresis_ratio,
+            down_hysteresis_ratio: settings.abr_down_hysteresis_ratio,
+            min_switch_interval: settings.abr_min_switch_interval,
+        };
+        let manual_variant_id = settings.selection_manual_variant_id;
         let mut controller = AbrController::new(
             manager,
-            abr_config.as_ref().clone(),
-            selection_mode,
+            abr_cfg,
+            manual_variant_id,
             initial_variant_index,
             init_bw,
         );
@@ -844,14 +837,7 @@ impl SourceStream for HlsStream {
     type StreamCreationError = HlsStreamError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
-        Self::new_with_config(
-            params.url,
-            params.hls_config,
-            params.abr_config,
-            params.selection_mode,
-            params.downloader_config,
-        )
-        .await
+        Self::new(params.url, params.settings).await
     }
 
     fn content_length(&self) -> ContentLength {

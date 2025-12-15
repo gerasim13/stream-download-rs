@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use rodio::{OutputStreamBuilder, Sink};
+use stream_download_audio::api::SelectionMode;
 use stream_download_audio::{
-    AbrConfig, AudioOptions, AudioStream, HlsConfig, PlayerEvent, RodioSourceAdapter,
-    SelectionMode, VariantId,
+    AudioOptions, AudioStream, HlsSettings, PlayerEvent, RodioSourceAdapter,
 };
 use tracing::metadata::LevelFilter;
 use tracing::trace;
@@ -26,17 +26,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
     let manual_variant_idx = 0usize;
-    let selection_mode = SelectionMode::Manual(VariantId(0));
+    let selection_mode = SelectionMode::Manual(0);
 
     // Build audio stream
     let opts = AudioOptions::default().with_selection_mode(selection_mode);
-    let stream = AudioStream::from_hls(
-        url.clone(),
-        opts,
-        HlsConfig::default(),
-        AbrConfig::default(),
-    )
-    .await;
+    let stream = AudioStream::from_hls(url.clone(), opts, HlsSettings::default()).await;
 
     // Setup rodio output
     let stream_handle =

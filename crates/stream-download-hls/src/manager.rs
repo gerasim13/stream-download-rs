@@ -30,10 +30,11 @@ use tracing::instrument;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{
-    EncryptionMethod, HlsConfig, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist,
-    MediaSegment, SegmentKey, VariantId, VariantStream,
+    EncryptionMethod, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
+    SegmentKey, VariantId, VariantStream,
 };
 use crate::parser::{parse_master_playlist, parse_media_playlist};
+use crate::settings::HlsSettings;
 use crate::traits::{MediaStream, NextSegmentResult, SegmentData};
 
 /// High-level handle for working with a single HLS stream.
@@ -55,7 +56,7 @@ pub struct HlsManager {
     /// URL of the master playlist.
     master_url: Arc<str>,
     /// Configuration parameters.
-    config: Arc<HlsConfig>,
+    config: Arc<HlsSettings>,
     /// Downloader used to fetch playlists and segments.
     downloader: ResourceDownloader,
 
@@ -97,7 +98,7 @@ impl HlsManager {
     /// HTTP/caching is configured (e.g., shared client, different backends).
     pub fn new(
         master_url: impl Into<Arc<str>>,
-        config: Arc<HlsConfig>,
+        config: Arc<HlsSettings>,
         downloader: ResourceDownloader,
     ) -> Self {
         Self {
@@ -122,7 +123,7 @@ impl HlsManager {
     }
 
     /// Access the configuration used by this manager.
-    pub fn config(&self) -> &HlsConfig {
+    pub fn config(&self) -> &HlsSettings {
         &self.config
     }
 

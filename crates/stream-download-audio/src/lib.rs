@@ -14,8 +14,7 @@ mod rodio;
 
 // Re-export useful HLS types for convenience.
 pub use stream_download_hls::{
-    AbrConfig, AbrController, HlsConfig, HlsManager, MediaStream, SegmentData, SelectionMode,
-    VariantId, VariantStream,
+    AbrController, HlsManager, HlsSettings, MediaStream, SegmentData, VariantId, VariantStream,
 };
 
 // Public API re-exports.

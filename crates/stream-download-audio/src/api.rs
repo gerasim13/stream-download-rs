@@ -8,7 +8,13 @@ separate modules; `lib.rs` should primarily re-export items from here.
 
 use std::time::Duration;
 
-use stream_download_hls::SelectionMode;
+/// Local selection mode to decouple AudioOptions from HLS crate exports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    Auto,
+    /// Manual mode by variant index (0-based).
+    Manual(usize),
+}
 
 /// Basic PCM specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

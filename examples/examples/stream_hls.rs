@@ -8,9 +8,7 @@ use rodio::{OutputStreamBuilder, Sink};
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
-use stream_download_hls::{
-    AbrConfig, HlsConfig, HlsStream, HlsStreamParams, SelectionMode, VariantId,
-};
+use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams, VariantId};
 use tracing::metadata::LevelFilter;
 use tracing::trace;
 use tracing_subscriber::EnvFilter;
@@ -29,14 +27,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
     let manual_variant_idx = 3;
-    let selection_mode = SelectionMode::Manual(VariantId(manual_variant_idx));
-
-    let params = HlsStreamParams::new(
-        url,
-        HlsConfig::default(),
-        AbrConfig::default(),
-        selection_mode,
-    );
+    let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
+    let params = HlsStreamParams::new(url, settings);
 
     let reader = match StreamDownload::new::<HlsStream>(
         params,

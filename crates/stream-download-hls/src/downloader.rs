@@ -16,61 +16,6 @@ use stream_download::http::reqwest::Client as ReqwestClient;
 use stream_download::http::reqwest::Url;
 use stream_download::source::{DecodeError, SourceStream};
 
-/// Configuration for HTTP requests made by [`ResourceDownloader`].
-#[derive(Debug, Clone)]
-pub struct DownloaderConfig {
-    /// Timeout for the entire request/collection (per attempt).
-    /// Default: 30 seconds.
-    pub request_timeout: Duration,
-
-    /// Maximum number of retry attempts for failed requests.
-    /// Default: 3 retries.
-    pub max_retries: u32,
-
-    /// Base delay for exponential backoff between retries.
-    /// Default: 100ms.
-    pub retry_base_delay: Duration,
-
-    /// Maximum delay between retries (caps exponential growth).
-    /// Default: 5 seconds.
-    pub max_retry_delay: Duration,
-}
-
-impl Default for DownloaderConfig {
-    fn default() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(30),
-            max_retries: 3,
-            retry_base_delay: Duration::from_millis(100),
-            max_retry_delay: Duration::from_secs(5),
-        }
-    }
-}
-
-impl DownloaderConfig {
-    /// Create configuration optimized for mobile devices.
-    /// Uses shorter timeouts and more aggressive retries to handle flaky mobile networks.
-    pub fn mobile() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(15),
-            max_retries: 5,
-            retry_base_delay: Duration::from_millis(50),
-            max_retry_delay: Duration::from_secs(3),
-        }
-    }
-
-    /// Create configuration for low-latency live streaming.
-    /// Uses shorter timeouts and fewer retries to maintain low latency.
-    pub fn low_latency() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(5),
-            max_retries: 1,
-            retry_base_delay: Duration::from_millis(50),
-            max_retry_delay: Duration::from_millis(500),
-        }
-    }
-}
-
 /// Async HTTP resource downloader optimized for HLS streaming.
 ///
 /// This downloader delegates HTTP I/O to `stream-download`'s `HttpStream` to:
@@ -82,24 +27,57 @@ impl DownloaderConfig {
 /// playlists and encryption keys (returned as `Bytes` instead of `Vec<u8>`).
 #[derive(Debug, Clone)]
 pub struct ResourceDownloader {
-    /// Configuration for requests and retry behavior.
-    config: DownloaderConfig,
+    // Flattened configuration for requests and retry behavior.
+    request_timeout: Duration,
+    max_retries: u32,
+    retry_base_delay: Duration,
+    max_retry_delay: Duration,
 }
 
 impl ResourceDownloader {
-    /// Create a new downloader with the given configuration.
-    pub fn new(config: DownloaderConfig) -> Self {
-        Self { config }
+    /// Create a new downloader with the given configuration values.
+    pub fn new(
+        request_timeout: Duration,
+        max_retries: u32,
+        retry_base_delay: Duration,
+        max_retry_delay: Duration,
+    ) -> Self {
+        Self {
+            request_timeout,
+            max_retries,
+            retry_base_delay,
+            max_retry_delay,
+        }
     }
 
     /// Create a downloader with default configuration.
     pub fn new_default() -> Self {
-        Self::new(DownloaderConfig::default())
+        Self {
+            request_timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(100),
+            max_retry_delay: Duration::from_secs(5),
+        }
     }
 
-    /// Get a reference to the configuration.
-    pub fn config(&self) -> &DownloaderConfig {
-        &self.config
+    /// Create a downloader optimized for mobile networks.
+    pub fn mobile() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(15),
+            max_retries: 5,
+            retry_base_delay: Duration::from_millis(50),
+            max_retry_delay: Duration::from_secs(3),
+        }
+    }
+
+    /// Create a downloader optimized for low-latency live streaming.
+    pub fn low_latency() -> Self {
+        Self {
+            request_timeout: Duration::from_secs(5),
+            max_retries: 1,
+            retry_base_delay: Duration::from_millis(50),
+            max_retry_delay: Duration::from_millis(500),
+        }
     }
 
     // ----------------------------
@@ -179,9 +157,9 @@ impl ResourceDownloader {
         cancel: Option<&CancellationToken>,
     ) -> HlsResult<Bytes> {
         let mut last_error: Option<HlsError> = None;
-        let mut delay = self.config.retry_base_delay;
+        let mut delay = self.retry_base_delay;
 
-        for attempt in 0..=self.config.max_retries {
+        for attempt in 0..=self.max_retries {
             // Check cancellation before each attempt
             if let Some(token) = cancel {
                 if token.is_cancelled() {
@@ -204,7 +182,7 @@ impl ResourceDownloader {
                     last_error = Some(e);
 
                     // Don't sleep after the last attempt
-                    if attempt < self.config.max_retries {
+                    if attempt < self.max_retries {
                         // Sleep with cancellation support
                         if let Some(token) = cancel {
                             tokio::select! {
@@ -215,7 +193,7 @@ impl ResourceDownloader {
                         } else {
                             tokio::time::sleep(delay).await;
                         }
-                        delay = (delay * 2).min(self.config.max_retry_delay);
+                        delay = (delay * 2).min(self.max_retry_delay);
                     }
                 }
             }
@@ -235,7 +213,7 @@ impl ResourceDownloader {
 
         // Collect all chunks with a global timeout and optional cancellation
         let collect_future = Self::collect_stream_to_bytes(http, cancel);
-        match timeout(self.config.request_timeout, collect_future).await {
+        match timeout(self.request_timeout, collect_future).await {
             Ok(res) => res,
             Err(_) => Err(HlsError::Timeout(url_str)),
         }
@@ -245,7 +223,7 @@ impl ResourceDownloader {
         // Use the default shared client via HttpStream::<C>::create.
         // On failures, map the error into HlsError using the DecodeError API.
         match timeout(
-            self.config.request_timeout,
+            self.request_timeout,
             HttpStream::<ReqwestClient>::create(url.clone()),
         )
         .await
@@ -369,10 +347,10 @@ impl ResourceDownloader {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => return Err(HlsError::Cancelled),
-                res = tokio::time::timeout(self.config.request_timeout, range_fut) => res,
+                res = tokio::time::timeout(self.request_timeout, range_fut) => res,
             }
         } else {
-            tokio::time::timeout(self.config.request_timeout, range_fut).await
+            tokio::time::timeout(self.request_timeout, range_fut).await
         };
 
         match response_res {
@@ -412,7 +390,7 @@ impl ResourceDownloader {
                 // As a last resort, perform a normal GET via HttpStream and read content_length
                 // from response headers (without consuming the body).
                 let http = match tokio::time::timeout(
-                    self.config.request_timeout,
+                    self.request_timeout,
                     HttpStream::<ReqwestClient>::create(url_parsed.clone()),
                 )
                 .await

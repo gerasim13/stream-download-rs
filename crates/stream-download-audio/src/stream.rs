@@ -99,10 +99,15 @@ impl AudioStream {
     pub async fn from_hls(
         url: impl Into<String>,
         opts: AudioOptions,
-        hls_config: stream_download_hls::HlsConfig,
-        abr_config: stream_download_hls::AbrConfig,
+        settings: stream_download_hls::HlsSettings,
     ) -> Self {
-        let producer = HlsPacketProducer::new(url, hls_config, abr_config, opts.selection_mode);
+        let settings = match opts.selection_mode {
+            crate::api::SelectionMode::Auto => settings.selection_auto(),
+            crate::api::SelectionMode::Manual(index) => {
+                settings.selection_manual(stream_download_hls::VariantId(index))
+            }
+        };
+        let producer = HlsPacketProducer::new(url, settings);
         Self::from_packet_producer(producer, opts, None).await
     }
 

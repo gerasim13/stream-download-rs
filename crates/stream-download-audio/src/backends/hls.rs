@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
-use stream_download_hls::{AbrConfig, HlsConfig, HlsStream, HlsStreamParams, SelectionMode};
+use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams};
 
 use crate::backends::common::{io_other, run_blocking_reading_loop};
 use crate::pipeline::Packet;
@@ -14,24 +14,15 @@ use crate::pipeline::Packet;
 /// HLS packet producer implementation.
 pub struct HlsPacketProducer {
     url: String,
-    hls_config: HlsConfig,
-    abr_config: AbrConfig,
-    selection_mode: SelectionMode,
+    settings: HlsSettings,
 }
 
 impl HlsPacketProducer {
     /// Create a new HLS packet producer.
-    pub fn new(
-        url: impl Into<String>,
-        hls_config: HlsConfig,
-        abr_config: AbrConfig,
-        selection_mode: SelectionMode,
-    ) -> Self {
+    pub fn new(url: impl Into<String>, settings: HlsSettings) -> Self {
         Self {
             url: url.into(),
-            hls_config,
-            abr_config,
-            selection_mode,
+            settings,
         }
     }
 }
@@ -50,12 +41,7 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
         out: AsyncSender<Packet>,
         cancel: Option<CancellationToken>,
     ) -> std::io::Result<()> {
-        let params = HlsStreamParams::new(
-            self.url.clone(),
-            self.hls_config.clone(),
-            self.abr_config.clone(),
-            self.selection_mode,
-        );
+        let params = HlsStreamParams::new(self.url.clone(), self.settings.clone());
 
         let reader = match StreamDownload::new::<HlsStream>(
             params,

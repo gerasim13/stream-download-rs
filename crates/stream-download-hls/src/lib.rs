@@ -32,21 +32,23 @@ mod manager;
 mod middleware;
 mod model;
 mod parser;
+mod settings;
 mod stream;
 mod traits;
 
-pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics, SelectionMode};
-pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
+pub use crate::abr::{AbrController, PlaybackMetrics};
+pub use crate::downloader::ResourceDownloader;
 
 pub use crate::manager::HlsManager;
 pub use crate::middleware::{
     Aes128CbcMiddleware, HlsByteStream, NoopMiddleware, StreamMiddleware, apply_middlewares,
 };
 pub use crate::model::{
-    HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
-    VariantId, VariantStream, diff_playlists,
+    HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment, VariantId,
+    VariantStream, diff_playlists,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
+pub use crate::settings::HlsSettings;
 pub use crate::stream::{HlsStream, HlsStreamError, HlsStreamParams};
 pub use crate::traits::{MediaStream, NextSegmentResult, SegmentData, SegmentType};
 
