@@ -28,10 +28,9 @@ use tokio::sync::mpsc::{self, error::SendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
-use crate::traits::NextSegmentResult;
 use crate::{
-    AbrConfig, AbrController, DownloaderConfig, HlsConfig, HlsManager, MediaStream,
-    ResourceDownloader, SegmentType, SelectionMode,
+    AbrConfig, AbrController, Aes128CbcMiddleware, DownloaderConfig, HlsConfig, HlsManager,
+    MediaStream, ResourceDownloader, SelectionMode, StreamMiddleware, apply_middlewares,
 };
 use stream_download::source::{DecodeError, SourceStream};
 use stream_download::storage::ContentLength;
@@ -157,6 +156,36 @@ impl From<SendError<u64>> for HlsStreamError {
 ///
 /// The stream produces raw bytes from HLS media segments. Higher-level components
 /// are responsible for handling init segments and variant switching metadata.
+/// Events emitted by the HLS streaming pipeline (out-of-band metadata).
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+    /// ABR: a new variant (rendition) has been selected. Emitted before the init segment.
+    VariantChanged {
+        variant_id: crate::model::VariantId,
+        codec_info: Option<crate::model::CodecInfo>,
+    },
+    /// Beginning of an init segment in the main byte stream.
+    /// byte_len may be None when exact length is unknown (e.g., due to DRM/middleware).
+    InitStart {
+        variant_id: crate::model::VariantId,
+        codec_info: Option<crate::model::CodecInfo>,
+        byte_len: Option<u64>,
+    },
+    /// End of the init segment in the main byte stream.
+    InitEnd { variant_id: crate::model::VariantId },
+    /// Optional: media segment boundaries (useful for metrics).
+    SegmentStart {
+        sequence: u64,
+        variant_id: crate::model::VariantId,
+        byte_len: Option<u64>,
+        duration: std::time::Duration,
+    },
+    SegmentEnd {
+        sequence: u64,
+        variant_id: crate::model::VariantId,
+    },
+}
+
 pub struct HlsStream {
     /// Channel receiver for stream data.
     data_receiver: mpsc::Receiver<Bytes>,
@@ -168,6 +197,8 @@ pub struct HlsStream {
     streaming_task: tokio::task::JoinHandle<()>,
     /// Whether the stream has finished (end of VOD stream reached).
     finished: bool,
+    /// Event broadcaster for out-of-band stream events.
+    event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
 }
 
 impl HlsStream {
@@ -211,6 +242,9 @@ impl HlsStream {
         let (seek_sender, seek_receiver) = mpsc::channel(1);
         let cancel_token = CancellationToken::new();
 
+        // Create event broadcast channel (out-of-band metadata)
+        let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(64);
+
         // Start background streaming task
         let streaming_task = Self::start_streaming_task(
             url,
@@ -221,6 +255,7 @@ impl HlsStream {
             data_sender,
             seek_receiver,
             cancel_token.clone(),
+            event_sender.clone(),
         )
         .await?;
 
@@ -230,7 +265,13 @@ impl HlsStream {
             cancel_token,
             streaming_task,
             finished: false,
+            event_sender,
         })
+    }
+
+    /// Subscribe to out-of-band stream events (variant changes, init boundaries, etc).
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<StreamEvent> {
+        self.event_sender.subscribe()
     }
 
     /// Start the background streaming task.
@@ -243,6 +284,7 @@ impl HlsStream {
         data_sender: mpsc::Sender<Bytes>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
+        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
         let task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
@@ -255,6 +297,7 @@ impl HlsStream {
                 data_sender,
                 seek_receiver,
                 cancel_token,
+                event_sender.clone(),
             )
             .await
             {
@@ -284,11 +327,19 @@ impl HlsStream {
         data_sender: mpsc::Sender<Bytes>,
         mut seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
+        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     ) -> Result<(), HlsStreamError> {
         let downloader_config = downloader_config.unwrap_or_default();
-        let downloader = ResourceDownloader::new(downloader_config);
+        // Keep reset clones for backward seek reinitialization
+        let reset_url = url.clone();
+        let reset_config = config.clone();
+        let reset_downloader_config = downloader_config.clone();
+        // Use a dedicated streaming downloader (avoid moving reset config)
+        let streaming_downloader = ResourceDownloader::new(downloader_config.clone());
+        // Separate downloader instance for manager to avoid moving the streaming downloader
+        let manager_downloader = ResourceDownloader::new(downloader_config);
 
-        let mut manager = HlsManager::new(url, config, downloader);
+        let mut manager = HlsManager::new(url, config, manager_downloader);
 
         // Exponential backoff for retry logic
         let mut retry_delay = std::time::Duration::from_millis(100);
@@ -334,6 +385,8 @@ impl HlsStream {
         // Track current byte position and bytes to skip
         let mut current_position: u64 = 0;
         let mut bytes_to_skip: u64 = 0;
+        // Track current variant for event emission
+        let mut last_variant_id: Option<crate::model::VariantId> = None;
 
         // Main streaming loop
         loop {
@@ -360,15 +413,24 @@ impl HlsStream {
                 if position >= current_position {
                     bytes_to_skip = position - current_position;
                 } else {
-                    tracing::warn!("HLS streaming loop: backward seek not supported");
-                    return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
+                    let (desc, intra) = controller
+                        .inner_stream_mut()
+                        .resolve_position(position)
+                        .await
+                        .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                    controller
+                        .inner_stream_mut()
+                        .seek_to_descriptor(&desc)
+                        .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                    bytes_to_skip = intra;
+                    current_position = position.saturating_sub(intra);
                 }
                 drop(reserved_permit);
                 continue;
             }
 
-            // Fetch next segment using non-blocking method
-            let next_result = tokio::select! {
+            // Fetch next segment descriptor using non-blocking method
+            let next_desc = tokio::select! {
                 biased;
                 _ = cancel_token.cancelled() => {
                     return Err(HlsStreamError::Cancelled);
@@ -377,10 +439,21 @@ impl HlsStream {
                     if let Some(position) = seek {
                         tracing::trace!("HLS streaming loop: received seek to position {}", position);
                         if position >= current_position {
+                            // forward seek: skip bytes relative to current position
                             bytes_to_skip = position - current_position;
                         } else {
-                            tracing::warn!("HLS streaming loop: backward seek not supported");
-                            return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
+                            // precise backward seek using resolve_position
+                            let (desc, intra) = controller
+                                .inner_stream_mut()
+                                .resolve_position(position)
+                                .await
+                                .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                            controller
+                                .inner_stream_mut()
+                                .seek_to_descriptor(&desc)
+                                .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                            bytes_to_skip = intra;
+                            current_position = position.saturating_sub(intra);
                         }
                         drop(reserved_permit);
                         continue;
@@ -389,39 +462,233 @@ impl HlsStream {
                         break;
                     }
                 }
-                result = controller.next_segment_nonblocking() => result,
+                result = controller.inner_stream_mut().next_segment_descriptor_nonblocking() => result,
             };
 
-            match next_result {
-                Ok(NextSegmentResult::Segment(segment_type)) => {
+            match next_desc {
+                Ok(crate::manager::NextSegmentDescResult::Segment(desc)) => {
                     // Reset retry delay on success
                     retry_delay = std::time::Duration::from_millis(100);
 
-                    let (data, is_init) = match segment_type {
-                        SegmentType::Init(segment_data) => (segment_data.data, true),
-                        SegmentType::Media(segment_data) => (segment_data.data, false),
+                    // Determine segment size if needed for skip math
+                    let seg_size_opt = if desc.is_init {
+                        controller.inner_stream().segment_size(0)
+                    } else {
+                        controller.inner_stream().segment_size(desc.sequence)
+                    };
+                    let seg_size = if let Some(sz) = seg_size_opt {
+                        Some(sz)
+                    } else {
+                        // Try probing if unknown
+                        match controller
+                            .inner_stream_mut()
+                            .probe_and_record_segment_size(
+                                if desc.is_init { 0 } else { desc.sequence },
+                                &desc.uri,
+                            )
+                            .await
+                        {
+                            Ok(s) => s,
+                            Err(_) => None, // best effort
+                        }
                     };
 
-                    if Self::send_data_with_skip(
-                        data,
-                        &mut bytes_to_skip,
-                        &mut current_position,
-                        &data_sender,
-                        is_init,
-                        Some(reserved_permit),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::trace!("HLS stream: receiver dropped, stopping");
-                        break;
+                    // Handle full-segment skip if we have enough bytes_to_skip and know size
+                    if let (Some(size), true) = (seg_size, bytes_to_skip > 0) {
+                        if bytes_to_skip >= size {
+                            bytes_to_skip -= size;
+                            current_position += size;
+                            drop(reserved_permit);
+                            continue;
+                        }
+                    }
+
+                    // Resolve DRM (AES-128-CBC) parameters before emitting events or building middlewares
+                    let drm_params_opt = controller
+                        .inner_stream_mut()
+                        .resolve_aes128_cbc_params(
+                            desc.key.as_ref(),
+                            if desc.is_init {
+                                None
+                            } else {
+                                Some(desc.sequence)
+                            },
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let drm_applied = drm_params_opt.is_some();
+
+                    // Emit events around init boundaries and variant changes
+                    if desc.is_init {
+                        // If variant changed, emit VariantChanged before InitStart
+                        if last_variant_id != Some(desc.variant_id) {
+                            let _ = event_sender.send(StreamEvent::VariantChanged {
+                                variant_id: desc.variant_id,
+                                codec_info: desc.codec_info.clone(),
+                            });
+                            last_variant_id = Some(desc.variant_id);
+                        }
+                        // For init, if DRM is applied the exact byte length after decryption is unknown -> None
+                        let init_len_opt = if drm_applied {
+                            None
+                        } else {
+                            controller.inner_stream().segment_size(0)
+                        };
+                        let _ = event_sender.send(StreamEvent::InitStart {
+                            variant_id: desc.variant_id,
+                            codec_info: desc.codec_info.clone(),
+                            byte_len: init_len_opt,
+                        });
+                    } else {
+                        // Media segment: if variant changed and there is no init, still notify
+                        if last_variant_id != Some(desc.variant_id) {
+                            let _ = event_sender.send(StreamEvent::VariantChanged {
+                                variant_id: desc.variant_id,
+                                codec_info: desc.codec_info.clone(),
+                            });
+                            last_variant_id = Some(desc.variant_id);
+                        }
+                        // Emit segment start with known length if available
+                        let _ = event_sender.send(StreamEvent::SegmentStart {
+                            sequence: desc.sequence,
+                            variant_id: desc.variant_id,
+                            byte_len: seg_size,
+                            duration: desc.duration,
+                        });
+                    }
+
+                    // Build a stream according to skip and init rules
+                    let stream_res = if bytes_to_skip > 0 && !desc.is_init {
+                        let start = bytes_to_skip;
+                        bytes_to_skip = 0;
+                        streaming_downloader
+                            .stream_segment_range(&desc.uri, start, None)
+                            .await
+                    } else {
+                        // For init segments, we always send the full segment even if skip is inside it
+                        streaming_downloader.stream_segment(&desc.uri).await
+                    };
+
+                    let mut stream = match stream_res {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to open segment stream: {}, retrying in {:?}",
+                                e,
+                                retry_delay
+                            );
+                            drop(reserved_permit);
+                            tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => return Err(HlsStreamError::Cancelled),
+                                _ = tokio::time::sleep(retry_delay) => {}
+                            }
+                            retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                            continue;
+                        }
+                    };
+                    // Apply streaming middlewares (DRM, etc.)
+                    let mut middlewares: Vec<Arc<dyn StreamMiddleware>> = Vec::new();
+                    if let Some((key, iv)) = drm_params_opt {
+                        middlewares.push(Arc::new(Aes128CbcMiddleware::new(key, iv)));
+                    }
+                    let mut stream = apply_middlewares(stream, &middlewares);
+
+                    // Send incoming chunks, interleaving cancellation and seek handling
+                    let mut first_permit = Some(reserved_permit);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_token.cancelled() => {
+                                return Err(HlsStreamError::Cancelled);
+                            }
+                            // Concurrently react to a seek during streaming a segment
+                            seek = seek_receiver.recv() => {
+                                if let Some(position) = seek {
+                                    tracing::trace!("HLS streaming loop: received seek during streaming");
+                                    if position >= current_position {
+                                        bytes_to_skip = position - current_position;
+                                    } else {
+                                        let (desc, intra) = controller
+                                            .inner_stream_mut()
+                                            .resolve_position(position)
+                                            .await
+                                            .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                                        controller
+                                            .inner_stream_mut()
+                                            .seek_to_descriptor(&desc)
+                                            .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                                        bytes_to_skip = intra;
+                                        current_position = position.saturating_sub(intra);
+                                        // break to apply new position on next iteration
+                                    }
+                                    break;
+                                } else {
+                                    tracing::trace!("HLS stream: seek channel closed");
+                                    break;
+                                }
+                            }
+                            item = futures_util::StreamExt::next(&mut stream) => {
+                                match item {
+                                    Some(Ok(chunk)) => {
+                                        // Send chunk
+                                        let permit = match first_permit.take() {
+                                            Some(p) => p,
+                                            None => match data_sender.reserve().await {
+                                                Ok(p) => p,
+                                                Err(_) => { tracing::trace!("HLS stream: receiver dropped, stopping"); break; }
+                                            },
+                                        };
+                                        let len = chunk.len() as u64;
+                                        permit.send(chunk);
+                                        current_position = current_position.saturating_add(len);
+                                    }
+                                    Some(Err(e)) => {
+                                        tracing::error!("Error reading segment chunk: {}, retrying in {:?}", e, retry_delay);
+                                        tokio::select! {
+                                            biased;
+                                            _ = cancel_token.cancelled() => return Err(HlsStreamError::Cancelled),
+                                            _ = tokio::time::sleep(retry_delay) => {}
+                                        }
+                                        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                                        break;
+                                    }
+                                    None => {
+                                        // Segment finished
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Emit segment boundary events after finishing streaming
+                    if desc.is_init {
+                        let _ = event_sender.send(StreamEvent::InitEnd {
+                            variant_id: desc.variant_id,
+                        });
+                    } else {
+                        let _ = event_sender.send(StreamEvent::SegmentEnd {
+                            sequence: desc.sequence,
+                            variant_id: desc.variant_id,
+                        });
+                    }
+
+                    // If we had a known segment size and current_position didn't advance fully (e.g., due to skipping inside init),
+                    // ensure current_position accounts for the whole segment (to keep consistent semantics with previous implementation).
+                    if let Some(size) = seg_size {
+                        // No-op if we've already advanced >= size within this segment context
+                        // This is best-effort; exact accounting happens via per-chunk increments above.
+                        let _ = size;
                     }
                 }
-                Ok(NextSegmentResult::EndOfStream) => {
+                Ok(crate::manager::NextSegmentDescResult::EndOfStream) => {
                     tracing::trace!("HLS stream: end of stream");
                     break;
                 }
-                Ok(NextSegmentResult::NeedsRefresh { wait }) => {
+                Ok(crate::manager::NextSegmentDescResult::NeedsRefresh { wait }) => {
                     // Live stream needs to wait for new segments
                     // Use select! for proper cancellation during wait
                     drop(reserved_permit);
@@ -437,7 +704,17 @@ impl HlsStream {
                                 if position >= current_position {
                                     bytes_to_skip = position - current_position;
                                 } else {
-                                    return Err(HlsStreamError::Hls(HlsErrorKind::BackwardSeekNotSupported));
+                                    let (desc, intra) = controller
+                                        .inner_stream_mut()
+                                        .resolve_position(position)
+                                        .await
+                                        .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                                    controller
+                                        .inner_stream_mut()
+                                        .seek_to_descriptor(&desc)
+                                        .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                                    bytes_to_skip = intra;
+                                    current_position = position.saturating_sub(intra);
                                 }
                             }
                             // Continue to next iteration regardless
@@ -449,7 +726,7 @@ impl HlsStream {
                 }
                 Err(e) => {
                     tracing::error!(
-                        "Failed to get next segment: {}, retrying in {:?}",
+                        "Failed to get next segment descriptor: {}, retrying in {:?}",
                         e,
                         retry_delay
                     );
@@ -540,6 +817,10 @@ impl HlsStream {
     }
 
     /// Seek to a specific position in the stream.
+    ///
+    /// Position is an absolute byte offset from the beginning of the concatenated stream.
+    /// Supports forward and backward seeks. Backward seek will reset the internal controller
+    /// state and replay from the start using byte-range where possible.
     async fn seek_internal(&self, position: u64) -> Result<(), HlsStreamError> {
         self.seek_sender.send(position).await?;
         Ok(())

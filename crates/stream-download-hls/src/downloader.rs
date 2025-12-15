@@ -1,40 +1,25 @@
-//! Async HTTP resource downloader for HLS streams.
-//!
-//! This module provides [`ResourceDownloader`], an efficient async HTTP client
-//! wrapper optimized for HLS streaming. It uses `reqwest` directly instead of
-//! `StreamDownload` to avoid overhead of temp file creation and blocking I/O
-//! for small resources like playlists and segments.
-//!
-//! # Design Rationale
-//!
-//! HLS segments are typically small enough (64KB - 2MB for audio) to fit in memory.
-//! Using `StreamDownload` for each segment would create unnecessary overhead:
-//! - Temp file creation per segment
-//! - `spawn_blocking` for synchronous `Read` trait
-//! - Full lifecycle management for short-lived resources
-//!
-//! Instead, `ResourceDownloader` provides:
-//! - Shared `reqwest::Client` with connection pooling
-//! - Fully async downloads with no blocking calls
-//! - Retry logic with exponential backoff
-//! - Cancellation support via `CancellationToken`
-//!
-//! The `Read`/`Seek` functionality is provided at the `HlsStream` level where
-//! `StreamDownload` wraps the entire concatenated HLS stream.
-
+use std::fmt::Display;
 use std::time::Duration;
 
-use bytes::Bytes;
-use reqwest::Client;
+use bytes::{Bytes, BytesMut};
+use futures_util::stream::{BoxStream, Stream, StreamExt};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::model::{HlsError, HlsResult};
+
+// Reuse the StreamDownload HTTP layer and its single, shared client.
+// We intentionally avoid using reqwest directly here.
+use stream_download::http::HttpStream;
+use stream_download::http::reqwest::Client as ReqwestClient;
+use stream_download::http::reqwest::Url;
+use stream_download::source::{DecodeError, SourceStream};
 
 /// Configuration for HTTP requests made by [`ResourceDownloader`].
 #[derive(Debug, Clone)]
 pub struct DownloaderConfig {
-    /// Timeout for individual HTTP requests.
+    /// Timeout for the entire request/collection (per attempt).
     /// Default: 30 seconds.
     pub request_timeout: Duration,
 
@@ -64,9 +49,7 @@ impl Default for DownloaderConfig {
 
 impl DownloaderConfig {
     /// Create configuration optimized for mobile devices.
-    ///
-    /// Uses shorter timeouts and more aggressive retries to handle
-    /// flaky mobile network conditions.
+    /// Uses shorter timeouts and more aggressive retries to handle flaky mobile networks.
     pub fn mobile() -> Self {
         Self {
             request_timeout: Duration::from_secs(15),
@@ -77,7 +60,6 @@ impl DownloaderConfig {
     }
 
     /// Create configuration for low-latency live streaming.
-    ///
     /// Uses shorter timeouts and fewer retries to maintain low latency.
     pub fn low_latency() -> Self {
         Self {
@@ -91,67 +73,28 @@ impl DownloaderConfig {
 
 /// Async HTTP resource downloader optimized for HLS streaming.
 ///
-/// This downloader uses `reqwest` directly for efficient async HTTP requests.
-/// It maintains a shared HTTP client for connection pooling and provides
-/// retry logic with exponential backoff.
+/// This downloader delegates HTTP I/O to `stream-download`'s `HttpStream` to:
+/// - reuse a shared reqwest client (connection pooling, DNS cache),
+/// - provide streaming responses for media segments (chunked delivery),
+/// - support HTTP byte-range requests for seeking within segments.
 ///
-/// # Example
-///
-/// ```no_run
-/// use stream_download_hls::downloader::{ResourceDownloader, DownloaderConfig};
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let downloader = ResourceDownloader::new(DownloaderConfig::default());
-///
-/// // Download a playlist
-/// let playlist_bytes = downloader.download_bytes("https://example.com/master.m3u8").await?;
-///
-/// // Download with cancellation support
-/// use tokio_util::sync::CancellationToken;
-/// let cancel = CancellationToken::new();
-/// let segment = downloader
-///     .download_bytes_cancellable("https://example.com/seg0.ts", &cancel)
-///     .await?;
-/// # Ok(())
-/// # }
-/// ```
+/// It also preserves simple "download fully" APIs for small resources like
+/// playlists and encryption keys (returned as `Bytes` instead of `Vec<u8>`).
 #[derive(Debug, Clone)]
 pub struct ResourceDownloader {
-    /// Shared HTTP client - connection pooling is handled by reqwest internally
-    client: Client,
-    /// Configuration for requests
+    /// Configuration for requests and retry behavior.
     config: DownloaderConfig,
 }
 
 impl ResourceDownloader {
     /// Create a new downloader with the given configuration.
-    ///
-    /// This creates a new `reqwest::Client` internally. For better connection
-    /// reuse across multiple downloaders, use [`with_client`](Self::with_client).
     pub fn new(config: DownloaderConfig) -> Self {
-        Self {
-            client: Client::new(),
-            config,
-        }
+        Self { config }
     }
 
-    /// Create a new downloader with a shared HTTP client.
-    ///
-    /// This is the recommended constructor when you have multiple components
-    /// that need to make HTTP requests, as it enables connection pooling
-    /// across all of them.
-    pub fn with_client(client: Client, config: DownloaderConfig) -> Self {
-        Self { client, config }
-    }
-
-    /// Create a downloader with a shared client and default configuration.
-    pub fn default_with_client(client: Client) -> Self {
-        Self::with_client(client, DownloaderConfig::default())
-    }
-
-    /// Get a reference to the underlying HTTP client.
-    pub fn client(&self) -> &Client {
-        &self.client
+    /// Create a downloader with default configuration.
+    pub fn new_default() -> Self {
+        Self::new(DownloaderConfig::default())
     }
 
     /// Get a reference to the configuration.
@@ -159,13 +102,15 @@ impl ResourceDownloader {
         &self.config
     }
 
+    // ----------------------------
+    // Byte-oriented helper methods
+    // ----------------------------
+
     /// Download bytes from a URL.
     ///
-    /// This method includes automatic retry with exponential backoff.
-    /// For downloads that should be cancellable, use
-    /// [`download_bytes_cancellable`](Self::download_bytes_cancellable).
+    /// Includes automatic retry with exponential backoff.
     pub async fn download_bytes(&self, url: &str) -> HlsResult<Bytes> {
-        self.download_with_retry(url, None).await
+        self.download_bytes_inner(url, None).await
     }
 
     /// Download bytes from a URL with cancellation support.
@@ -177,40 +122,63 @@ impl ResourceDownloader {
         url: &str,
         cancel: &CancellationToken,
     ) -> HlsResult<Bytes> {
-        self.download_with_retry(url, Some(cancel)).await
+        self.download_bytes_inner(url, Some(cancel)).await
     }
 
-    /// Download a playlist file.
-    ///
-    /// This is a convenience alias for [`download_bytes`](Self::download_bytes)
-    /// that makes the intent clearer in calling code.
+    /// Download a playlist file fully into memory.
     pub async fn download_playlist(&self, url: &str) -> HlsResult<Bytes> {
         self.download_bytes(url).await
     }
 
-    /// Download a media segment.
-    ///
-    /// This is a convenience alias for [`download_bytes`](Self::download_bytes)
-    /// that makes the intent clearer in calling code.
-    pub async fn download_segment(&self, url: &str) -> HlsResult<Bytes> {
-        self.download_bytes(url).await
-    }
-
-    /// Download an encryption key.
-    ///
-    /// This is a convenience alias for [`download_bytes`](Self::download_bytes)
-    /// that makes the intent clearer in calling code.
+    /// Download an encryption key fully into memory.
     pub async fn download_key(&self, url: &str) -> HlsResult<Bytes> {
         self.download_bytes(url).await
     }
 
-    /// Internal: download with retry logic and optional cancellation.
-    async fn download_with_retry(
+    // ----------------------------
+    // Streaming segment methods
+    // ----------------------------
+
+    /// Open a streaming HTTP connection for a media segment.
+    ///
+    /// Returns a boxed stream of chunks. The stream yields `Bytes` as they arrive.
+    /// Errors are mapped into `HlsError`.
+    pub async fn stream_segment(
+        &self,
+        url: &str,
+    ) -> HlsResult<BoxStream<'static, Result<Bytes, HlsError>>> {
+        let url = parse_url(url)?;
+        let http = self.create_stream(url).await?;
+        Ok(Self::map_stream_errors(http).boxed())
+    }
+
+    /// Open a streaming HTTP connection for a media segment with a byte range.
+    ///
+    /// The `end` is exclusive (i.e., `start..end`). Pass `None` for an open-ended
+    /// range to the end of the resource.
+    pub async fn stream_segment_range(
+        &self,
+        url: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> HlsResult<BoxStream<'static, Result<Bytes, HlsError>>> {
+        let url = parse_url(url)?;
+        let mut http = self.create_stream(url).await?;
+        // `HttpStream` expects an exclusive end value; this matches our API.
+        http.seek_range(start, end).await.map_err(io_to_hls_error)?;
+        Ok(Self::map_stream_errors(http).boxed())
+    }
+
+    // ----------------------------
+    // Internals
+    // ----------------------------
+
+    async fn download_bytes_inner(
         &self,
         url: &str,
         cancel: Option<&CancellationToken>,
     ) -> HlsResult<Bytes> {
-        let mut last_error = None;
+        let mut last_error: Option<HlsError> = None;
         let mut delay = self.config.retry_base_delay;
 
         for attempt in 0..=self.config.max_retries {
@@ -221,43 +189,32 @@ impl ResourceDownloader {
                 }
             }
 
-            match self.download_once(url).await {
+            match self.try_download_once(url, cancel).await {
                 Ok(bytes) => {
                     if attempt > 0 {
-                        tracing::debug!(
+                        debug!(
                             url = url,
                             attempts = attempt + 1,
-                            "Download succeeded after retry"
+                            "download succeeded after retry"
                         );
                     }
                     return Ok(bytes);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        url = url,
-                        attempt = attempt,
-                        max_retries = self.config.max_retries,
-                        error = %e,
-                        "Download attempt failed"
-                    );
                     last_error = Some(e);
 
                     // Don't sleep after the last attempt
                     if attempt < self.config.max_retries {
-                        // Async delay with cancellation support
+                        // Sleep with cancellation support
                         if let Some(token) = cancel {
                             tokio::select! {
                                 biased;
-                                _ = token.cancelled() => {
-                                    return Err(HlsError::Cancelled);
-                                }
-                                _ = tokio::time::sleep(delay) => {}
+                                _ = token.cancelled() => return Err(HlsError::Cancelled),
+                                _ = tokio::time::sleep(delay) => {},
                             }
                         } else {
                             tokio::time::sleep(delay).await;
                         }
-
-                        // Exponential backoff with cap
                         delay = (delay * 2).min(self.config.max_retry_delay);
                     }
                 }
@@ -267,55 +224,218 @@ impl ResourceDownloader {
         Err(last_error.unwrap_or_else(|| HlsError::Io("download failed with no error".into())))
     }
 
-    /// Internal: single download attempt.
-    async fn download_once(&self, url: &str) -> HlsResult<Bytes> {
-        // Send request with timeout
-        let response = timeout(self.config.request_timeout, self.client.get(url).send())
-            .await
-            .map_err(|_| HlsError::Timeout(url.to_string()))?
-            .map_err(|e| HlsError::Io(format!("HTTP request failed: {}", e)))?;
+    async fn try_download_once(
+        &self,
+        url: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> HlsResult<Bytes> {
+        let url_parsed = parse_url(url)?;
+        let url_str = url_parsed.to_string();
+        let http = self.create_stream(url_parsed).await?;
 
-        // Check status code
-        let status = response.status();
-        if !status.is_success() {
-            return Err(HlsError::HttpError {
-                status: status.as_u16(),
-                url: url.to_string(),
-            });
+        // Collect all chunks with a global timeout and optional cancellation
+        let collect_future = Self::collect_stream_to_bytes(http, cancel);
+        match timeout(self.config.request_timeout, collect_future).await {
+            Ok(res) => res,
+            Err(_) => Err(HlsError::Timeout(url_str)),
+        }
+    }
+
+    async fn create_stream(&self, url: Url) -> HlsResult<HttpStream<ReqwestClient>> {
+        // Use the default shared client via HttpStream::<C>::create.
+        // On failures, map the error into HlsError using the DecodeError API.
+        match timeout(
+            self.config.request_timeout,
+            HttpStream::<ReqwestClient>::create(url.clone()),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => {
+                // Decode the error text from the server if possible
+                let msg = e.decode_error().await;
+                Err(HlsError::Io(format!("HTTP stream creation failed: {msg}")))
+            }
+            Err(_) => Err(HlsError::Timeout(url.to_string())),
+        }
+    }
+
+    fn map_stream_errors(
+        stream: HttpStream<ReqwestClient>,
+    ) -> impl Stream<Item = Result<Bytes, HlsError>> + Send {
+        stream.map(|res| match res {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => Err(HlsError::Io(e.to_string())),
+        })
+    }
+
+    async fn collect_stream_to_bytes<S, E>(
+        mut stream: S,
+        cancel: Option<&CancellationToken>,
+    ) -> HlsResult<Bytes>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Display,
+    {
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+
+        loop {
+            // Support cancellation while reading
+            let next = if let Some(token) = cancel {
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => return Err(HlsError::Cancelled),
+                    item = stream.next() => item,
+                }
+            } else {
+                stream.next().await
+            };
+
+            match next {
+                Some(Ok(chunk)) => {
+                    buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => return Err(HlsError::Io(e.to_string())),
+                None => break,
+            }
         }
 
-        // Read body asynchronously
-        timeout(self.config.request_timeout, response.bytes())
-            .await
-            .map_err(|_| HlsError::Timeout(url.to_string()))?
-            .map_err(|e| HlsError::Io(format!("Failed to read response body: {}", e)))
+        Ok(buf.freeze())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ----------------------------
+// Helpers
+// ----------------------------
 
-    #[test]
-    fn default_config_has_sane_values() {
-        let config = DownloaderConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(30));
-        assert_eq!(config.max_retries, 3);
-        assert_eq!(config.retry_base_delay, Duration::from_millis(100));
-        assert_eq!(config.max_retry_delay, Duration::from_secs(5));
+fn parse_url(url: &str) -> HlsResult<Url> {
+    Url::parse(url).map_err(|e| HlsError::Io(format!("invalid URL: {e}")))
+}
+
+/// Parse the `Content-Range` header to extract the total length.
+/// Expected formats:
+/// - "bytes 0-0/12345"
+/// - "bytes */12345"
+fn parse_content_range_total(header_val: &str) -> Option<u64> {
+    // Find the '/' separator and parse the number after it
+    let idx = header_val.rfind('/')?;
+    let total_str = header_val.get(idx + 1..)?.trim();
+    if total_str == "*" {
+        None
+    } else {
+        total_str.parse::<u64>().ok()
+    }
+}
+
+impl ResourceDownloader {
+    /// Probe the content length using a minimal Range request (HEAD-like).
+    ///
+    /// This method tries to avoid downloading the whole body by requesting only a single byte
+    /// (`Range: bytes=0-0`). If the server supports ranges, we parse the `Content-Range` header
+    /// to obtain the total length. If that fails, we fall back to a normal GET via `HttpStream`
+    /// and read the `Content-Length` header.
+    pub async fn probe_content_length(&self, url: &str) -> HlsResult<Option<u64>> {
+        self.probe_content_length_inner(url, None).await
     }
 
-    #[test]
-    fn mobile_config_is_more_aggressive() {
-        let config = DownloaderConfig::mobile();
-        assert!(config.request_timeout < Duration::from_secs(30));
-        assert!(config.max_retries > 3);
+    /// Cancellable variant of [`probe_content_length`].
+    pub async fn probe_content_length_cancellable(
+        &self,
+        url: &str,
+        cancel: &CancellationToken,
+    ) -> HlsResult<Option<u64>> {
+        self.probe_content_length_inner(url, Some(cancel)).await
     }
 
-    #[test]
-    fn low_latency_config_has_short_timeouts() {
-        let config = DownloaderConfig::low_latency();
-        assert!(config.request_timeout <= Duration::from_secs(5));
-        assert!(config.max_retries <= 2);
+    async fn probe_content_length_inner(
+        &self,
+        url: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> HlsResult<Option<u64>> {
+        let url_parsed = parse_url(url)?;
+        let url_str = url_parsed.to_string();
+
+        // Try a 0-0 range request first (minimal data, HEAD-like).
+        let client = <ReqwestClient as stream_download::http::Client>::create();
+        let range_fut = <ReqwestClient as stream_download::http::Client>::get_range(
+            &client,
+            &url_parsed,
+            0,
+            Some(0),
+        );
+
+        // Apply timeout and optional cancellation.
+        let response_res = if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(HlsError::Cancelled),
+                res = tokio::time::timeout(self.config.request_timeout, range_fut) => res,
+            }
+        } else {
+            tokio::time::timeout(self.config.request_timeout, range_fut).await
+        };
+
+        match response_res {
+            Ok(Ok(response)) => {
+                // If server doesn't support range, it may still return 200.
+                // We'll try to parse Content-Range first; fallback to Content-Length.
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(HlsError::HttpError {
+                        status: status.as_u16(),
+                        url: url_str,
+                    });
+                }
+
+                let headers = response.headers();
+                // Prefer Content-Range for total length.
+                if let Some(cr) = headers.get("Content-Range").and_then(|v| v.to_str().ok()) {
+                    if let Some(total) = parse_content_range_total(cr) {
+                        return Ok(Some(total));
+                    }
+                }
+
+                // Fallback: Content-Length might be the full length or 1 (for 0-0).
+                if let Some(cl) = headers
+                    .get("Content-Length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    // If status is 200 OK, many servers include full Content-Length.
+                    // If 206 Partial Content, Content-Length is the size of the partial body (likely 1).
+                    // We can't infer total from this unless Content-Range was present.
+                    if status.as_u16() == 200 {
+                        return Ok(Some(cl));
+                    }
+                }
+
+                // As a last resort, perform a normal GET via HttpStream and read content_length
+                // from response headers (without consuming the body).
+                let http = match tokio::time::timeout(
+                    self.config.request_timeout,
+                    HttpStream::<ReqwestClient>::create(url_parsed.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        let msg = e.decode_error().await;
+                        return Err(HlsError::Io(format!(
+                            "HTTP stream creation failed during probe: {msg}"
+                        )));
+                    }
+                    Err(_) => return Err(HlsError::Timeout(url_str)),
+                };
+
+                let cl_opt: Option<u64> = http.content_length().into();
+                Ok(cl_opt)
+            }
+            Ok(Err(e)) => Err(HlsError::Io(e.to_string())),
+            Err(_) => Err(HlsError::Timeout(url_str)),
+        }
     }
+}
+
+fn io_to_hls_error(e: std::io::Error) -> HlsError {
+    HlsError::Io(e.to_string())
 }

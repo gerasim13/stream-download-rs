@@ -29,6 +29,7 @@ mod abr;
 mod crypto;
 mod downloader;
 mod manager;
+mod middleware;
 mod model;
 mod parser;
 mod stream;
@@ -38,6 +39,9 @@ pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics, SelectionMode};
 pub use crate::downloader::{DownloaderConfig, ResourceDownloader};
 
 pub use crate::manager::HlsManager;
+pub use crate::middleware::{
+    Aes128CbcMiddleware, HlsByteStream, NoopMiddleware, StreamMiddleware, apply_middlewares,
+};
 pub use crate::model::{
     HlsConfig, HlsError, HlsResult, MasterPlaylist, MediaPlaylist, MediaSegment, NewSegment,
     VariantId, VariantStream, diff_playlists,

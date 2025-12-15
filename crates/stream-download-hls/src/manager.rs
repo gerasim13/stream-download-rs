@@ -76,6 +76,8 @@ pub struct HlsManager {
     key_cache: HashMap<String, Bytes>,
     /// Cache of downloaded init segments by absolute URI with LRU eviction.
     init_segment_cache: LruCache<String, Bytes>,
+    /// Known sizes (in bytes) of media segments keyed by sequence.
+    segment_sizes: HashMap<u64, u64>,
 }
 
 #[allow(dead_code)]
@@ -110,6 +112,7 @@ impl HlsManager {
             init_segment_sent: false,
             key_cache: HashMap::with_capacity(4), // Usually 1-2 keys
             init_segment_cache: LruCache::new(NonZeroUsize::new(8).unwrap()), // Keep last 8 init segments
+            segment_sizes: HashMap::new(),
         }
     }
 
@@ -241,10 +244,11 @@ impl HlsManager {
             let data = if let Some(cached) = self.init_segment_cache.get(&resolved_uri) {
                 cached.clone()
             } else {
-                let downloaded = bytes::Bytes::from(
-                    self.download_segment(&init_segment.uri, init_segment.key.as_ref(), None)
-                        .await?,
-                );
+                let downloaded = self
+                    .download_segment(&init_segment.uri, init_segment.key.as_ref(), None)
+                    .await?;
+                // Record init segment size for seek map
+                self.set_segment_size(0, downloaded.len() as u64);
                 self.init_segment_cache
                     .put(resolved_uri.clone(), downloaded.clone());
                 downloaded
@@ -269,10 +273,11 @@ impl HlsManager {
     ) -> HlsResult<crate::traits::SegmentType> {
         let codec_info = self.current_codec_info()?;
 
-        let data = Bytes::from(
-            self.download_segment(&seg.uri, seg.key.as_ref(), Some(seg.sequence))
-                .await?,
-        );
+        let data = self
+            .download_segment(&seg.uri, seg.key.as_ref(), Some(seg.sequence))
+            .await?;
+        // Record media segment size for seek map
+        self.set_segment_size(seg.sequence, data.len() as u64);
 
         self.next_segment_index += 1;
 
@@ -299,6 +304,31 @@ impl HlsManager {
     /// Return the currently cached media playlist for the selected variant.
     pub fn current_media_playlist(&self) -> Option<&MediaPlaylist> {
         self.current_media_playlist.as_ref()
+    }
+
+    /// Get known size (in bytes) for a media segment by sequence number.
+    pub fn segment_size(&self, sequence: u64) -> Option<u64> {
+        self.segment_sizes.get(&sequence).copied()
+    }
+
+    /// Record observed media segment size (in bytes).
+    pub fn set_segment_size(&mut self, sequence: u64, size: u64) {
+        self.segment_sizes.insert(sequence, size);
+    }
+
+    /// Probe and record the content length for the given segment URI.
+    /// Returns the discovered size if available.
+    pub async fn probe_and_record_segment_size(
+        &mut self,
+        sequence: u64,
+        uri: &str,
+    ) -> HlsResult<Option<u64>> {
+        let resolved_url = self.resolve_url(uri)?;
+        let size_opt = self.downloader.probe_content_length(&resolved_url).await?;
+        if let Some(size) = size_opt {
+            self.segment_sizes.insert(sequence, size);
+        }
+        Ok(size_opt)
     }
 
     /// Load and parse the master playlist.
@@ -477,12 +507,19 @@ impl HlsManager {
         }
     }
 
-    async fn decrypt_segment_if_needed(
+    /// Resolve AES-128-CBC decryption parameters (key, iv) for a segment.
+    ///
+    /// Returns `Ok(Some((key, iv)))` when the provided `key` indicates AES-128 and the
+    /// key material can be fetched and validated (16 bytes). Returns `Ok(None)` when
+    /// no decryption is necessary (no key or unsupported method).
+    ///
+    /// This method is intended to be used by streaming middleware in order to
+    /// construct a per-segment decryptor without buffering the entire segment.
+    pub async fn resolve_aes128_cbc_params(
         &mut self,
-        data: Bytes,
         key: Option<&SegmentKey>,
         sequence: Option<u64>,
-    ) -> HlsResult<Bytes> {
+    ) -> HlsResult<Option<([u8; 16], [u8; 16])>> {
         if let Some(seg_key) = key {
             if matches!(seg_key.method, EncryptionMethod::Aes128) {
                 if let Some(ref key_info) = seg_key.key_info {
@@ -490,15 +527,31 @@ impl HlsManager {
                         let abs_key_url = self.resolve_url(key_uri)?;
                         let final_key_url = self.finalize_key_url(&abs_key_url)?;
                         let key_bytes = self.fetch_key_bytes(&final_key_url).await?;
+                        if key_bytes.len() != 16 {
+                            return Err(HlsError::Message(format!(
+                                "invalid AES-128 key length: expected 16, got {}",
+                                key_bytes.len()
+                            )));
+                        }
+                        let mut key_arr = [0u8; 16];
+                        key_arr.copy_from_slice(&key_bytes);
                         let iv = Self::compute_iv(key_info, sequence);
-                        let decrypted =
-                            crate::crypto::decrypt_aes128_cbc_full(key_bytes.as_ref(), &iv, data)?;
-                        return Ok(decrypted);
+                        return Ok(Some((key_arr, iv)));
                     }
                 }
             }
         }
+        Ok(None)
+    }
 
+    async fn decrypt_segment_if_needed(
+        &mut self,
+        data: Bytes,
+        _key: Option<&SegmentKey>,
+        _sequence: Option<u64>,
+    ) -> HlsResult<Bytes> {
+        // TODO: DRM decryption will be implemented via streaming middleware.
+        // For now, pass-through bytes unchanged.
         Ok(data)
     }
 
@@ -507,11 +560,264 @@ impl HlsManager {
         uri: &str,
         key: Option<&SegmentKey>,
         sequence: Option<u64>,
-    ) -> HlsResult<Vec<u8>> {
+    ) -> HlsResult<Bytes> {
         let resolved_url = self.resolve_url(uri)?;
-        let data = self.downloader.download_segment(&resolved_url).await?;
+        let data = self.downloader.download_bytes(&resolved_url).await?;
         let data = self.decrypt_segment_if_needed(data, key, sequence).await?;
-        Ok(data.to_vec())
+        Ok(data)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SegmentDescriptor {
+    pub uri: String,
+    pub sequence: u64,
+    pub is_init: bool,
+    pub duration: std::time::Duration,
+    pub variant_id: VariantId,
+    pub codec_info: Option<crate::model::CodecInfo>,
+    pub key: Option<SegmentKey>,
+}
+
+#[derive(Debug, Clone)]
+pub enum NextSegmentDescResult {
+    Segment(SegmentDescriptor),
+    EndOfStream,
+    NeedsRefresh { wait: std::time::Duration },
+}
+
+impl HlsManager {
+    /// Non-blocking descriptor-based API mirroring `next_segment_nonblocking` logic.
+    /// Returns a segment descriptor suitable for opening a streaming HTTP connection.
+    pub async fn next_segment_descriptor_nonblocking(
+        &mut self,
+    ) -> HlsResult<NextSegmentDescResult> {
+        let PlaylistSnapshot {
+            end_list,
+            last_seq,
+            target_duration,
+            current_segment: seg_opt,
+        } = self.playlist_snapshot()?;
+
+        // 1) Init segment (at most once per variant selection)
+        if !self.init_segment_sent {
+            if let Some(init_segment) = self
+                .current_media_playlist
+                .as_ref()
+                .and_then(|p| p.init_segment.as_ref())
+                .cloned()
+            {
+                let desc = self.build_init_descriptor(&init_segment)?;
+                self.init_segment_sent = true;
+                return Ok(NextSegmentDescResult::Segment(desc));
+            } else {
+                // Mark even if absent to avoid re-checking
+                self.init_segment_sent = true;
+            }
+        }
+
+        // 2) Media segment available at current index
+        if let Some(seg) = seg_opt {
+            let desc = self.build_media_descriptor(&seg)?;
+            self.next_segment_index += 1;
+            return Ok(NextSegmentDescResult::Segment(desc));
+        }
+
+        // 3) No segment at current index
+        if end_list {
+            return Ok(NextSegmentDescResult::EndOfStream);
+        }
+
+        // 4) LIVE - refresh playlist and check for new segments
+        let (found_new_idx, _new_total, new_end_list, interval) =
+            self.live_refresh_cycle(last_seq, target_duration).await?;
+
+        if let Some(idx) = found_new_idx {
+            self.next_segment_index = idx;
+
+            let seg = self
+                .current_media_playlist
+                .as_ref()
+                .and_then(|pl| pl.segments.get(idx))
+                .cloned()
+                .ok_or_else(|| {
+                    HlsError::Message("segment index out of bounds after refresh".to_string())
+                })?;
+
+            let desc = self.build_media_descriptor(&seg)?;
+            // Mirror the byte-based flow where the index is advanced after yield
+            self.next_segment_index = idx + 1;
+            return Ok(NextSegmentDescResult::Segment(desc));
+        }
+
+        if new_end_list {
+            return Ok(NextSegmentDescResult::EndOfStream);
+        }
+
+        Ok(NextSegmentDescResult::NeedsRefresh { wait: interval })
+    }
+
+    fn build_init_descriptor(
+        &self,
+        init_segment: &crate::model::InitSegment,
+    ) -> HlsResult<SegmentDescriptor> {
+        let (variant_id, codec_info) = self.current_variant_info()?;
+        let resolved_uri = self.resolve_url(&init_segment.uri)?;
+        Ok(SegmentDescriptor {
+            uri: resolved_uri,
+            sequence: 0,
+            is_init: true,
+            duration: std::time::Duration::from_secs(0),
+            variant_id,
+            codec_info,
+            key: init_segment.key.clone(),
+        })
+    }
+
+    fn build_media_descriptor(&self, seg: &MediaSegment) -> HlsResult<SegmentDescriptor> {
+        let codec_info = self.current_codec_info()?;
+        let resolved_uri = self.resolve_url(&seg.uri)?;
+        Ok(SegmentDescriptor {
+            uri: resolved_uri,
+            sequence: seg.sequence,
+            is_init: false,
+            duration: seg.duration,
+            variant_id: seg.variant_id,
+            codec_info,
+            key: seg.key.clone(),
+        })
+    }
+
+    /// Helper to get or probe the size of a segment in bytes.
+    async fn get_or_probe_segment_size(
+        &mut self,
+        sequence: u64,
+        uri: &str,
+    ) -> HlsResult<Option<u64>> {
+        if let Some(sz) = self.segment_size(sequence) {
+            return Ok(Some(sz));
+        }
+        let size_opt = self.probe_and_record_segment_size(sequence, uri).await?;
+        Ok(size_opt)
+    }
+
+    /// Resolve an absolute byte offset into a concrete segment and an intra-segment offset.
+    ///
+    /// - If an init segment exists and `byte_offset` falls within it, returns the init descriptor
+    ///   with the the offset inside the init.
+    /// - Otherwise iterates media segments, probing sizes as needed (via Range/HEAD-like), and
+    ///   returns the first segment where the remaining offset falls.
+    ///
+    /// Returns an error if the current media playlist is not loaded or the position falls beyond
+    /// the currently known window.
+    pub async fn resolve_position(
+        &mut self,
+        byte_offset: u64,
+    ) -> HlsResult<(SegmentDescriptor, u64)> {
+        // Clone minimal playlist data to avoid holding an immutable borrow of `self`
+        // while probing sizes (which requires `&mut self`).
+        let (init_opt, media_entries): (
+            Option<crate::model::InitSegment>,
+            Vec<(u64, String, std::time::Duration, Option<SegmentKey>)>,
+        ) = {
+            let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
+                HlsError::Message("no media playlist loaded; call select_variant first".to_string())
+            })?;
+            let init = pl.init_segment.clone();
+            let entries = pl
+                .segments
+                .iter()
+                .map(|s| (s.sequence, s.uri.clone(), s.duration, s.key.clone()))
+                .collect();
+            (init, entries)
+        };
+
+        let mut remaining = byte_offset;
+
+        // 1) Init segment (if present)
+        if let Some(init) = init_opt.as_ref() {
+            let resolved_uri = self.resolve_url(&init.uri)?;
+            if let Some(init_size) = self.get_or_probe_segment_size(0, &resolved_uri).await? {
+                if remaining < init_size {
+                    // Inside init
+                    let desc = self.build_init_descriptor(init)?;
+                    return Ok((desc, remaining));
+                }
+                // Skip init
+                remaining = remaining.saturating_sub(init_size);
+            }
+        }
+
+        // 2) Walk media segments (using cloned metadata)
+        for (seq, uri, duration, key) in media_entries.iter() {
+            let resolved_uri = self.resolve_url(uri)?;
+            let size = match self.get_or_probe_segment_size(*seq, &resolved_uri).await? {
+                Some(sz) => sz,
+                None => {
+                    return Err(HlsError::Message(format!(
+                        "unable to determine size for segment sequence {}",
+                        seq
+                    )));
+                }
+            };
+
+            if remaining < size {
+                // Build descriptor manually to avoid borrowing issues
+                let (variant_id, codec_info) = self.current_variant_info()?;
+                let desc = SegmentDescriptor {
+                    uri: resolved_uri,
+                    sequence: *seq,
+                    is_init: false,
+                    duration: *duration,
+                    variant_id,
+                    codec_info,
+                    key: key.clone(),
+                };
+                return Ok((desc, remaining));
+            } else {
+                remaining = remaining.saturating_sub(size);
+            }
+        }
+
+        // 3) If we got here, the position lies beyond the currently known window.
+        Err(HlsError::Message(
+            "seek position is beyond current window".to_string(),
+        ))
+    }
+    /// Reposition internal state so that `next_segment_descriptor_nonblocking` yields `desc` next.
+    ///
+    /// - If `desc` is an init segment, this marks the init as not yet sent and resets
+    ///   `next_segment_index` to the first media segment.
+    /// - If `desc` is a media segment, this marks the init as already sent and sets
+    ///   `next_segment_index` to the index of the segment with the same sequence number.
+    pub fn seek_to_descriptor(&mut self, desc: &SegmentDescriptor) -> HlsResult<()> {
+        let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
+            HlsError::Message("no media playlist loaded; call select_variant first".to_string())
+        })?;
+
+        if desc.is_init {
+            // Next descriptor should be the init segment; after that, start from the first media segment.
+            self.init_segment_sent = false;
+            self.next_segment_index = 0;
+            return Ok(());
+        }
+
+        // Find the media segment index by sequence number
+        let idx = pl
+            .segments
+            .iter()
+            .position(|s| s.sequence == desc.sequence)
+            .ok_or_else(|| {
+                HlsError::Message(format!(
+                    "segment sequence {} not found in current playlist",
+                    desc.sequence
+                ))
+            })?;
+
+        // Next descriptor should be this media segment
+        self.init_segment_sent = true; // do not emit init again
+        self.next_segment_index = idx;
+        Ok(())
     }
 }
 
