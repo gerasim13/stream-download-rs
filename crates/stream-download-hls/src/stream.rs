@@ -597,19 +597,6 @@ impl HlsStreamWorker {
     async fn run(mut self) -> Result<(), HlsStreamError> {
         let mut last_variant_id: Option<crate::model::VariantId> = None;
         loop {
-            // Early cancellation check before processing
-            if self.cancel_token.is_cancelled() {
-                return Err(HlsStreamError::Cancelled);
-            }
-
-            // Check for seek commands first (non-blocking)
-            if let Ok(position) = self.seek_receiver.try_recv() {
-                tracing::trace!("HLS streaming loop: received seek to position {}", position);
-                self.apply_seek_position(position).await?;
-                // no pre-reserved permit; continue
-                continue;
-            }
-
             // Fetch next segment descriptor using non-blocking method
             let next_desc = tokio::select! {
                 biased;
