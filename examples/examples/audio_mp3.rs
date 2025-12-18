@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use rodio::{OutputStreamBuilder, Sink};
-use stream_download_audio::{AudioOptions, AudioStream, PlayerEvent, RodioSourceAdapter};
-use tracing::trace;
+use stream_download_audio::{AudioOptions, AudioStream, RodioSourceAdapter};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -14,7 +13,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
-                .add_directive("stream_download_audio=debug".parse()?)
+                .add_directive("stream_download_audio=info".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
         .with_line_number(true)

@@ -140,25 +140,21 @@ impl<S: MediaStream> AbrController<S> {
     }
 
     /// Get a reference to the underlying `MediaStream`.
-    #[must_use]
     pub fn inner_stream(&self) -> &S {
         &self.stream
     }
 
     /// Get a mutable reference to the underlying `MediaStream`.
-    #[must_use]
     pub fn inner_stream_mut(&mut self) -> &mut S {
         &mut self.stream
     }
 
     /// Consume the controller and return the underlying `MediaStream`.
-    #[must_use]
     pub fn into_inner(self) -> S {
         self.stream
     }
 
     /// Get the ID of the variant currently targeted by the controller.
-    #[must_use]
     pub fn current_variant_id(&self) -> Option<VariantId> {
         self.current_variant_id
     }
@@ -166,25 +162,21 @@ impl<S: MediaStream> AbrController<S> {
     /// Resets the bandwidth estimator, clearing all historical data.
     ///
     /// This is useful after a network change or a long pause.
-    #[must_use]
     pub fn reset(&mut self) {
         self.bandwidth_estimator.reset();
     }
 
     /// Get the manual selection target if set (manual mode).
-    #[must_use]
     pub fn manual_selection(&self) -> Option<VariantId> {
         self.manual_variant_id
     }
 
     /// Switch to AUTO mode (ABR).
-    #[must_use]
     pub fn set_auto(&mut self) {
         self.manual_variant_id = None;
     }
 
     /// Switch to MANUAL mode and lock to the given variant.
-    #[must_use]
     pub async fn set_manual(&mut self, variant_id: VariantId) -> HlsResult<()> {
         self.manual_variant_id = Some(variant_id);
         self.current_variant_id = Some(variant_id);
@@ -203,7 +195,6 @@ impl<S: MediaStream> AbrController<S> {
     /// - Inspect `self.stream.variants()` and `metrics`.
     /// - Choose a new variant ID.
     /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
-    #[must_use]
     pub async fn maybe_switch(&mut self, metrics: &PlaybackMetrics) -> HlsResult<()> {
         // If manual mode is active, ensure we are locked to the manual target and skip ABR.
         if let Some(target) = self.manual_variant_id {

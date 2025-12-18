@@ -231,17 +231,14 @@ impl Stream for HlsStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         match self.data_receiver.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
-                #[cfg(debug_assertions)]
                 tracing::trace!("HlsStream::poll_next: returning {} bytes", data.len());
                 Poll::Ready(Some(Ok(data)))
             }
             Poll::Ready(None) => {
-                #[cfg(debug_assertions)]
                 tracing::trace!("HlsStream::poll_next: channel closed");
                 Poll::Ready(None)
             }
             Poll::Pending => {
-                #[cfg(debug_assertions)]
                 tracing::trace!("HlsStream::poll_next: no data available, pending");
                 Poll::Pending
             }

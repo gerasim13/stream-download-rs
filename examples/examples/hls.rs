@@ -1,16 +1,10 @@
-use std::env;
 use std::error::Error;
-use std::io;
-use std::sync::{Arc, Mutex};
-use std::thread;
 
-use rodio::{OutputStreamBuilder, Sink};
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams, VariantId};
 use tracing::metadata::LevelFilter;
-use tracing::trace;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -39,7 +33,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         Ok(r) => r,
         Err(e) => {
-            return return Err(e.decode_error().await)?;
+            return Err(e.decode_error().await)?;
         }
     };
 

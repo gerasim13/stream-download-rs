@@ -54,22 +54,25 @@ pub struct HlsSettings {
     /// Default: 5 seconds.
     pub retry_timeout: Duration,
 
-    /// Optional callback to post-process fetched AES keys before use (e.g., unwrap DRM).
-    ///
-    /// Intentionally boxed and wrapped in `Arc` for cheap clones across tasks.
-    /// Not included in Debug output for readability.
-    pub key_processor_cb: Option<Arc<Box<KeyProcessorCallback>>>,
-
-    /// Optional query parameters appended to key fetch requests.
-    pub key_query_params: Option<HashMap<String, String>>,
-
-    /// Optional headers added to key fetch requests.
-    pub key_request_headers: Option<HashMap<String, String>>,
-
     /// Number of segments to prefetch in the buffer.
     /// Larger values can improve smoothness at the cost of memory usage.
     /// Default: 2.
     pub prefetch_buffer_size: usize,
+
+    /// Optional callback to post-process fetched AES keys before use (e.g., unwrap DRM).
+    ///
+    /// Intentionally boxed and wrapped in `Arc` for cheap clones across tasks.
+    /// Not included in Debug output for readability.
+    #[cfg(feature = "aes-decrypt")]
+    pub key_processor_cb: Option<Arc<Box<KeyProcessorCallback>>>,
+
+    /// Optional query parameters appended to key fetch requests.
+    #[cfg(feature = "aes-decrypt")]
+    pub key_query_params: Option<HashMap<String, String>>,
+
+    /// Optional headers added to key fetch requests.
+    #[cfg(feature = "aes-decrypt")]
+    pub key_request_headers: Option<HashMap<String, String>>,
 
     // ----------------------------
     // ABR behavior (flattened from `AbrConfig`)

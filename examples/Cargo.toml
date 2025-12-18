@@ -52,11 +52,11 @@ name = "s3"
 required-features = ["opendal"]
 
 [[example]]
-name = "stream_hls"
+name = "hls"
 required-features = ["hls"]
 
 [[example]]
-name = "stream_hls_seek"
+name = "hls_seek"
 required-features = ["hls"]
 
 [[example]]
