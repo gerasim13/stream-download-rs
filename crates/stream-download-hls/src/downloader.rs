@@ -14,7 +14,7 @@ use crate::model::{HlsError, HlsResult};
 use stream_download::http::HttpStream;
 use stream_download::http::reqwest::Client as ReqwestClient;
 use stream_download::http::reqwest::Url;
-use stream_download::source::{DecodeError, SourceStream};
+use stream_download::source::{DecodeError, SourceStream, StreamMsg};
 
 /// Async HTTP resource downloader optimized for HLS streaming.
 ///
@@ -242,7 +242,7 @@ impl ResourceDownloader {
         stream: HttpStream<ReqwestClient>,
     ) -> impl Stream<Item = Result<Bytes, HlsError>> + Send {
         stream.map(|res| match res {
-            Ok(bytes) => Ok(bytes),
+            Ok(StreamMsg::Data(bytes)) => Ok(bytes),
             Err(e) => Err(HlsError::Io(e.to_string())),
         })
     }
@@ -252,7 +252,7 @@ impl ResourceDownloader {
         cancel: Option<&CancellationToken>,
     ) -> HlsResult<Bytes>
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        S: Stream<Item = Result<StreamMsg, E>> + Unpin,
         E: Display,
     {
         let mut buf = BytesMut::with_capacity(16 * 1024);
@@ -270,7 +270,7 @@ impl ResourceDownloader {
             };
 
             match next {
-                Some(Ok(chunk)) => {
+                Some(Ok(StreamMsg::Data(chunk))) => {
                     buf.extend_from_slice(&chunk);
                 }
                 Some(Err(e)) => return Err(HlsError::Io(e.to_string())),

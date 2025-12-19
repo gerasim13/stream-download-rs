@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
 use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
-use stream_download::source::SourceStream;
+use stream_download::source::{SourceStream, StreamMsg};
 use stream_download::storage::ContentLength;
 
 /// Parameters for creating an HLS stream.
@@ -226,13 +226,13 @@ impl SourceStream for HlsStream {
 }
 
 impl Stream for HlsStream {
-    type Item = io::Result<Bytes>;
+    type Item = io::Result<StreamMsg>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         match self.data_receiver.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
                 tracing::trace!("HlsStream::poll_next: returning {} bytes", data.len());
-                Poll::Ready(Some(Ok(data)))
+                Poll::Ready(Some(Ok(StreamMsg::Data(data))))
             }
             Poll::Ready(None) => {
                 tracing::trace!("HlsStream::poll_next: channel closed");

@@ -24,6 +24,18 @@ use crate::{ProgressFn, ReconnectFn, Settings, StreamPhase, StreamState};
 
 pub(crate) mod handle;
 
+/// A single ordered message emitted by a [`SourceStream`].
+///
+/// For now this only wraps raw byte chunks. In the next iterations we can extend it with:
+/// - segment boundaries (start/end)
+/// - discontinuities (codec change)
+/// - resource blobs (init segments, playlists, keys)
+#[derive(Debug, Clone)]
+pub enum StreamMsg {
+    /// A chunk of payload bytes.
+    Data(Bytes),
+}
+
 /// Enum representing the final outcome of the stream.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StreamOutcome {
@@ -40,7 +52,7 @@ pub enum StreamOutcome {
 /// The implementation must also implement the
 /// [Stream](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) trait.
 pub trait SourceStream:
-    TryStream<Ok = Bytes>
+    TryStream<Ok = StreamMsg>
     + Stream<Item = Result<Self::Ok, Self::Error>>
     + Unpin
     + Send
@@ -371,11 +383,12 @@ where
     async fn handle_bytes(
         &mut self,
         stream: &mut S,
-        bytes: Option<Result<Bytes, S::Error>>,
+        msg: Option<Result<StreamMsg, S::Error>>,
         download_start: Instant,
     ) -> io::Result<DownloadAction> {
-        let bytes = match bytes.transpose() {
-            Ok(bytes) => bytes,
+        let bytes = match msg.transpose() {
+            Ok(Some(StreamMsg::Data(bytes))) => Some(bytes),
+            Ok(None) => None,
             Err(e) => {
                 error!("Error fetching chunk from stream: {e:?}");
                 return Ok(DownloadAction::Continue);

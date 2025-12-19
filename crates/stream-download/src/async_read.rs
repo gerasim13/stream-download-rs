@@ -4,7 +4,8 @@ use std::convert::Infallible;
 use std::io;
 use std::pin::Pin;
 
-use bytes::Bytes;
+use crate::source::StreamMsg;
+
 use futures_util::Stream;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
@@ -105,12 +106,19 @@ impl<T> Stream for AsyncReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    type Item = io::Result<Bytes>;
+    type Item = io::Result<StreamMsg>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+        match Pin::new(&mut self.stream).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                std::task::Poll::Ready(Some(Ok(StreamMsg::Data(bytes))))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
     }
 }

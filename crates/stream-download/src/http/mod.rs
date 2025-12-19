@@ -15,14 +15,26 @@
 //! use stream_download::http::HttpStream;
 //! use stream_download::http::reqwest::Client;
 //! use stream_download::source::SourceStream;
+//! use stream_download::source::StreamMsg;
+//! use futures_util::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn Error>> {
-//!     let stream = HttpStream::new(
+//!     let mut stream = HttpStream::new(
 //!         Client::new(),
 //!         "https://some-cool-url.com/some-file.mp3".parse()?,
 //!     )
 //!     .await?;
+//!
+//!     // The HTTP stream yields ordered `StreamMsg` items (currently only `Data(Bytes)`).
+//!     while let Some(msg) = stream.next().await.transpose()? {
+//!         match msg {
+//!             StreamMsg::Data(_bytes) => {
+//!                 // Consume bytes...
+//!             }
+//!         }
+//!     }
+//!
 //!     let content_length = stream.content_length();
 //!     Ok(())
 //! }
@@ -44,7 +56,7 @@ pub use reqwest;
 use tracing::{debug, instrument, warn};
 
 use crate::WrapIoResult;
-use crate::source::{DecodeError, SourceStream};
+use crate::source::{DecodeError, SourceStream, StreamMsg};
 use crate::storage::ContentLength;
 
 #[cfg(feature = "reqwest")]
@@ -278,10 +290,15 @@ impl<C: Client> HttpStream<C> {
 }
 
 impl<C: Client> Stream for HttpStream<C> {
-    type Item = Result<Bytes, <<C as Client>::Response as ClientResponse>::StreamError>;
+    type Item = Result<StreamMsg, <<C as Client>::Response as ClientResponse>::StreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+        match Pin::new(&mut self.stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(StreamMsg::Data(bytes)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

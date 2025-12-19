@@ -9,11 +9,11 @@ use std::io::{self};
 use std::num::NonZeroUsize;
 use std::task::Poll;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures_util::{Stream, ready};
 use opendal::{FuturesAsyncReader, Operator, Reader};
 use pin_project_lite::pin_project;
-use stream_download::source::{DecodeError, SourceStream};
+use stream_download::source::{DecodeError, SourceStream, StreamMsg};
 use stream_download::storage::{ContentLength, StorageProvider};
 use stream_download::{Settings, StreamDownload, StreamInitializationError};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
@@ -215,7 +215,7 @@ impl SourceStream for OpendalStream {
 }
 
 impl Stream for OpendalStream {
-    type Item = io::Result<Bytes>;
+    type Item = io::Result<StreamMsg>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -232,7 +232,7 @@ impl Stream for OpendalStream {
             Ok(0) => Poll::Ready(None),
             Ok(_) => {
                 let chunk = this.buf.split();
-                Poll::Ready(Some(Ok(chunk.freeze())))
+                Poll::Ready(Some(Ok(StreamMsg::Data(chunk.freeze()))))
             }
         }
     }

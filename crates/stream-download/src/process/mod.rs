@@ -22,7 +22,6 @@ use std::pin::Pin;
 use std::process::{ChildStdout, Stdio};
 use std::task::Poll;
 
-use bytes::Bytes;
 pub use command_builder::*;
 pub use ffmpeg::*;
 use futures_util::Stream;
@@ -32,7 +31,7 @@ pub use yt_dlp::*;
 
 use crate::WrapIoResult;
 use crate::async_read::AsyncReadStream;
-use crate::source::{SourceStream, StreamOutcome};
+use crate::source::{SourceStream, StreamMsg, StreamOutcome};
 use crate::storage::ContentLength;
 
 mod command_builder;
@@ -309,12 +308,13 @@ impl SourceStream for ProcessStream {
 }
 
 impl Stream for ProcessStream {
-    type Item = io::Result<Bytes>;
+    type Item = io::Result<StreamMsg>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
+        // `AsyncReadStream` now yields `StreamMsg`, so just forward it.
         Pin::new(&mut self.stream).poll_next(cx)
     }
 }
