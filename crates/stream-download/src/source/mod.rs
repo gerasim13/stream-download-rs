@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::future;
 use std::io::{self, SeekFrom};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -24,16 +25,83 @@ use crate::{ProgressFn, ReconnectFn, Settings, StreamPhase, StreamState};
 
 pub(crate) mod handle;
 
+/// Key for addressing per-stream or per-resource objects (segments, init segments, playlists, keys).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceKey(pub Arc<str>);
+
+impl From<&str> for ResourceKey {
+    fn from(value: &str) -> Self {
+        Self(Arc::<str>::from(value))
+    }
+}
+
+impl From<String> for ResourceKey {
+    fn from(value: String) -> Self {
+        Self(Arc::<str>::from(value))
+    }
+}
+
+impl From<Arc<str>> for ResourceKey {
+    fn from(value: Arc<str>) -> Self {
+        Self(value)
+    }
+}
+
+/// Chunk kind for segmented streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkKind {
+    /// Init segment (e.g. fMP4 init).
+    Init,
+    /// Media segment.
+    Media,
+}
+
+/// Control messages that describe segmented boundaries and auxiliary resources.
+#[derive(Debug, Clone)]
+pub enum StreamControl {
+    /// Start a new chunk under `stream_key`.
+    ChunkStart {
+        /// Logical stream identifier (e.g. `master/<variant>`). Used to keep segments for different
+        /// streams/codecs isolated in storage.
+        stream_key: ResourceKey,
+        /// The kind of chunk being started (init vs media).
+        kind: ChunkKind,
+        /// Optional reported length in bytes (e.g. HTTP `Content-Length`) for the chunk.
+        reported_len: Option<u64>,
+        /// Optional filename hint (e.g. playlist basename) for deterministic caching.
+        filename_hint: Option<Arc<str>>,
+    },
+
+    /// Finish the current chunk.
+    ChunkEnd {
+        /// Logical stream identifier that this chunk belongs to.
+        stream_key: ResourceKey,
+        /// The kind of chunk being finalized (init vs media).
+        kind: ChunkKind,
+        /// Actual bytes gathered/written for this chunk.
+        gathered_len: u64,
+    },
+
+    /// Store a keyed resource blob (init segment, playlist, key, etc.).
+    StoreResource {
+        /// Resource identifier for later retrieval (e.g. init segment key).
+        key: ResourceKey,
+        /// Resource payload bytes.
+        data: Bytes,
+    },
+}
+
 /// A single ordered message emitted by a [`SourceStream`].
 ///
-/// For now this only wraps raw byte chunks. In the next iterations we can extend it with:
-/// - segment boundaries (start/end)
-/// - discontinuities (codec change)
-/// - resource blobs (init segments, playlists, keys)
+/// Today, only `Data` is required for basic streaming.
+/// Control messages provide the foundation for segmented storage and caching.
 #[derive(Debug, Clone)]
 pub enum StreamMsg {
     /// A chunk of payload bytes.
     Data(Bytes),
+
+    /// Ordered out-of-band control message.
+    Control(StreamControl),
 }
 
 /// Enum representing the final outcome of the stream.
@@ -386,13 +454,23 @@ where
         msg: Option<Result<StreamMsg, S::Error>>,
         download_start: Instant,
     ) -> io::Result<DownloadAction> {
-        let bytes = match msg.transpose() {
-            Ok(Some(StreamMsg::Data(bytes))) => Some(bytes),
-            Ok(None) => None,
+        let msg = match msg.transpose() {
+            Ok(msg) => msg,
             Err(e) => {
                 error!("Error fetching chunk from stream: {e:?}");
                 return Ok(DownloadAction::Continue);
             }
+        };
+
+        let bytes = match msg {
+            Some(StreamMsg::Data(bytes)) => Some(bytes),
+            Some(StreamMsg::Control(ctrl)) => {
+                // Control messages are ordered relative to `Data`. They do not advance the
+                // contiguous byte stream position, but can influence segmented storage.
+                self.writer.control(ctrl)?;
+                return Ok(DownloadAction::Continue);
+            }
+            None => None,
         };
 
         if !self.prefetch_complete {

@@ -241,9 +241,12 @@ impl ResourceDownloader {
     fn map_stream_errors(
         stream: HttpStream<ReqwestClient>,
     ) -> impl Stream<Item = Result<Bytes, HlsError>> + Send {
-        stream.map(|res| match res {
-            Ok(StreamMsg::Data(bytes)) => Ok(bytes),
-            Err(e) => Err(HlsError::Io(e.to_string())),
+        stream.filter_map(|res| async move {
+            match res {
+                Ok(StreamMsg::Data(bytes)) => Some(Ok(bytes)),
+                Ok(StreamMsg::Control(_)) => None,
+                Err(e) => Some(Err(HlsError::Io(e.to_string()))),
+            }
         })
     }
 
@@ -272,6 +275,10 @@ impl ResourceDownloader {
             match next {
                 Some(Ok(StreamMsg::Data(chunk))) => {
                     buf.extend_from_slice(&chunk);
+                }
+                Some(Ok(StreamMsg::Control(_))) => {
+                    // Ignore ordered control messages; this helper is used only to collect payload bytes.
+                    continue;
                 }
                 Some(Err(e)) => return Err(HlsError::Io(e.to_string())),
                 None => break,

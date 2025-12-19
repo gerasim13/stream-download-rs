@@ -26,11 +26,16 @@
 //!     )
 //!     .await?;
 //!
-//!     // The HTTP stream yields ordered `StreamMsg` items (currently only `Data(Bytes)`).
+//!     // The HTTP stream yields ordered `StreamMsg` items.
+//!     // Most sources will only emit `Data(Bytes)`, but consumers should be prepared to ignore
+//!     // control messages.
 //!     while let Some(msg) = stream.next().await.transpose()? {
 //!         match msg {
 //!             StreamMsg::Data(_bytes) => {
 //!                 // Consume bytes...
+//!             }
+//!             StreamMsg::Control(_ctrl) => {
+//!                 // Ignore control messages for plain HTTP streams.
 //!             }
 //!         }
 //!     }

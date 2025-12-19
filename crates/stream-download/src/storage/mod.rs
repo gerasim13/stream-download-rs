@@ -172,6 +172,18 @@ pub trait StorageReader: Read + Seek + Send {}
 impl<T> StorageReader for T where T: Read + Seek + Send {}
 
 /// Handle for writing to the underlying storage layer.
-pub trait StorageWriter: Write + Seek + Send + 'static {}
+///
+/// In addition to plain byte writes, a writer may optionally handle ordered control messages
+/// emitted by a [`SourceStream`](crate::source::SourceStream) (e.g. chunk boundaries, resources).
+///
+/// The default implementation is a no-op to keep existing storage providers compatible.
+pub trait StorageWriter: Write + Seek + Send + 'static {
+    /// Handle an ordered control message associated with the byte stream.
+    ///
+    /// Storage providers that don't support segmented streams can ignore this (default no-op).
+    fn control(&mut self, _msg: crate::source::StreamControl) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl<T> StorageWriter for T where T: Write + Seek + Send + 'static {}
