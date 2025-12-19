@@ -12,7 +12,7 @@ use futures_util::{Stream, StreamExt};
 use stream_download::http;
 use stream_download::source::DecodeError;
 use stream_download::storage::memory::{MemoryStorage, MemoryStorageProvider};
-use stream_download::storage::{ContentLength, StorageProvider};
+use stream_download::storage::{ContentLength, StorageProvider, StorageWriter};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::services::ServeDir;
@@ -246,6 +246,8 @@ impl http::ClientResponse for TestResponse {
 pub struct ErrorTestStorageProvider(pub MemoryStorageProvider);
 
 pub struct ErrorTestStorage(MemoryStorage);
+
+impl StorageWriter for ErrorTestStorage {}
 
 impl Write for ErrorTestStorage {
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {

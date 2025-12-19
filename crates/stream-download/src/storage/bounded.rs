@@ -273,6 +273,8 @@ where
     shared_info: Arc<AssertUnwindSafe<Mutex<SharedInfo>>>,
 }
 
+impl<T> StorageWriter for BoundedStorageWriter<T> where T: StorageWriter {}
+
 impl<T> Write for BoundedStorageWriter<T>
 where
     T: StorageWriter,

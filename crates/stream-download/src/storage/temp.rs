@@ -13,10 +13,12 @@ use educe::Educe;
 pub use tempfile;
 use tempfile::NamedTempFile;
 
-use super::{ContentLength, StorageProvider};
+use super::{ContentLength, StorageProvider, StorageWriter};
 use crate::WrapIoResult;
 
 type TempfileFnType = Arc<dyn Fn() -> io::Result<NamedTempFile> + Send + Sync + 'static>;
+
+impl StorageWriter for File {}
 
 #[derive(Clone, Educe)]
 #[educe(Debug)]

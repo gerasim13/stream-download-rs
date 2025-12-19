@@ -204,6 +204,20 @@ where
     Variable(V),
 }
 
+impl<F, V> StorageWriter for AdaptiveStorageWriter<F, V>
+where
+    F: StorageWriter,
+    V: StorageWriter,
+{
+    fn control(&mut self, msg: crate::source::StreamControl) -> io::Result<()> {
+        match self {
+            Self::Bounded(w) => w.control(msg),
+            Self::Fixed(w) => w.control(msg),
+            Self::Variable(w) => w.control(msg),
+        }
+    }
+}
+
 impl<F, V> Write for AdaptiveStorageWriter<F, V>
 where
     F: StorageWriter,

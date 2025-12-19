@@ -1,0 +1,766 @@
+#![allow(clippy::type_complexity)]
+//! Segmented storage provider for HLS.
+//!
+//! This module implements a `stream_download::storage::StorageProvider` wrapper that understands
+//! ordered [`StreamControl`](stream_download::source::StreamControl) messages emitted by an HLS
+//! [`SourceStream`](stream_download::source::SourceStream).
+//!
+//! The goal is to split the logical byte stream into **per-chunk** files (typically one init
+//! segment + many media segments), while still exposing a single contiguous `Read + Seek` view to
+//! decoders (e.g. Symphonia) via a virtual stitched reader.
+//!
+//! Design notes:
+//! - All segmentation is driven by **ordered** `StreamMsg::Control(StreamControl::...)` messages.
+//!   There is no separate channel for control vs data, so ordering is deterministic.
+//! - Each chunk is backed by a fresh `P: StorageProvider` instance (e.g. `TempStorageProvider`,
+//!   `MemoryStorageProvider`, or a file provider), cloned from an inner factory.
+//! - Multiple logical streams are supported by `stream_key` (e.g. different variants/codecs).
+//! - Auxiliary resources (init segments, playlists, keys) can be stored via `StoreResource` and
+//!   retrieved via an optional `StorageHandle`.
+//!
+//! Important:
+//! - This is intentionally scoped to HLS for now. If later you want a generic segmented stream
+//!   facility, we can extract it into `stream-download`.
+//! - The writer is intentionally strict: **bytes must only be written after `ChunkStart`**.
+//!   If HLS emits data without an active chunk, we return an error to avoid corrupt outputs.
+
+use std::collections::HashMap;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
+
+use stream_download::source::{ChunkKind, ResourceKey, StreamControl};
+use stream_download::storage::{ContentLength, DynamicLength, StorageProvider, StorageWriter};
+
+/// Optional integration: if the core provides these types/traits (they existed in earlier WIP),
+/// `SegmentedStorageProvider` can vend a handle to read stored resources.
+///
+/// If your current `stream-download` core does not have these, keep using the provider without
+/// resource retrieval for now, or add the handle types later.
+///
+/// We keep this behind a feature-like cfg by using `cfg(any())` as a placeholder. Replace it with
+/// a real feature flag if you want.
+///
+/// NOTE: This file is added "from scratch" for the current repo state; it intentionally avoids
+/// depending on non-existent core APIs.
+#[cfg(any())]
+use stream_download::storage::{ProvidesStorageHandle, StorageHandle, StorageResourceReader};
+
+/// A segmented storage provider.
+///
+/// Wraps an inner provider `P` and orchestrates per-chunk inner providers based on `StreamControl`.
+///
+/// - `P` is cloned per chunk.
+/// - Each chunk gets its own `(P::Reader, P::Writer)` pair.
+/// - A `SegmentedReader` stitches chunks for a chosen `stream_key`.
+#[derive(Clone, Debug)]
+pub struct SegmentedStorageProvider<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    inner: P,
+    default_stream_key: ResourceKey,
+    resource_root: PathBuf,
+}
+
+impl<P> SegmentedStorageProvider<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    /// Create a new segmented storage provider wrapping an inner provider factory.
+    pub fn new(inner: P) -> Self {
+        Self {
+            inner,
+            default_stream_key: ResourceKey("playback".into()),
+            resource_root: std::env::temp_dir().join("stream-download-hls-resources"),
+        }
+    }
+
+    /// Override the default logical stream key used by the reader.
+    pub fn with_default_stream_key(mut self, key: ResourceKey) -> Self {
+        self.default_stream_key = key;
+        self
+    }
+
+    /// Root directory used to persist `StoreResource` blobs (init segments, playlists, keys).
+    ///
+    /// This currently is only used internally; retrieval is wired when/if `StorageHandle` exists.
+    pub fn with_resource_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.resource_root = path.into();
+        self
+    }
+}
+
+impl<P> StorageProvider for SegmentedStorageProvider<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    type Reader = SegmentedReader<P>;
+    type Writer = SegmentedWriter<P>;
+
+    fn into_reader_writer(
+        self,
+        _content_length: ContentLength,
+    ) -> io::Result<(Self::Reader, Self::Writer)> {
+        let state = Arc::new(RwLock::new(SharedState::<P> {
+            default_stream_key: self.default_stream_key.clone(),
+            resources: HashMap::new(),
+            streams: HashMap::new(),
+            resource_root: self.resource_root.clone(),
+        }));
+
+        // Ensure there is a default stream entry so the reader has a target.
+        {
+            let mut guard = state.write();
+            guard
+                .streams
+                .entry(self.default_stream_key.clone())
+                .or_insert_with(StreamState::<P>::default);
+        }
+
+        let reader = SegmentedReader::<P> {
+            state: state.clone(),
+            stream_key: self.default_stream_key.clone(),
+            pos: 0,
+        };
+
+        let writer = SegmentedWriter::<P> {
+            state,
+            inner: self.inner,
+            current_stream_key: None,
+            current_seg_index: None,
+            current_kind: None,
+        };
+
+        Ok((reader, writer))
+    }
+
+    fn max_capacity(&self) -> Option<usize> {
+        // Segmented provider capacity is dictated by the inner provider per segment.
+        // Returning None lets upstream logic decide.
+        None
+    }
+}
+
+#[cfg(any())]
+impl<P> ProvidesStorageHandle for SegmentedStorageProvider<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn storage_handle(&self) -> Option<StorageHandle> {
+        Some(StorageHandle::new(Arc::new(ResourceFsReader {
+            root: self.resource_root.clone(),
+        })))
+    }
+}
+
+/// Shared orchestration state for segmented storage.
+struct SharedState<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    default_stream_key: ResourceKey,
+    resources: HashMap<ResourceKey, Bytes>,
+    streams: HashMap<ResourceKey, StreamState<P>>,
+    resource_root: PathBuf,
+}
+
+#[cfg(any())]
+struct ResourceFsReader {
+    root: PathBuf,
+}
+
+#[cfg(any())]
+impl StorageResourceReader for ResourceFsReader {
+    fn read(&self, key: &ResourceKey) -> io::Result<Option<Bytes>> {
+        use std::fs;
+
+        let rel = encode_resource_key(key);
+        let path = self.root.join(rel);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let data = fs::read(path)?;
+        Ok(Some(Bytes::from(data)))
+    }
+}
+
+#[cfg(any())]
+fn encode_resource_key(key: &ResourceKey) -> PathBuf {
+    let mut pb = PathBuf::new();
+    for comp in key.0.split('/') {
+        let clean = sanitize_component(comp);
+        if !clean.is_empty() {
+            pb.push(clean);
+        }
+    }
+    if pb.as_os_str().is_empty() {
+        pb.push("default");
+    }
+    pb
+}
+
+#[cfg(any())]
+fn sanitize_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Per-stream segmented state (sequence of segments, in order).
+struct StreamState<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    segments: Vec<Arc<Segment<P>>>,
+}
+
+impl<P> Default for StreamState<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn default() -> Self {
+        Self {
+            segments: Vec::new(),
+        }
+    }
+}
+
+// (duplicate `Default` impl removed)
+
+/// A single segment, backed by an inner provider's `(Reader, Writer)`.
+struct Segment<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    /// Reader for this segment. Protected by a mutex to allow safe seek/read.
+    reader: Mutex<P::Reader>,
+    /// Writer for this segment, present until the segment is finalized.
+    writer: Mutex<Option<P::Writer>>,
+    /// Reported length (best-known before processing). When `None`, we fall back to gathered.
+    reported: Option<u64>,
+    /// Bytes written (actual gathered length so far).
+    gathered_len: Mutex<u64>,
+    /// Segment finalization flag.
+    finalized: Mutex<bool>,
+    /// Chunk kind (Init/Media) for debugging / informational use.
+    kind: ChunkKind,
+    /// Optional filename hint for deterministic per-segment naming in file-based inners.
+    filename_hint: Option<Arc<str>>,
+}
+
+impl<P> Segment<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn new(
+        reader: P::Reader,
+        writer: P::Writer,
+        reported: Option<u64>,
+        kind: ChunkKind,
+        filename_hint: Option<Arc<str>>,
+    ) -> Self {
+        Self {
+            reader: Mutex::new(reader),
+            writer: Mutex::new(Some(writer)),
+            reported,
+            gathered_len: Mutex::new(0),
+            finalized: Mutex::new(false),
+            kind,
+            filename_hint,
+        }
+    }
+
+    fn available_len(&self) -> u64 {
+        *self.gathered_len.lock()
+    }
+
+    fn is_finalized(&self) -> bool {
+        *self.finalized.lock()
+    }
+}
+
+/// Reader that stitches per-segment readers of the current stream into a single logical stream.
+pub struct SegmentedReader<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    state: Arc<RwLock<SharedState<P>>>,
+    stream_key: ResourceKey,
+    pos: u64,
+}
+
+impl<P> SegmentedReader<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    /// Switch the logical stream being read (e.g. after a codec/variant discontinuity).
+    pub fn set_stream_key(&mut self, key: ResourceKey) {
+        self.stream_key = key;
+        self.pos = 0;
+    }
+
+    /// Current logical stream key.
+    pub fn stream_key(&self) -> &ResourceKey {
+        &self.stream_key
+    }
+}
+
+impl<P> Read for SegmentedReader<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Snapshot segments and their cumulative offsets and available lengths.
+        let (segments, cumulative_starts, total_len) = {
+            let guard = self.state.read();
+            let Some(stream) = guard.streams.get(&self.stream_key) else {
+                return Ok(0);
+            };
+
+            let mut starts = Vec::with_capacity(stream.segments.len());
+            let mut segs = Vec::with_capacity(stream.segments.len());
+            let mut offset = 0u64;
+            for seg in &stream.segments {
+                starts.push(offset);
+                let avail = seg.available_len();
+                offset = offset.saturating_add(avail);
+                segs.push(seg.clone());
+            }
+            (segs, starts, offset)
+        };
+
+        if segments.is_empty() || self.pos >= total_len {
+            return Ok(0);
+        }
+
+        // Locate segment for current position.
+        let mut seg_index = match cumulative_starts
+            .iter()
+            .enumerate()
+            .take(segments.len())
+            .rfind(|(_, start)| **start <= self.pos)
+        {
+            Some((idx, _)) => idx,
+            None => 0,
+        };
+
+        let mut read_total = 0usize;
+        let mut local_pos = self.pos;
+
+        while read_total < buf.len() && seg_index < segments.len() {
+            let seg = &segments[seg_index];
+            let seg_start = cumulative_starts[seg_index];
+            let seg_len = seg.available_len();
+            if local_pos >= seg_start.saturating_add(seg_len) {
+                seg_index += 1;
+                continue;
+            }
+
+            let offset_in_seg = local_pos.saturating_sub(seg_start);
+            let remaining_in_seg = seg_len.saturating_sub(offset_in_seg) as usize;
+            let remaining_in_buf = buf.len() - read_total;
+            let to_read = remaining_in_seg.min(remaining_in_buf);
+            if to_read == 0 {
+                break;
+            }
+
+            // Perform IO on the inner segment reader.
+            {
+                let mut inner = seg.reader.lock();
+                inner.seek(SeekFrom::Start(offset_in_seg))?;
+                let n = inner.read(&mut buf[read_total..read_total + to_read])?;
+                read_total += n;
+                local_pos = local_pos.saturating_add(n as u64);
+                if n == 0 {
+                    // Defensive: if inner returned EOF unexpectedly, advance.
+                    seg_index += 1;
+                    continue;
+                }
+            }
+        }
+
+        self.pos = self.pos.saturating_add(read_total as u64);
+        Ok(read_total)
+    }
+}
+
+impl<P> Seek for SegmentedReader<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Start(p) => {
+                self.pos = p;
+                Ok(self.pos)
+            }
+            SeekFrom::Current(delta) => {
+                if delta < 0 {
+                    self.pos = self.pos.saturating_sub(delta.unsigned_abs());
+                } else {
+                    self.pos = self.pos.saturating_add(delta as u64);
+                }
+                Ok(self.pos)
+            }
+            SeekFrom::End(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "seek from end not supported in segmented reader",
+            )),
+        }
+    }
+}
+
+/// Writer that orchestrates per-chunk writers via ordered `StreamControl` messages.
+/// Actual bytes are written to the current chunk's inner writer.
+///
+/// This implements `StorageWriter::control` to receive chunk boundaries and resources.
+pub struct SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    state: Arc<RwLock<SharedState<P>>>,
+    inner: P,
+
+    current_stream_key: Option<ResourceKey>,
+    current_seg_index: Option<usize>,
+    current_kind: Option<ChunkKind>,
+}
+
+impl<P> SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn ensure_stream(&self, key: &ResourceKey) {
+        let mut guard = self.state.write();
+        guard
+            .streams
+            .entry(key.clone())
+            .or_insert_with(StreamState::<P>::default);
+    }
+
+    fn open_new_segment(
+        &mut self,
+        stream_key: ResourceKey,
+        reported: Option<u64>,
+        kind: ChunkKind,
+        filename_hint: Option<Arc<str>>,
+    ) -> io::Result<()> {
+        self.ensure_stream(&stream_key);
+
+        let content_length = reported
+            .map(|r| {
+                ContentLength::Dynamic(DynamicLength {
+                    reported: r,
+                    gathered: None,
+                })
+            })
+            .unwrap_or(ContentLength::Unknown);
+
+        let (reader, writer) = self.inner.clone().into_reader_writer(content_length)?;
+        let segment = Arc::new(Segment::<P>::new(
+            reader,
+            writer,
+            reported,
+            kind,
+            filename_hint,
+        ));
+
+        let mut guard = self.state.write();
+        let stream = guard
+            .streams
+            .get_mut(&stream_key)
+            .expect("stream must exist after ensure_stream");
+        stream.segments.push(segment);
+        self.current_stream_key = Some(stream_key);
+        self.current_seg_index = Some(stream.segments.len() - 1);
+        self.current_kind = Some(kind);
+        Ok(())
+    }
+
+    fn active_stream_key(&self) -> ResourceKey {
+        let guard = self.state.read();
+        self.current_stream_key
+            .clone()
+            .unwrap_or_else(|| guard.default_stream_key.clone())
+    }
+
+    fn current_segment(&self) -> io::Result<Arc<Segment<P>>> {
+        let guard = self.state.read();
+        let stream_key = self.active_stream_key();
+        let stream = guard.streams.get(&stream_key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "stream not found while resolving current segment",
+            )
+        })?;
+
+        let Some(seg_index) = self.current_seg_index else {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "no active segment; expected ChunkStart before data",
+            ));
+        };
+
+        if seg_index >= stream.segments.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "active segment index out of bounds",
+            ));
+        }
+
+        Ok(stream.segments[seg_index].clone())
+    }
+
+    fn finalize_current_segment(&mut self, gathered_len: u64) -> io::Result<()> {
+        let seg = self.current_segment()?;
+        {
+            let mut g = seg.gathered_len.lock();
+            *g = gathered_len;
+        }
+
+        if let Some(mut inner) = seg.writer.lock().take() {
+            // Best-effort flush; truncation is not part of core StorageWriter contract today.
+            let _ = inner.flush();
+        }
+        *seg.finalized.lock() = true;
+
+        // Keep current_seg_index as-is; the next ChunkStart will open the next one.
+        Ok(())
+    }
+
+    fn store_resource(&self, key: ResourceKey, data: Bytes) -> io::Result<()> {
+        // Keep an in-memory copy (useful for debugging / quick reads if we later add a handle).
+        {
+            let mut guard = self.state.write();
+            guard.resources.insert(key.clone(), data.clone());
+        }
+
+        // Persist to disk under resource_root to survive across readers/handles.
+        // This is best-effort; it is ok to disable/adjust later.
+        use std::fs;
+        use std::fs::OpenOptions;
+        use std::io::Write as _;
+
+        let root = { self.state.read().resource_root.clone() };
+
+        // If handle support is enabled, we'd use a safer encoder. For now, a very small sanitizer.
+        let rel = {
+            let mut pb = PathBuf::new();
+            for comp in key.0.split('/') {
+                let clean: String = comp
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                if !clean.is_empty() {
+                    pb.push(clean);
+                }
+            }
+            if pb.as_os_str().is_empty() {
+                pb.push("default");
+            }
+            pb
+        };
+
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        f.write_all(&data)?;
+        f.flush()?;
+        Ok(())
+    }
+}
+
+impl<P> Write for SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.current_seg_index.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "received data without active chunk; expected StreamControl::ChunkStart before data",
+            ));
+        }
+
+        let seg = self.current_segment()?;
+        if seg.is_finalized() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "received data after chunk was finalized",
+            ));
+        }
+
+        let mut guard = seg.writer.lock();
+        let Some(inner) = guard.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "chunk writer missing while chunk is not finalized",
+            ));
+        };
+
+        let offset_in_seg = inner.seek(SeekFrom::Current(0))?;
+        let written = inner.write(buf)?;
+        inner.flush()?;
+
+        // Update gathered length = max(existing, offset + written)
+        {
+            let mut g = seg.gathered_len.lock();
+            let new_gathered = offset_in_seg.saturating_add(written as u64);
+            if new_gathered > *g {
+                *g = new_gathered;
+            }
+        }
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<P> Seek for SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        // For correctness, only allow seeking within the current active (non-finalized) segment.
+        let seg = self.current_segment()?;
+        if seg.is_finalized() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "writer seek not supported after chunk finalization",
+            ));
+        }
+
+        let mut guard = seg.writer.lock();
+        let Some(inner) = guard.as_mut() else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "chunk writer missing",
+            ));
+        };
+
+        let new_pos = inner.seek(pos)?;
+        // Update gathered length pessimistically to avoid shrinking visible length.
+        {
+            let mut g = seg.gathered_len.lock();
+            if new_pos > *g {
+                *g = new_pos;
+            }
+        }
+        Ok(new_pos)
+    }
+}
+
+impl<P> StorageWriter for SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    fn control(&mut self, msg: StreamControl) -> io::Result<()> {
+        match msg {
+            StreamControl::ChunkStart {
+                stream_key,
+                kind,
+                reported_len,
+                filename_hint,
+            } => self.open_new_segment(stream_key, reported_len, kind, filename_hint),
+
+            StreamControl::ChunkEnd {
+                stream_key: _,
+                kind: _,
+                gathered_len,
+            } => self.finalize_current_segment(gathered_len),
+
+            StreamControl::StoreResource { key, data } => self.store_resource(key, data),
+        }
+    }
+}
+
+/// Optional helper method (not part of core traits) to report cached ranges for a stream.
+///
+/// This is useful for debugging and for later “smart seek” behaviors.
+/// We keep it as an inherent method so we don't need to change core traits again.
+impl<P> SegmentedWriter<P>
+where
+    P: StorageProvider + Clone + Send + 'static,
+{
+    /// Returns a synthetic segmented `ContentLength` and a list of cached ranges for `stream_key`.
+    pub fn get_cached_ranges_for(
+        &self,
+        stream_key: &ResourceKey,
+    ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
+        let guard = self.state.read();
+        let Some(stream) = guard.streams.get(stream_key) else {
+            return Ok(None);
+        };
+        if stream.segments.is_empty() {
+            return Ok(None);
+        }
+
+        let mut ranges = Vec::<Range<u64>>::with_capacity(stream.segments.len());
+        let mut lengths = Vec::<DynamicLength>::with_capacity(stream.segments.len());
+        let mut offset = 0u64;
+
+        for seg in &stream.segments {
+            let gathered = seg.available_len();
+            let reported = seg.reported.unwrap_or(gathered);
+            lengths.push(DynamicLength {
+                reported,
+                gathered: Some(gathered),
+            });
+
+            let start = offset;
+            let end = start.saturating_add(gathered);
+            ranges.push(start..end);
+            offset = end;
+        }
+
+        // Core `ContentLength` currently has Static/Dynamic/Unknown in `5c6cadb`.
+        // In `47e49d4` there was a `ContentLength::Segmented`. We cannot assume it exists now.
+        //
+        // To keep this file self-contained and compiling against current core, we return a Dynamic
+        // length with reported = sum(reported) and gathered = sum(gathered). This is enough for
+        // capacity planning and basic introspection.
+        let sum_reported = lengths.iter().map(|d| d.reported).sum::<u64>();
+        let sum_gathered = lengths
+            .iter()
+            .map(|d| d.gathered.unwrap_or(d.reported))
+            .sum::<u64>();
+
+        Ok(Some((
+            ContentLength::Dynamic(DynamicLength {
+                reported: sum_reported,
+                gathered: Some(sum_gathered),
+            }),
+            ranges,
+        )))
+    }
+}

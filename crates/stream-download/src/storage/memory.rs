@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
 
-use super::{ContentLength, StorageProvider};
+use super::{ContentLength, StorageProvider, StorageWriter};
 use crate::WrapIoResult;
 
 /// Creates a [`MemoryStorage`] with an initial size based on the supplied content length.
@@ -55,6 +55,8 @@ pub struct MemoryStorage {
     position: usize,
     written: Arc<AtomicUsize>,
 }
+
+impl StorageWriter for MemoryStorage {}
 
 impl Read for MemoryStorage {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {

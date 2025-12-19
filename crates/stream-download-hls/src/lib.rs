@@ -20,6 +20,7 @@
 //! - `downloader`: A thin wrapper around `stream-download` for fetching resources.
 //! - `traits`: High-level traits for abstracting media stream sources.
 //! - `stream`: HLS implementation of the `SourceStream` trait.
+//! - `storage`: Segmented storage provider for splitting HLS segments into separate files.
 //!
 //! This file (`lib.rs`) acts as a facade: it re-exports the main
 //! types and functions from the internal modules to form the public API
@@ -31,6 +32,7 @@ mod manager;
 mod model;
 mod parser;
 mod settings;
+mod storage;
 mod stream;
 mod traits;
 mod worker;
@@ -44,6 +46,7 @@ pub use crate::model::{
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
+pub use crate::storage::SegmentedStorageProvider;
 pub use crate::stream::{HlsStream, HlsStreamParams};
 pub use crate::traits::{
     MediaStream, NextSegmentResult, SegmentData, SegmentType, StreamMiddleware, apply_middlewares,
