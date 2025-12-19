@@ -3,9 +3,12 @@
 //! This module provides `HlsStream`, a `SourceStream` implementation for HLS streams.
 //! It handles playlist parsing, segment downloading, and adaptive bitrate switching.
 //!
-//! The stream produces raw bytes from HLS media segments, including init segments
-//! when available. The stream concatenates init segment data with media segment data
-//! to ensure proper decoding.
+//! The stream produces ordered [`StreamMsg`] items:
+//! - `StreamMsg::Data(Bytes)` for payload data
+//! - `StreamMsg::Control(StreamControl::...)` for ordered chunk boundaries and resources
+//!
+//! This ordering is the foundation for segmented storage (init/media segments in separate files)
+//! while still exposing a single contiguous `Read + Seek` view via a stitched reader.
 //!
 //! # Performance Considerations for Mobile Devices
 //!
@@ -20,14 +23,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{self, Poll};
 
-use bytes::Bytes;
 use futures_util::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 
 use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
-use stream_download::source::{SourceStream, StreamMsg};
+use stream_download::source::{SourceStream, StreamControl, StreamMsg};
 use stream_download::storage::ContentLength;
 
 /// Parameters for creating an HLS stream.
@@ -50,8 +52,8 @@ impl HlsStreamParams {
 }
 
 pub struct HlsStream {
-    /// Channel receiver for stream data.
-    data_receiver: mpsc::Receiver<Bytes>,
+    /// Channel receiver for ordered stream messages (data + control).
+    data_receiver: mpsc::Receiver<StreamMsg>,
     /// Channel sender for seek commands to the streaming loop.
     seek_sender: mpsc::Sender<u64>,
     /// Cancellation token for graceful shutdown.
@@ -94,7 +96,7 @@ impl HlsStream {
         // Create channels for data and commands
         // Use bounded channel for data to control backpressure with configurable buffer size
         let buffer_size = settings.prefetch_buffer_size;
-        let (data_sender, data_receiver) = mpsc::channel(buffer_size);
+        let (data_sender, data_receiver) = mpsc::channel::<StreamMsg>(buffer_size);
         let (seek_sender, seek_receiver) = mpsc::channel(1);
         let cancel_token = CancellationToken::new();
 
@@ -130,7 +132,7 @@ impl HlsStream {
     async fn start_streaming_task(
         url: Arc<str>,
         settings: Arc<crate::HlsSettings>,
-        data_sender: mpsc::Sender<Bytes>,
+        data_sender: mpsc::Sender<StreamMsg>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
@@ -230,9 +232,26 @@ impl Stream for HlsStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         match self.data_receiver.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                tracing::trace!("HlsStream::poll_next: returning {} bytes", data.len());
-                Poll::Ready(Some(Ok(StreamMsg::Data(data))))
+            Poll::Ready(Some(msg)) => {
+                // Control messages are ordered relative to data and must be forwarded as-is.
+                match &msg {
+                    StreamMsg::Data(bytes) => {
+                        tracing::trace!(
+                            "HlsStream::poll_next: returning Data({} bytes)",
+                            bytes.len()
+                        );
+                    }
+                    StreamMsg::Control(StreamControl::ChunkStart { .. }) => {
+                        tracing::trace!("HlsStream::poll_next: returning Control(ChunkStart)");
+                    }
+                    StreamMsg::Control(StreamControl::ChunkEnd { .. }) => {
+                        tracing::trace!("HlsStream::poll_next: returning Control(ChunkEnd)");
+                    }
+                    StreamMsg::Control(StreamControl::StoreResource { .. }) => {
+                        tracing::trace!("HlsStream::poll_next: returning Control(StoreResource)");
+                    }
+                }
+                Poll::Ready(Some(Ok(msg)))
             }
             Poll::Ready(None) => {
                 tracing::trace!("HlsStream::poll_next: channel closed");

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -9,6 +8,7 @@ use crate::{
     AbrConfig, AbrController, Aes128CbcMiddleware, HlsErrorKind, HlsManager, HlsStreamError,
     MediaStream, ResourceDownloader, StreamEvent, StreamMiddleware, apply_middlewares,
 };
+use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -17,7 +17,7 @@ enum RaceOutcome<T> {
 }
 
 pub struct HlsStreamWorker {
-    data_sender: mpsc::Sender<Bytes>,
+    data_sender: mpsc::Sender<StreamMsg>,
     seek_receiver: mpsc::Receiver<u64>,
     cancel_token: CancellationToken,
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
@@ -244,9 +244,8 @@ impl HlsStreamWorker {
     async fn pump_stream_chunks(
         &mut self,
         mut stream: crate::HlsByteStream,
-    ) -> Result<(), HlsStreamError> {
-        // Reserve on demand to avoid long-lived borrows during prefetch phases
-        let mut first_permit: Option<tokio::sync::mpsc::Permit<Bytes>> = None;
+    ) -> Result<u64, HlsStreamError> {
+        let mut gathered_len: u64 = 0;
 
         loop {
             let next_fut = futures_util::StreamExt::next(&mut stream);
@@ -266,19 +265,15 @@ impl HlsStreamWorker {
                 RaceOutcome::Completed(item) => {
                     match item {
                         Some(Ok(chunk)) => {
-                            // Send chunk
-                            let permit = match first_permit.take() {
-                                Some(p) => p,
-                                None => match self.data_sender.reserve().await {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        tracing::trace!("HLS stream: receiver dropped, stopping");
-                                        break;
-                                    }
-                                },
-                            };
                             let len = chunk.len() as u64;
-                            permit.send(chunk);
+                            gathered_len = gathered_len.saturating_add(len);
+
+                            // Send chunk as ordered stream message.
+                            if self.data_sender.send(StreamMsg::Data(chunk)).await.is_err() {
+                                tracing::trace!("HLS stream: receiver dropped, stopping");
+                                break;
+                            }
+
                             self.current_position = self.current_position.saturating_add(len);
                         }
                         Some(Err(e)) => {
@@ -299,7 +294,7 @@ impl HlsStreamWorker {
             }
         }
 
-        Ok(())
+        Ok(gathered_len)
     }
 
     /// Process a single segment descriptor: computes size, handles skip, DRM, events and streaming.
@@ -364,10 +359,46 @@ impl HlsStreamWorker {
             }
         };
 
+        // Emit ordered control message to start a new chunk in segmented storage.
+        let stream_key: ResourceKey = format!("hls/variant-{}", desc.variant_id.0).into();
+        let kind = if desc.is_init {
+            ChunkKind::Init
+        } else {
+            ChunkKind::Media
+        };
+
+        // Filename hint: for now we use the URI basename (query stripped) when possible.
+        // This will be used later by file-based storage factories for deterministic naming.
+        let filename_hint = {
+            let uri = desc.uri.as_str();
+            let no_query = uri.split('?').next().unwrap_or(uri);
+            no_query.rsplit('/').next().map(|s| Arc::<str>::from(s))
+        };
+
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkStart {
+                stream_key: stream_key.clone(),
+                kind,
+                reported_len: seg_size,
+                filename_hint,
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
+
         // Apply streaming middlewares (DRM, etc.) and pump data
         let middlewares = HlsStreamWorker::build_middlewares(drm_params_opt);
         let stream = apply_middlewares(stream, &middlewares);
-        self.pump_stream_chunks(stream).await?;
+        let gathered_len = self.pump_stream_chunks(stream).await?;
+
+        // Emit ordered control message to finalize the chunk.
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkEnd {
+                stream_key,
+                kind,
+                gathered_len,
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
 
         // Emit segment boundary events after finishing streaming
         self.emit_post_segment_events(&desc);
@@ -378,7 +409,7 @@ impl HlsStreamWorker {
     pub async fn new(
         url: Arc<str>,
         settings: Arc<crate::HlsSettings>,
-        data_sender: mpsc::Sender<Bytes>,
+        data_sender: mpsc::Sender<StreamMsg>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
