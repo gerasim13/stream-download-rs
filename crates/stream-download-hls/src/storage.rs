@@ -12,8 +12,7 @@
 //! Design notes:
 //! - All segmentation is driven by **ordered** `StreamMsg::Control(StreamControl::...)` messages.
 //!   There is no separate channel for control vs data, so ordering is deterministic.
-//! - Each chunk is backed by a fresh `P: StorageProvider` instance (e.g. `TempStorageProvider`,
-//!   `MemoryStorageProvider`, or a file provider), cloned from an inner factory.
+//! - Each chunk is backed by a fresh `P: StorageProvider` instance created by a factory.
 //! - Multiple logical streams are supported by `stream_key` (e.g. different variants/codecs).
 //! - Auxiliary resources (init segments, playlists, keys) can be stored via `StoreResource` and
 //!   retrieved via an optional `StorageHandle`.
@@ -50,34 +49,49 @@ use stream_download::storage::{ContentLength, DynamicLength, StorageProvider, St
 #[cfg(any())]
 use stream_download::storage::{ProvidesStorageHandle, StorageHandle, StorageResourceReader};
 
+type ProviderFactory<P> = Arc<dyn Fn() -> P + Send + Sync + 'static>;
+
 /// A segmented storage provider.
 ///
-/// Wraps an inner provider `P` and orchestrates per-chunk inner providers based on `StreamControl`.
+/// Wraps an inner provider factory and orchestrates per-chunk inner providers based on
+/// `StreamControl`.
 ///
-/// - `P` is cloned per chunk.
+/// - A fresh `P` is created per chunk via the factory.
 /// - Each chunk gets its own `(P::Reader, P::Writer)` pair.
 /// - A `SegmentedReader` stitches chunks for a chosen `stream_key`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SegmentedStorageProvider<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
-    inner: P,
+    factory: ProviderFactory<P>,
     default_stream_key: ResourceKey,
     resource_root: PathBuf,
 }
 
 impl<P> SegmentedStorageProvider<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
-    /// Create a new segmented storage provider wrapping an inner provider factory.
-    pub fn new(inner: P) -> Self {
+    /// Create a new segmented storage provider that uses `factory` to create a fresh inner provider
+    /// for each chunk.
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: Fn() -> P + Send + Sync + 'static,
+    {
         Self {
-            inner,
+            factory: Arc::new(factory),
             default_stream_key: ResourceKey("playback".into()),
             resource_root: std::env::temp_dir().join("stream-download-hls-resources"),
         }
+    }
+
+    /// Convenience constructor for providers that can be created with `Default`.
+    pub fn new_default() -> Self
+    where
+        P: Default,
+    {
+        Self::new(P::default)
     }
 
     /// Override the default logical stream key used by the reader.
@@ -97,7 +111,7 @@ where
 
 impl<P> StorageProvider for SegmentedStorageProvider<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     type Reader = SegmentedReader<P>;
     type Writer = SegmentedWriter<P>;
@@ -130,7 +144,7 @@ where
 
         let writer = SegmentedWriter::<P> {
             state,
-            inner: self.inner,
+            factory: self.factory,
             current_stream_key: None,
             current_seg_index: None,
             current_kind: None,
@@ -161,7 +175,7 @@ where
 /// Shared orchestration state for segmented storage.
 struct SharedState<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     default_stream_key: ResourceKey,
     resources: HashMap<ResourceKey, Bytes>,
@@ -220,14 +234,14 @@ fn sanitize_component(s: &str) -> String {
 /// Per-stream segmented state (sequence of segments, in order).
 struct StreamState<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     segments: Vec<Arc<Segment<P>>>,
 }
 
 impl<P> Default for StreamState<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn default() -> Self {
         Self {
@@ -241,7 +255,7 @@ where
 /// A single segment, backed by an inner provider's `(Reader, Writer)`.
 struct Segment<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     /// Reader for this segment. Protected by a mutex to allow safe seek/read.
     reader: Mutex<P::Reader>,
@@ -261,7 +275,7 @@ where
 
 impl<P> Segment<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn new(
         reader: P::Reader,
@@ -293,7 +307,7 @@ where
 /// Reader that stitches per-segment readers of the current stream into a single logical stream.
 pub struct SegmentedReader<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     state: Arc<RwLock<SharedState<P>>>,
     stream_key: ResourceKey,
@@ -302,7 +316,7 @@ where
 
 impl<P> SegmentedReader<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     /// Switch the logical stream being read (e.g. after a codec/variant discontinuity).
     pub fn set_stream_key(&mut self, key: ResourceKey) {
@@ -318,7 +332,7 @@ where
 
 impl<P> Read for SegmentedReader<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
@@ -401,7 +415,7 @@ where
 
 impl<P> Seek for SegmentedReader<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
@@ -431,10 +445,10 @@ where
 /// This implements `StorageWriter::control` to receive chunk boundaries and resources.
 pub struct SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     state: Arc<RwLock<SharedState<P>>>,
-    inner: P,
+    factory: ProviderFactory<P>,
 
     current_stream_key: Option<ResourceKey>,
     current_seg_index: Option<usize>,
@@ -443,7 +457,7 @@ where
 
 impl<P> SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn ensure_stream(&self, key: &ResourceKey) {
         let mut guard = self.state.write();
@@ -471,7 +485,7 @@ where
             })
             .unwrap_or(ContentLength::Unknown);
 
-        let (reader, writer) = self.inner.clone().into_reader_writer(content_length)?;
+        let (reader, writer) = (self.factory)().into_reader_writer(content_length)?;
         let segment = Arc::new(Segment::<P>::new(
             reader,
             writer,
@@ -599,7 +613,7 @@ where
 
 impl<P> Write for SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.current_seg_index.is_none() {
@@ -648,7 +662,7 @@ where
 
 impl<P> Seek for SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         // For correctness, only allow seeking within the current active (non-finalized) segment.
@@ -682,7 +696,7 @@ where
 
 impl<P> StorageWriter for SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     fn control(&mut self, msg: StreamControl) -> io::Result<()> {
         match msg {
@@ -710,7 +724,7 @@ where
 /// We keep it as an inherent method so we don't need to change core traits again.
 impl<P> SegmentedWriter<P>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    P: StorageProvider + Send + 'static,
 {
     /// Returns a synthetic segmented `ContentLength` and a list of cached ranges for `stream_key`.
     pub fn get_cached_ranges_for(
