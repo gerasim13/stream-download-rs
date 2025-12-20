@@ -41,6 +41,7 @@ use parking_lot::{Mutex, RwLock};
 
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl};
 use stream_download::storage::{ContentLength, DynamicLength, StorageProvider, StorageWriter};
+use tracing::trace;
 
 /// Optional integration: if the core provides these types/traits (they existed in earlier WIP),
 /// `SegmentedStorageProvider` can vend a handle to read stored resources.
@@ -544,12 +545,26 @@ where
                 .unwrap_or(0)
         };
 
+        trace!(
+            "storage: ChunkStart stream_key='{}' chunk_id={} kind={:?} reported_len={:?} filename_hint={:?}",
+            stream_key.0,
+            chunk_id,
+            kind,
+            reported,
+            filename_hint.as_deref()
+        );
+
         let provider = self.factory.provider_for_segment(
             &stream_key,
             chunk_id,
             kind,
             filename_hint.as_deref(),
         )?;
+
+        trace!(
+            "storage: segment provider created stream_key='{}' chunk_id={} kind={:?}",
+            stream_key.0, chunk_id, kind
+        );
 
         let (reader, writer) = provider.into_reader_writer(content_length)?;
         let segment = Arc::new(Segment::<F::Provider>::new(
@@ -613,6 +628,11 @@ where
             *g = gathered_len;
         }
 
+        trace!(
+            "storage: ChunkEnd gathered_len={} (finalizing segment)",
+            gathered_len
+        );
+
         if let Some(mut inner) = seg.writer.lock().take() {
             // Best-effort flush; truncation is not part of core StorageWriter contract today.
             let _ = inner.flush();
@@ -624,6 +644,12 @@ where
     }
 
     fn store_resource(&self, key: ResourceKey, data: Bytes) -> io::Result<()> {
+        trace!(
+            "storage: StoreResource received key='{}' ({} bytes)",
+            key.0,
+            data.len()
+        );
+
         // Keep an in-memory copy (useful for debugging / quick reads if we later add a handle).
         {
             let mut guard = self.state.write();
@@ -675,6 +701,8 @@ where
         };
 
         let path = root.join(rel);
+        trace!("storage: StoreResource write path='{}'", path.display());
+
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -687,6 +715,14 @@ where
 
         f.write_all(&data)?;
         f.flush()?;
+
+        trace!(
+            "storage: StoreResource persisted key='{}' ({} bytes) -> '{}'",
+            key.0,
+            data.len(),
+            path.display()
+        );
+
         Ok(())
     }
 }

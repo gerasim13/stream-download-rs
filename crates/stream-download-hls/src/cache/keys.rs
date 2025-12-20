@@ -33,12 +33,19 @@
 //!   components to prevent traversal.
 //!
 //! This module does **not** perform any IO.
+//!
+//! Logging
+//! -------
+//! This module emits `trace` logs when it successfully derives basenames / keys (or fails to),
+//! to help debug cache key mapping issues.
 
 use std::borrow::Cow;
 
 use stream_download::source::ResourceKey;
 
 use crate::model::VariantId;
+
+use tracing::trace;
 
 /// Best-effort basename extraction for a URI-like string.
 ///
@@ -54,7 +61,14 @@ use crate::model::VariantId;
 pub fn uri_basename_no_query(uri: &str) -> Option<&str> {
     let no_query = uri.split('?').next().unwrap_or(uri);
     let base = no_query.rsplit('/').next().unwrap_or(no_query);
-    if base.is_empty() { None } else { Some(base) }
+    let out = if base.is_empty() { None } else { Some(base) };
+
+    match out {
+        Some(b) => trace!("cache_key: basename derived uri='{}' basename='{}'", uri, b),
+        None => trace!("cache_key: basename missing uri='{}'", uri),
+    }
+
+    out
 }
 
 /// Construct a playlist cache key (master or variant) given a URL string.
@@ -65,7 +79,12 @@ pub fn uri_basename_no_query(uri: &str) -> Option<&str> {
 /// Returns `None` if the URL does not have a usable basename.
 pub fn playlist_key_from_url(master_hash: &str, playlist_url: &str) -> Option<ResourceKey> {
     let basename = uri_basename_no_query(playlist_url)?;
-    Some(playlist_key_from_basename(master_hash, basename))
+    let key = playlist_key_from_basename(master_hash, basename);
+    trace!(
+        "cache_key: playlist key derived master_hash='{}' url='{}' key='{}'",
+        master_hash, playlist_url, key.0
+    );
+    Some(key)
 }
 
 /// Construct a playlist cache key (master or variant) given a basename.
@@ -75,7 +94,12 @@ pub fn playlist_key_from_url(master_hash: &str, playlist_url: &str) -> Option<Re
 #[inline]
 pub fn playlist_key_from_basename(master_hash: &str, playlist_basename: &str) -> ResourceKey {
     // Keep it allocation-friendly: allocate one String once.
-    ResourceKey(format!("{}/{}", master_hash, playlist_basename).into())
+    let key = ResourceKey(format!("{}/{}", master_hash, playlist_basename).into());
+    trace!(
+        "cache_key: playlist key from basename master_hash='{}' basename='{}' key='{}'",
+        master_hash, playlist_basename, key.0
+    );
+    key
 }
 
 /// Construct a variant-scoped key cache key given a URL string.
@@ -90,7 +114,12 @@ pub fn key_key_from_url(
     key_url: &str,
 ) -> Option<ResourceKey> {
     let basename = uri_basename_no_query(key_url)?;
-    Some(key_key_from_basename(master_hash, variant_id, basename))
+    let key = key_key_from_basename(master_hash, variant_id, basename);
+    trace!(
+        "cache_key: key key derived master_hash='{}' variant_id={} url='{}' key='{}'",
+        master_hash, variant_id.0, key_url, key.0
+    );
+    Some(key)
 }
 
 /// Construct a variant-scoped key cache key given a basename.
@@ -103,7 +132,12 @@ pub fn key_key_from_basename(
     variant_id: VariantId,
     key_basename: &str,
 ) -> ResourceKey {
-    ResourceKey(format!("{}/{}/{}", master_hash, variant_id.0, key_basename).into())
+    let key = ResourceKey(format!("{}/{}/{}", master_hash, variant_id.0, key_basename).into());
+    trace!(
+        "cache_key: key key from basename master_hash='{}' variant_id={} basename='{}' key='{}'",
+        master_hash, variant_id.0, key_basename, key.0
+    );
+    key
 }
 
 /// Convenience: given a playlist URL, return an owned-or-borrowed basename (query stripped).

@@ -26,6 +26,7 @@
 //! - Cache read errors are treated as cache misses by default (best-effort).
 //! - Cached methods return [`CachedBytes`] so callers can decide whether to persist via `StoreResource`
 //!   only on network misses.
+//! - This module emits `trace` logs for cache hits/misses and cache read errors.
 
 use bytes::Bytes;
 use stream_download::source::ResourceKey;
@@ -33,6 +34,7 @@ use stream_download::storage::StorageHandle;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{HlsError, HlsResult};
+use tracing::trace;
 
 /// Where the returned bytes came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,13 +102,23 @@ impl CachedResourceDownloader {
     /// Try to read from cache. Returns `Ok(Some(bytes))` for a hit, `Ok(None)` for miss.
     fn read_cache(&self, key: &ResourceKey) -> HlsResult<Option<Bytes>> {
         let Some(handle) = &self.handle else {
+            trace!("cache: disabled; key='{}'", key.0);
             return Ok(None);
         };
 
         match handle.read(key) {
-            Ok(v) => Ok(v),
+            Ok(Some(bytes)) => {
+                trace!("cache: HIT key='{}' ({} bytes)", key.0, bytes.len());
+                Ok(Some(bytes))
+            }
+            Ok(None) => {
+                trace!("cache: MISS key='{}'", key.0);
+                Ok(None)
+            }
             Err(e) => {
+                trace!("cache: READ ERROR key='{}' err='{}'", key.0, e);
                 if self.best_effort_cache {
+                    trace!("cache: treating read error as miss (best_effort_cache=true)");
                     Ok(None)
                 } else {
                     Err(HlsError::Io(format!(
@@ -127,14 +139,26 @@ impl CachedResourceDownloader {
         url: &str,
         key: &ResourceKey,
     ) -> HlsResult<CachedBytes> {
+        trace!("playlist: request url='{}' key='{}'", url, key.0);
         if let Some(bytes) = self.read_cache(key)? {
+            trace!("playlist: serving from cache key='{}'", key.0);
             return Ok(CachedBytes {
                 bytes,
                 source: CacheSource::Cache,
             });
         }
 
+        trace!(
+            "playlist: downloading from network url='{}' key='{}'",
+            url, key.0
+        );
         let bytes = self.inner.download_playlist(url).await?;
+        trace!(
+            "playlist: downloaded from network url='{}' key='{}' ({} bytes)",
+            url,
+            key.0,
+            bytes.len()
+        );
         Ok(CachedBytes {
             bytes,
             source: CacheSource::Network,
@@ -150,14 +174,26 @@ impl CachedResourceDownloader {
         url: &str,
         key: &ResourceKey,
     ) -> HlsResult<CachedBytes> {
+        trace!("key: request url='{}' key='{}'", url, key.0);
         if let Some(bytes) = self.read_cache(key)? {
+            trace!("key: serving from cache key='{}'", key.0);
             return Ok(CachedBytes {
                 bytes,
                 source: CacheSource::Cache,
             });
         }
 
+        trace!(
+            "key: downloading from network url='{}' key='{}'",
+            url, key.0
+        );
         let bytes = self.inner.download_key(url).await?;
+        trace!(
+            "key: downloaded from network url='{}' key='{}' ({} bytes)",
+            url,
+            key.0,
+            bytes.len()
+        );
         Ok(CachedBytes {
             bytes,
             source: CacheSource::Network,

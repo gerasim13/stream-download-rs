@@ -455,7 +455,8 @@ impl HlsStreamWorker {
             max_retry_delay,
         );
 
-        let mut manager = HlsManager::new(url.clone(), settings.clone(), manager_downloader);
+        let mut manager = HlsManager::new(url.clone(), settings.clone(), manager_downloader)
+            .with_control_sender(data_sender.clone());
 
         // Initialize manager and ABR controller
         manager

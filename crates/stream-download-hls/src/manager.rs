@@ -1,21 +1,14 @@
 //! HLS stream manager.
 //!
-//! NOTE: This file needs to be updated to use the cached downloader wrapper for playlist/key
-//! downloads. I can’t safely produce exact `<old_text>` snippets for this file in the required
-//! patch format without reading the current file contents (tool access is disabled in this turn).
-//!
-//! Please re-enable file-reading for the next turn, or paste the relevant parts of
-//! `crates/stream-download-hls/src/manager.rs` (imports + `HlsManager` struct + the methods that
-//! download master/media playlists and keys). Then I’ll provide a precise `<edits>` patch that:
-//! - threads an optional `StorageHandle` into the manager (or into the downloader it owns),
-//! - uses `CachedResourceDownloader::download_playlist_cached` / `download_key_cached`,
-//! - emits `StreamControl::StoreResource { key, data }` after network misses,
-//! - uses `ResourceKey` formatting you approved:
-//!   - playlists: `"<master_hash>/<playlist_basename>"`
-//!   - keys: `"<master_hash>/<variant_id>/<key_basename>"`
-//!
 //! This module provides [`HlsManager`], a high-level handle for working with a
 //! single HLS stream (identified by a master playlist URL).
+//!
+//! Caching responsibilities:
+//! - **Read-before-fetch** for playlists/keys is performed by [`CachedResourceDownloader`] using
+//!   a [`stream_download::storage::StorageHandle`].
+//! - **Key formatting** for cached playlists/keys is centralized in `crate::cache::keys`.
+//! - After a **network miss**, the manager emits `StreamControl::StoreResource { key, data }` so the
+//!   storage layer can persist the resource under `storage_root/<key-as-path>`.
 //!
 //! At this stage it intentionally contains only a minimal, non-networked
 //! skeleton so that higher layers can start integrating against a stable API.
@@ -42,7 +35,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use tracing::instrument;
 
+use crate::cache::keys as cache_keys;
 use crate::downloader::ResourceDownloader;
+use crate::downloader_cached::{CacheSource, CachedResourceDownloader};
 use crate::model::{
     EncryptionMethod, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
     SegmentKey, VariantId, VariantStream,
@@ -50,6 +45,9 @@ use crate::model::{
 use crate::parser::{parse_master_playlist, parse_media_playlist};
 use crate::settings::HlsSettings;
 use crate::traits::{MediaStream, NextSegmentResult, SegmentData};
+use stream_download::source::{StreamControl, StreamMsg};
+use tokio::sync::mpsc;
+use tracing::trace;
 
 /// High-level handle for working with a single HLS stream.
 ///
@@ -73,6 +71,12 @@ pub struct HlsManager {
     config: Arc<HlsSettings>,
     /// Downloader used to fetch playlists and segments.
     downloader: ResourceDownloader,
+    /// Cached wrapper for playlist/key reads (read-before-fetch using `StorageHandle`).
+    cached_downloader: CachedResourceDownloader,
+    /// Optional control sender used to persist fetched resources via `StoreResource`.
+    ///
+    /// This is intentionally optional so unit tests and minimal setups don't need to wire it.
+    control_sender: Option<mpsc::Sender<StreamMsg>>,
 
     /// Cached master playlist, once loaded.
     master: Option<MasterPlaylist>,
@@ -115,10 +119,15 @@ impl HlsManager {
         config: Arc<HlsSettings>,
         downloader: ResourceDownloader,
     ) -> Self {
+        let downloader = downloader;
+        let cached_downloader = CachedResourceDownloader::new_uncached(downloader.clone());
+
         Self {
             master_url: master_url.into(),
             config,
             downloader,
+            cached_downloader,
+            control_sender: None,
             master: None,
             current_variant_index: None,
             current_media_playlist: None,
@@ -152,6 +161,59 @@ impl HlsManager {
     /// Mutable access to the underlying downloader.
     pub fn downloader_mut(&mut self) -> &mut ResourceDownloader {
         &mut self.downloader
+    }
+
+    /// Enable read-before-fetch caching for playlists/keys using the provided storage handle.
+    ///
+    /// This keeps changes in the manager minimal: the cached downloader encapsulates the caching
+    /// policy, while key formatting stays in `crate::cache::keys`.
+    pub fn with_storage_handle(
+        mut self,
+        handle: Option<stream_download::storage::StorageHandle>,
+    ) -> Self {
+        self.cached_downloader = CachedResourceDownloader::new(self.downloader.clone(), handle);
+        self
+    }
+
+    /// Enable persistence of fetched resources (playlists/keys) by providing a control sender.
+    ///
+    /// On network misses, the manager will emit `StreamControl::StoreResource { key, data }`
+    /// through this channel.
+    pub fn with_control_sender(mut self, sender: mpsc::Sender<StreamMsg>) -> Self {
+        self.control_sender = Some(sender);
+        self
+    }
+
+    /// Best-effort emit of `StoreResource` after a network miss so storage can persist the blob.
+    #[inline]
+    fn emit_store_resource(&self, key: stream_download::source::ResourceKey, data: Bytes) {
+        trace!(
+            "store_resource: persist request key='{}' ({} bytes)",
+            key.0,
+            data.len()
+        );
+
+        let Some(sender) = &self.control_sender else {
+            trace!(
+                "store_resource: skipped (no control_sender) key='{}' ({} bytes)",
+                key.0,
+                data.len()
+            );
+            return;
+        };
+
+        // Best-effort: if the channel is full/closed, we skip persistence rather than breaking playback.
+        match sender.try_send(StreamMsg::Control(StreamControl::StoreResource {
+            key,
+            data,
+        })) {
+            Ok(()) => {
+                trace!("store_resource: enqueued");
+            }
+            Err(e) => {
+                trace!("store_resource: enqueue failed err='{}'", e);
+            }
+        }
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
@@ -355,8 +417,22 @@ impl HlsManager {
     ///
     /// For now this is a stub that always returns an error.
     pub async fn load_master(&mut self) -> HlsResult<&MasterPlaylist> {
-        let data = self.downloader.download_playlist(&self.master_url).await?;
-        let master_playlist = parse_master_playlist(&data)?;
+        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let key =
+            cache_keys::playlist_key_from_url(&master_hash, &self.master_url).ok_or_else(|| {
+                HlsError::Message("unable to derive master playlist basename".to_string())
+            })?;
+
+        let res = self
+            .cached_downloader
+            .download_playlist_cached(&self.master_url, &key)
+            .await?;
+
+        if res.source == CacheSource::Network {
+            self.emit_store_resource(key.clone(), res.bytes.clone());
+        }
+
+        let master_playlist = parse_master_playlist(&res.bytes)?;
         self.master = Some(master_playlist);
         Ok(self.master.as_ref().unwrap())
     }
@@ -386,12 +462,22 @@ impl HlsManager {
             .clone(); // Clone to avoid borrowing issues
 
         let media_playlist_url = self.resolve_url(&variant.uri)?;
-        let data = self
-            .downloader
-            .download_playlist(&media_playlist_url)
+
+        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let key = cache_keys::playlist_key_from_url(&master_hash, &media_playlist_url).ok_or_else(
+            || HlsError::Message("unable to derive media playlist basename".to_string()),
+        )?;
+
+        let res = self
+            .cached_downloader
+            .download_playlist_cached(&media_playlist_url, &key)
             .await?;
 
-        let media_playlist = parse_media_playlist(&data, variant.id)?;
+        if res.source == CacheSource::Network {
+            self.emit_store_resource(key.clone(), res.bytes.clone());
+        }
+
+        let media_playlist = parse_media_playlist(&res.bytes, variant.id)?;
 
         // Preserve playback position by keeping the same segment index
         // This assumes variants are time-synchronized (standard HLS behavior)
@@ -448,8 +534,21 @@ impl HlsManager {
             .ok_or_else(|| HlsError::Message("no variant selected".to_string()))?;
 
         // Download and parse the latest media playlist
-        let data = self.downloader.download_playlist(&media_url).await?;
-        let media_playlist = parse_media_playlist(&data, variant_id)?;
+        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let key = cache_keys::playlist_key_from_url(&master_hash, &media_url).ok_or_else(|| {
+            HlsError::Message("unable to derive media playlist basename".to_string())
+        })?;
+
+        let res = self
+            .cached_downloader
+            .download_playlist_cached(&media_url, &key)
+            .await?;
+
+        if res.source == CacheSource::Network {
+            self.emit_store_resource(key.clone(), res.bytes.clone());
+        }
+
+        let media_playlist = parse_media_playlist(&res.bytes, variant_id)?;
         self.current_media_playlist = Some(media_playlist);
 
         Ok(self.current_media_playlist.as_ref().unwrap())
@@ -490,7 +589,24 @@ impl HlsManager {
             return Ok(cached.clone());
         }
 
-        let mut kb = self.downloader.download_key(final_key_url).await?;
+        // Variant-scoped key caching:
+        // key path: `<master_hash>/<variant_id>/<key_basename>`
+        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let variant_id = self.current_variant()?.id;
+
+        let key = cache_keys::key_key_from_url(&master_hash, variant_id, final_key_url)
+            .ok_or_else(|| HlsError::Message("unable to derive key basename".to_string()))?;
+
+        let res = self
+            .cached_downloader
+            .download_key_cached(final_key_url, &key)
+            .await?;
+
+        if res.source == CacheSource::Network {
+            self.emit_store_resource(key.clone(), res.bytes.clone());
+        }
+
+        let mut kb = res.bytes;
         if let Some(cb) = &self.config.key_processor_cb {
             kb = (cb)(kb);
         }
