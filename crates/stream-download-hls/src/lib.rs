@@ -17,8 +17,7 @@
 //! - `parser`: Parsing of master/media M3U8 playlists.
 //! - `manager`: `HlsManager` and the logic for handling a single HLS stream.
 //! - `abr`: A basic adaptive bitrate (ABR) controller.
-//! - `downloader`: A thin wrapper around `stream-download` for fetching resources.
-//! - `downloader_cached`: Read-before-fetch cache wrapper for playlists/keys.
+//! - `downloader`: Network downloader plus cached wrapper for playlists/keys.
 //! - `traits`: High-level traits for abstracting media stream sources.
 //! - `stream`: HLS implementation of the `SourceStream` trait.
 //! - `storage`: Segmented storage provider for splitting HLS segments into separate files.
@@ -34,7 +33,6 @@ use std::sync::Arc;
 mod abr;
 mod cache;
 mod downloader;
-mod downloader_cached;
 mod manager;
 mod model;
 mod parser;
@@ -45,8 +43,7 @@ mod traits;
 mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
-pub use crate::downloader::ResourceDownloader;
-pub use crate::downloader_cached::CachedResourceDownloader;
+pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
 pub use crate::manager::HlsManager;
 pub use crate::model::{
     HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,

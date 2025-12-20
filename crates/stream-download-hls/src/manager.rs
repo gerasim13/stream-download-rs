@@ -37,7 +37,7 @@ use tracing::instrument;
 
 use crate::cache::keys as cache_keys;
 use crate::downloader::ResourceDownloader;
-use crate::downloader_cached::{CacheSource, CachedResourceDownloader};
+use crate::downloader::{CacheSource, CachedResourceDownloader};
 use crate::model::{
     EncryptionMethod, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
     SegmentKey, VariantId, VariantStream,
