@@ -2,11 +2,12 @@ use std::error::Error;
 use std::time::Duration;
 
 use rodio::{OutputStreamBuilder, Sink};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use stream_download::source::DecodeError;
-use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
-    HlsSettings, HlsStream, HlsStreamParams, SegmentedStorageProvider, VariantId,
+    HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams, VariantId,
 };
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -33,14 +34,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let settings = HlsSettings::default().selection_manual(VariantId(0));
     let params = HlsStreamParams::new(url, settings);
 
+    // Persistent, deterministic on-disk storage layout:
+    // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
+    let storage_root = PathBuf::from("./hls-cache-seek");
+    std::fs::create_dir_all(&storage_root)?;
+    let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB
+    let max_cached_streams = NonZeroUsize::new(10).unwrap();
+    let provider = HlsPersistentStorageProvider::new_hls_file_tree(
+        storage_root,
+        prefetch_bytes,
+        Some(max_cached_streams),
+    );
+
     // Create a blocking reader over the HLS stream via StreamDownload, but store each HLS chunk
     // (init/media segments) separately via SegmentedStorageProvider. This enables correct seeking.
-    let reader = match StreamDownload::new::<HlsStream>(
-        params,
-        SegmentedStorageProvider::new(|| TempStorageProvider::default()),
-        Settings::default(),
-    )
-    .await
+    let reader = match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await
     {
         Ok(r) => r,
         Err(e) => {

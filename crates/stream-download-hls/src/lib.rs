@@ -18,6 +18,7 @@
 //! - `manager`: `HlsManager` and the logic for handling a single HLS stream.
 //! - `abr`: A basic adaptive bitrate (ABR) controller.
 //! - `downloader`: A thin wrapper around `stream-download` for fetching resources.
+//! - `downloader_cached`: Read-before-fetch cache wrapper for playlists/keys.
 //! - `traits`: High-level traits for abstracting media stream sources.
 //! - `stream`: HLS implementation of the `SourceStream` trait.
 //! - `storage`: Segmented storage provider for splitting HLS segments into separate files.
@@ -33,6 +34,7 @@ use std::sync::Arc;
 mod abr;
 mod cache;
 mod downloader;
+mod downloader_cached;
 mod manager;
 mod model;
 mod parser;
@@ -44,6 +46,7 @@ mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
 pub use crate::downloader::ResourceDownloader;
+pub use crate::downloader_cached::CachedResourceDownloader;
 pub use crate::manager::HlsManager;
 pub use crate::model::{
     HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,
@@ -58,6 +61,18 @@ pub use crate::storage::hls_factory::HlsFileTreeSegmentFactory;
 
 // Cache/policy layer (leases + eviction) wrapping a segment factory.
 pub use crate::storage::cache_layer::HlsCacheLayer;
+
+/// Default persistent HLS segmented storage provider type.
+///
+/// This is the recommended provider for "real disk caching":
+/// - segments: `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
+/// - small resources (`StoreResource`): `<storage_root>/<resource_key_as_path>`
+/// - LRU eviction and leases are enabled via the underlying cache layer.
+///
+/// Use [`HlsPersistentStorageProvider::new_hls_file_tree`] to construct it without specifying
+/// generics.
+pub type HlsPersistentStorageProvider =
+    SegmentedStorageProvider<HlsCacheLayer<HlsFileTreeSegmentFactory>>;
 
 pub use crate::stream::{HlsStream, HlsStreamParams};
 pub use crate::traits::{

@@ -1,5 +1,19 @@
 //! HLS stream manager.
 //!
+//! NOTE: This file needs to be updated to use the cached downloader wrapper for playlist/key
+//! downloads. I can’t safely produce exact `<old_text>` snippets for this file in the required
+//! patch format without reading the current file contents (tool access is disabled in this turn).
+//!
+//! Please re-enable file-reading for the next turn, or paste the relevant parts of
+//! `crates/stream-download-hls/src/manager.rs` (imports + `HlsManager` struct + the methods that
+//! download master/media playlists and keys). Then I’ll provide a precise `<edits>` patch that:
+//! - threads an optional `StorageHandle` into the manager (or into the downloader it owns),
+//! - uses `CachedResourceDownloader::download_playlist_cached` / `download_key_cached`,
+//! - emits `StreamControl::StoreResource { key, data }` after network misses,
+//! - uses `ResourceKey` formatting you approved:
+//!   - playlists: `"<master_hash>/<playlist_basename>"`
+//!   - keys: `"<master_hash>/<variant_id>/<key_basename>"`
+//!
 //! This module provides [`HlsManager`], a high-level handle for working with a
 //! single HLS stream (identified by a master playlist URL).
 //!

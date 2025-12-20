@@ -14,26 +14,24 @@
 //!   There is no separate channel for control vs data, so ordering is deterministic.
 //! - Each chunk is backed by a per-segment `StorageProvider` created by a factory.
 //! - Multiple logical streams are supported by `stream_key` (e.g. different variants/codecs).
-//! - Auxiliary resources (init segments, playlists, keys) can be stored via `StoreResource` and
-//!   retrieved via an optional `StorageHandle`.
+//! - Auxiliary resources (playlists, keys, etc.) can be stored via `StoreResource` and retrieved
+//!   via a tree-layout `StorageHandle` under `storage_root`.
 //!
 //! Important:
 //! - This is intentionally scoped to HLS for now. If later you want a generic segmented stream
 //!   facility, we can extract it into `stream-download`.
 //! - The writer is intentionally strict: **bytes must only be written after `ChunkStart`**.
 //!   If HLS emits data without an active chunk, we return an error to avoid corrupt outputs.
-//
-// Public storage helpers (e.g. deterministic file-tree factory).
+
 pub mod hls_factory;
 
-// Cache/policy layer (leases + eviction) that wraps a segment factory.
 pub mod cache_layer;
 
-// Tree-layout StorageHandle implementation for reading persisted resources by ResourceKey.
 pub mod tree_handle;
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,7 +92,9 @@ where
 {
     factory: F,
     default_stream_key: ResourceKey,
-    resource_root: PathBuf,
+    /// Root directory used to persist small resources written via `StoreResource` and read via
+    /// `StorageHandle` (tree-layout: `storage_root/<key-as-path>`).
+    storage_root: PathBuf,
 }
 
 impl<F> SegmentedStorageProvider<F>
@@ -103,25 +103,47 @@ where
 {
     /// Create a new segmented storage provider that uses `factory` to create a fresh inner provider
     /// for each chunk.
-    pub fn new(factory: F) -> Self {
+    ///
+    /// `storage_root` is mandatory to prevent silent cache root mismatches between:
+    /// - segment files (file-tree layout),
+    /// - eviction/lease state,
+    /// - `StoreResource` persisted blobs and `StorageHandle` reads.
+    pub fn new(factory: F, storage_root: impl Into<PathBuf>) -> Self {
         Self {
             factory,
             default_stream_key: ResourceKey("playback".into()),
-            resource_root: std::env::temp_dir().join("stream-download-hls-resources"),
+            storage_root: storage_root.into(),
         }
+    }
+
+    /// One-shot constructor for persistent HLS caching that wires **one** `storage_root` across:
+    /// - the file-tree segment layout factory,
+    /// - the HLS cache policy layer (leases + eviction),
+    /// - the segmented storage provider (resources + `StorageHandle`).
+    ///
+    /// This avoids accidental root mismatches between the three components.
+    pub fn new_hls_file_tree(
+        storage_root: impl Into<PathBuf>,
+        prefetch_bytes: NonZeroUsize,
+        max_cached_streams: Option<NonZeroUsize>,
+    ) -> SegmentedStorageProvider<cache_layer::HlsCacheLayer<hls_factory::HlsFileTreeSegmentFactory>>
+    {
+        let storage_root: PathBuf = storage_root.into();
+
+        let file_tree =
+            hls_factory::HlsFileTreeSegmentFactory::new(storage_root.clone(), prefetch_bytes);
+
+        let mut factory = cache_layer::HlsCacheLayer::new(file_tree, storage_root.clone());
+        if let Some(max) = max_cached_streams {
+            factory = factory.with_max_cached_streams(max);
+        }
+
+        SegmentedStorageProvider::new(factory, storage_root)
     }
 
     /// Override the default logical stream key used by the reader.
     pub fn with_default_stream_key(mut self, key: ResourceKey) -> Self {
         self.default_stream_key = key;
-        self
-    }
-
-    /// Root directory used to persist `StoreResource` blobs (init segments, playlists, keys).
-    ///
-    /// This currently is only used internally; retrieval is wired when/if `StorageHandle` exists.
-    pub fn with_resource_root(mut self, path: impl Into<PathBuf>) -> Self {
-        self.resource_root = path.into();
         self
     }
 }
@@ -141,7 +163,7 @@ where
             default_stream_key: self.default_stream_key.clone(),
             resources: HashMap::new(),
             streams: HashMap::new(),
-            resource_root: self.resource_root.clone(),
+            storage_root: self.storage_root.clone(),
         }));
 
         // Ensure there is a default stream entry so the reader has a target.
@@ -177,17 +199,15 @@ where
     }
 }
 
-#[cfg(any())]
-impl<P> ProvidesStorageHandle for SegmentedStorageProvider<P>
+impl<F> stream_download::storage::ProvidesStorageHandle for SegmentedStorageProvider<F>
 where
-    P: StorageProvider + Clone + Send + 'static,
+    F: SegmentStorageFactory,
 {
-    fn storage_handle(&self) -> Option<StorageHandle> {
-        // NOTE: Resource handle support is not wired in the current repo state.
-        // This implementation remains cfg-gated as a placeholder.
-        Some(StorageHandle::new(Arc::new(ResourceFsReader {
-            root: self.resource_root.clone(),
-        })))
+    fn storage_handle(&self) -> Option<stream_download::storage::StorageHandle> {
+        Some(
+            crate::storage::tree_handle::TreeStorageResourceReader::new(self.storage_root.clone())
+                .into_handle(),
+        )
     }
 }
 
@@ -199,7 +219,7 @@ where
     default_stream_key: ResourceKey,
     resources: HashMap<ResourceKey, Bytes>,
     streams: HashMap<ResourceKey, StreamState<P>>,
-    resource_root: PathBuf,
+    storage_root: PathBuf,
 }
 
 #[cfg(any())]
@@ -620,7 +640,7 @@ where
         use std::fs::OpenOptions;
         use std::io::Write as _;
 
-        let root = { self.state.read().resource_root.clone() };
+        let root = { self.state.read().storage_root.clone() };
 
         let rel = {
             let mut pb = PathBuf::new();
