@@ -387,7 +387,7 @@ where
         download_start: Instant,
     ) -> io::Result<DownloadAction> {
         // Update the content length to reflect the fetched data
-        if let ContentLength::Dynamic(_) = self.content_length {
+        if !matches!(self.content_length, ContentLength::Static(_)) {
             self.content_length = stream.content_length();
         }
         let Some(bytes) = bytes else {

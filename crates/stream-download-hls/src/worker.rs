@@ -40,6 +40,18 @@ pub struct HlsStreamWorker {
 }
 
 impl HlsStreamWorker {
+    #[inline]
+    fn update_last_segment_length(&self, gathered_len: u64) {
+        if let Ok(mut guard) = self.segmented_length.write() {
+            if let Some(last) = guard.segments.last_mut() {
+                last.gathered = Some(gathered_len);
+                if last.reported == 0 {
+                    last.reported = gathered_len;
+                }
+            }
+        }
+    }
+
     /// Build per-segment middlewares (no self borrow to avoid conflicts).
     #[inline]
     fn build_middlewares(
@@ -279,6 +291,9 @@ impl HlsStreamWorker {
                         Some(Ok(chunk)) => {
                             let len = chunk.len() as u64;
                             gathered_len = gathered_len.saturating_add(len);
+                            // Best-effort keep segmented length snapshot in sync even mid-segment
+                            // so callers can observe a non-zero content length during prefetch.
+                            self.update_last_segment_length(gathered_len);
 
                             // Send chunk as ordered stream message.
                             if self.data_sender.send(StreamMsg::Data(chunk)).await.is_err() {

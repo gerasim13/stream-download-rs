@@ -235,9 +235,20 @@ impl SourceStream for HlsStream {
     }
 
     fn content_length(&self) -> ContentLength {
-        // Best-effort: if the lock is poisoned, fall back to Unknown.
+        // Best-effort: if we have no segment boundaries yet, report Unknown to avoid a zero clamp
+        // before the worker has a chance to populate lengths.
         match self.segmented_length.read() {
-            Ok(guard) => ContentLength::Segmented(guard.clone()),
+            Ok(guard) => {
+                let has_lengths = guard
+                    .segments
+                    .iter()
+                    .any(|seg| seg.reported > 0 || seg.gathered.is_some());
+                if has_lengths {
+                    ContentLength::Segmented(guard.clone())
+                } else {
+                    ContentLength::Unknown
+                }
+            }
             Err(_) => ContentLength::Unknown,
         }
     }

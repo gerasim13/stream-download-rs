@@ -425,6 +425,10 @@ where
                 let n = inner.read(&mut buf[read_total..read_total + to_read])?;
                 read_total += n;
                 local_pos = local_pos.saturating_add(n as u64);
+                trace!(
+                    "read {} bytes from segment {} at position {}, total read {}",
+                    n, seg_index, local_pos, read_total
+                );
                 if n == 0 {
                     // Defensive: if inner returned EOF unexpectedly, advance.
                     seg_index += 1;
