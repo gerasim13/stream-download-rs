@@ -166,6 +166,8 @@ where
     P: StorageProvider + Clone + Send + 'static,
 {
     fn storage_handle(&self) -> Option<StorageHandle> {
+        // NOTE: Resource handle support is not wired in the current repo state.
+        // This implementation remains cfg-gated as a placeholder.
         Some(StorageHandle::new(Arc::new(ResourceFsReader {
             root: self.resource_root.clone(),
         })))
@@ -310,6 +312,8 @@ where
     P: StorageProvider + Send + 'static,
 {
     state: Arc<RwLock<SharedState<P>>>,
+    /// Last observed default stream key. The reader follows `SharedState::default_stream_key`,
+    /// and resets `pos` when it changes.
     stream_key: ResourceKey,
     pos: u64,
 }
@@ -318,13 +322,19 @@ impl<P> SegmentedReader<P>
 where
     P: StorageProvider + Send + 'static,
 {
-    /// Switch the logical stream being read (e.g. after a codec/variant discontinuity).
-    pub fn set_stream_key(&mut self, key: ResourceKey) {
-        self.stream_key = key;
-        self.pos = 0;
+    /// Ensure the reader follows the current shared default stream key.
+    ///
+    /// If the default key changes (via `StreamControl::SetDefaultStreamKey`), we reset `pos` to 0.
+    #[inline]
+    fn refresh_stream_key_from_state(&mut self) {
+        let new_key = { self.state.read().default_stream_key.clone() };
+        if self.stream_key != new_key {
+            self.stream_key = new_key;
+            self.pos = 0;
+        }
     }
 
-    /// Current logical stream key.
+    /// Current logical stream key (last observed).
     pub fn stream_key(&self) -> &ResourceKey {
         &self.stream_key
     }
@@ -335,6 +345,8 @@ where
     P: StorageProvider + Send + 'static,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.refresh_stream_key_from_state();
+
         if buf.is_empty() {
             return Ok(0);
         }
@@ -665,6 +677,49 @@ where
     P: StorageProvider + Send + 'static,
 {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        // IMPORTANT:
+        // `stream_download` calls `writer.stream_position()` during prefetch.
+        // `stream_position()` is implemented via `seek(SeekFrom::Current(0))`.
+        //
+        // For segmented writers it is valid to query the current logical position even after a
+        // chunk has been finalized, so we must support `SeekFrom::Current(0)` in all states.
+        if matches!(pos, SeekFrom::Current(0)) {
+            let stream_key = self.active_stream_key();
+            let seg_index = self.current_seg_index;
+
+            let guard = self.state.read();
+            let stream = guard.streams.get(&stream_key).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "stream not found while seeking writer",
+                )
+            })?;
+
+            // Sum lengths of segments before the active one.
+            let mut abs = 0u64;
+            if let Some(i) = seg_index {
+                for seg in stream.segments.iter().take(i) {
+                    abs = abs.saturating_add(seg.available_len());
+                }
+
+                // Add position within current segment:
+                // - if still writable: use inner writer position
+                // - if finalized: snap to end of segment
+                if let Some(seg) = stream.segments.get(i) {
+                    if let Some(inner) = seg.writer.lock().as_mut() {
+                        let inner_pos = inner.seek(SeekFrom::Current(0))?;
+                        abs = abs.saturating_add(inner_pos);
+                    } else {
+                        abs = abs.saturating_add(seg.available_len());
+                    }
+                }
+            } else {
+                // No active segment selected yet; treat as position 0.
+            }
+
+            return Ok(abs);
+        }
+
         // For correctness, only allow seeking within the current active (non-finalized) segment.
         let seg = self.current_segment()?;
         if seg.is_finalized() {
@@ -714,6 +769,17 @@ where
             } => self.finalize_current_segment(gathered_len),
 
             StreamControl::StoreResource { key, data } => self.store_resource(key, data),
+
+            StreamControl::SetDefaultStreamKey { stream_key } => {
+                // Update the shared default stream key so stitched readers can follow it without
+                // requiring a direct reader-side API call.
+                //
+                // Note: we intentionally do not mutate writer-side cursor here. The next
+                // ChunkStart will select the stream explicitly.
+                let mut guard = self.state.write();
+                guard.default_stream_key = stream_key;
+                Ok(())
+            }
         }
     }
 }

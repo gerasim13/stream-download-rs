@@ -192,7 +192,7 @@ pub trait StorageWriter: Write + Seek + Send + 'static {
 // Reason:
 // - `StorageWriter` contains an overridable hook (`control`) used by segmented/caching writers.
 // - A blanket impl would conflict with any concrete `StorageWriter` impls we want to provide
-//   (e.g. HLS segmented writer), preventing downstream crates from overriding `control`.
+//   (e.g. HLS segmented writer), preventing downstream crates from overriding this hook.
 //
 // Any concrete writer type returned by a `StorageProvider` should implement `StorageWriter`
 // explicitly (usually a trivial empty impl).

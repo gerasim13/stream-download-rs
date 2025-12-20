@@ -326,6 +326,17 @@ impl HlsStreamWorker {
         } else {
             None
         };
+        // If the variant changed, notify the storage layer so the stitched reader follows the
+        // new logical stream key.
+        if *last_variant_id != Some(desc.variant_id) {
+            let new_stream_key: ResourceKey = format!("hls/variant-{}", desc.variant_id.0).into();
+            let _ =
+                self.data_sender
+                    .try_send(StreamMsg::Control(StreamControl::SetDefaultStreamKey {
+                        stream_key: new_stream_key,
+                    }));
+        }
+
         self.emit_pre_segment_events(last_variant_id, &desc, seg_size, init_len_opt);
 
         // Build a stream according to skip and init rules
@@ -360,6 +371,10 @@ impl HlsStreamWorker {
         };
 
         // Emit ordered control message to start a new chunk in segmented storage.
+        //
+        // We store chunks under a per-variant stream key so different variants/codecs do not mix.
+        // The stitched reader follows `SharedState::default_stream_key`, which we can switch via
+        // `StreamControl::SetDefaultStreamKey`.
         let stream_key: ResourceKey = format!("hls/variant-{}", desc.variant_id.0).into();
         let kind = if desc.is_init {
             ChunkKind::Init

@@ -250,6 +250,11 @@ impl Stream for HlsStream {
                     StreamMsg::Control(StreamControl::StoreResource { .. }) => {
                         tracing::trace!("HlsStream::poll_next: returning Control(StoreResource)");
                     }
+                    StreamMsg::Control(StreamControl::SetDefaultStreamKey { .. }) => {
+                        tracing::trace!(
+                            "HlsStream::poll_next: returning Control(SetDefaultStreamKey)"
+                        );
+                    }
                 }
                 Poll::Ready(Some(Ok(msg)))
             }

@@ -89,6 +89,17 @@ pub enum StreamControl {
         /// Resource payload bytes.
         data: Bytes,
     },
+
+    /// Switch the default logical stream key used by segmented readers.
+    ///
+    /// This is useful for segmented sources (e.g. HLS) that need to switch between logical streams
+    /// (variants/codecs) while preserving ordered control/data delivery.
+    ///
+    /// Storage providers that don't implement segmented reading can safely ignore this message.
+    SetDefaultStreamKey {
+        /// The new default stream key that readers should follow.
+        stream_key: ResourceKey,
+    },
 }
 
 /// A single ordered message emitted by a [`SourceStream`].

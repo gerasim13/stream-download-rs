@@ -3,7 +3,9 @@ use std::error::Error;
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
-use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams, VariantId};
+use stream_download_hls::{
+    HlsSettings, HlsStream, HlsStreamParams, SegmentedStorageProvider, VariantId,
+};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -26,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let reader = match StreamDownload::new::<HlsStream>(
         params,
-        TempStorageProvider::default(),
+        SegmentedStorageProvider::new(|| TempStorageProvider::default()),
         Settings::default(),
     )
     .await
