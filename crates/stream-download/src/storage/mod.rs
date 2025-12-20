@@ -6,9 +6,12 @@ use std::io::{self, Read, Seek, Write};
 pub mod adaptive;
 pub mod bounded;
 pub mod file;
+pub mod handle;
 pub mod memory;
 #[cfg(feature = "temp-storage")]
 pub mod temp;
+
+pub use handle::{ProvidesStorageHandle, StorageHandle, StorageResourceReader};
 
 /// Represents a content length that can change during processing.
 ///

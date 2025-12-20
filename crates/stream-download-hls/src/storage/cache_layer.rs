@@ -5,6 +5,9 @@
 //! - LRU-style eviction by `<storage_root>/<master_hash>` directory count.
 //! - `.access` marker updates for LRU ordering.
 //!
+//! Additionally, it can vend a read-only [`StorageHandle`] for persisted small resources
+//! (e.g. playlists/keys) stored under `storage_root` by treating `ResourceKey` as a relative path.
+//!
 //! Design goals:
 //! - Keep all caching policy out of `HlsStream` / playback logic.
 //! - Avoid global locks and avoid hot-path overhead:
@@ -28,8 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stream_download::source::{ChunkKind, ResourceKey};
+use stream_download::storage::{ProvidesStorageHandle, StorageHandle};
 
 use crate::cache::lease::{CacheLeaseGuard, DEFAULT_LEASE_TTL};
+use crate::storage::tree_handle::TreeStorageResourceReader;
 
 use super::SegmentStorageFactory;
 
@@ -86,6 +91,10 @@ where
     /// Return the root directory where stream caches are stored.
     pub fn storage_root(&self) -> &Path {
         &self.storage_root
+    }
+
+    fn make_storage_handle(&self) -> StorageHandle {
+        TreeStorageResourceReader::new(self.storage_root.clone()).into_handle()
     }
 
     /// Enable LRU eviction by master playlist (by `<storage_root>/<master_hash>` directory count).
@@ -296,5 +305,14 @@ where
         // Delegate actual storage creation to the inner factory.
         self.inner
             .provider_for_segment(stream_key, chunk_id, kind, filename_hint)
+    }
+}
+
+impl<F> ProvidesStorageHandle for HlsCacheLayer<F>
+where
+    F: SegmentStorageFactory,
+{
+    fn storage_handle(&self) -> Option<StorageHandle> {
+        Some(self.make_storage_handle())
     }
 }

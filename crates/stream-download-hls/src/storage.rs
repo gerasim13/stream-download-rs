@@ -29,6 +29,9 @@ pub mod hls_factory;
 // Cache/policy layer (leases + eviction) that wraps a segment factory.
 pub mod cache_layer;
 
+// Tree-layout StorageHandle implementation for reading persisted resources by ResourceKey.
+pub mod tree_handle;
+
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -607,18 +610,27 @@ where
             guard.resources.insert(key.clone(), data.clone());
         }
 
-        // Persist to disk under resource_root to survive across readers/handles.
-        // This is best-effort; it is ok to disable/adjust later.
+        // Persist to disk using the same tree-layout rules as our StorageHandle:
+        // `storage_root / <key-as-path>`
+        //
+        // Important:
+        // - `ResourceKey` is treated as a relative path (slash-separated).
+        // - Each component is sanitized to avoid traversal and weird filesystem edge cases.
         use std::fs;
         use std::fs::OpenOptions;
         use std::io::Write as _;
 
         let root = { self.state.read().resource_root.clone() };
 
-        // If handle support is enabled, we'd use a safer encoder. For now, a very small sanitizer.
         let rel = {
             let mut pb = PathBuf::new();
             for comp in key.0.split('/') {
+                // Disallow traversal-ish components.
+                if comp == "." || comp == ".." {
+                    continue;
+                }
+
+                // Keep component stable and safe on disk.
                 let clean: String = comp
                     .chars()
                     .map(|c| {
@@ -629,10 +641,13 @@ where
                         }
                     })
                     .collect();
+
+                let clean = clean.trim_matches('_');
                 if !clean.is_empty() {
                     pb.push(clean);
                 }
             }
+
             if pb.as_os_str().is_empty() {
                 pb.push("default");
             }
@@ -643,11 +658,13 @@ where
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&path)?;
+
         f.write_all(&data)?;
         f.flush()?;
         Ok(())
