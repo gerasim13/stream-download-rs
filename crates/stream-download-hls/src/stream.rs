@@ -30,7 +30,7 @@ use tracing::{instrument, trace};
 
 use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
 use stream_download::source::{SourceStream, StreamControl, StreamMsg};
-use stream_download::storage::ContentLength;
+use stream_download::storage::{ContentLength, StorageHandle};
 
 /// Parameters for creating an HLS stream.
 #[derive(Debug, Clone)]
@@ -39,14 +39,24 @@ pub struct HlsStreamParams {
     pub url: Arc<str>,
     /// Unified settings for HLS playback and downloader behavior.
     pub settings: Arc<crate::HlsSettings>,
+    /// Storage handle used for read-before-fetch caching of playlists/keys.
+    ///
+    /// This is mandatory to ensure caching is actually enabled (otherwise the cached downloader
+    /// would be forced into "cache disabled" mode).
+    pub storage_handle: StorageHandle,
 }
 
 impl HlsStreamParams {
     /// Create new HLS stream parameters.
-    pub fn new(url: impl Into<Arc<str>>, settings: impl Into<Arc<crate::HlsSettings>>) -> Self {
+    pub fn new(
+        url: impl Into<Arc<str>>,
+        settings: impl Into<Arc<crate::HlsSettings>>,
+        storage_handle: StorageHandle,
+    ) -> Self {
         Self {
             url: url.into(),
             settings: settings.into(),
+            storage_handle,
         }
     }
 }
@@ -75,8 +85,9 @@ impl HlsStream {
     pub async fn new(
         url: impl Into<Arc<str>>,
         settings: Arc<crate::HlsSettings>,
+        storage_handle: StorageHandle,
     ) -> Result<Self, HlsStreamError> {
-        Self::new_with_config(url, settings).await
+        Self::new_with_config(url, settings, storage_handle).await
     }
 
     /// Create a new HLS stream with custom downloader configuration.
@@ -90,6 +101,7 @@ impl HlsStream {
     pub async fn new_with_config(
         url: impl Into<Arc<str>>,
         settings: Arc<crate::HlsSettings>,
+        storage_handle: StorageHandle,
     ) -> Result<Self, HlsStreamError> {
         let url = url.into();
 
@@ -107,6 +119,7 @@ impl HlsStream {
         let streaming_task = Self::start_streaming_task(
             url,
             settings,
+            storage_handle,
             data_sender,
             seek_receiver,
             cancel_token.clone(),
@@ -132,6 +145,7 @@ impl HlsStream {
     async fn start_streaming_task(
         url: Arc<str>,
         settings: Arc<crate::HlsSettings>,
+        storage_handle: StorageHandle,
         data_sender: mpsc::Sender<StreamMsg>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
@@ -147,6 +161,7 @@ impl HlsStream {
                 let worker = HlsStreamWorker::new(
                     url,
                     settings,
+                    storage_handle,
                     data_sender,
                     seek_receiver,
                     cancel_token,
@@ -201,7 +216,7 @@ impl SourceStream for HlsStream {
     type StreamCreationError = HlsStreamError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
-        Self::new(params.url, params.settings).await
+        Self::new(params.url, params.settings, params.storage_handle).await
     }
 
     fn content_length(&self) -> ContentLength {

@@ -9,6 +9,7 @@ use crate::{
     MediaStream, ResourceDownloader, StreamEvent, StreamMiddleware, apply_middlewares,
 };
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
+use stream_download::storage::StorageHandle;
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -434,6 +435,7 @@ impl HlsStreamWorker {
     pub async fn new(
         url: Arc<str>,
         settings: Arc<crate::HlsSettings>,
+        storage_handle: StorageHandle,
         data_sender: mpsc::Sender<StreamMsg>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
@@ -455,8 +457,15 @@ impl HlsStreamWorker {
             max_retry_delay,
         );
 
-        let mut manager = HlsManager::new(url.clone(), settings.clone(), manager_downloader)
-            .with_control_sender(data_sender.clone());
+        // Read-before-fetch caching for playlists/keys uses the storage handle.
+        // Persistence is performed by emitting `StoreResource` via the same ordered stream channel.
+        let mut manager = HlsManager::new(
+            url.clone(),
+            settings.clone(),
+            manager_downloader,
+            storage_handle,
+            data_sender.clone(),
+        );
 
         // Initialize manager and ABR controller
         manager

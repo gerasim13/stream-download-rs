@@ -46,6 +46,7 @@ use crate::parser::{parse_master_playlist, parse_media_playlist};
 use crate::settings::HlsSettings;
 use crate::traits::{MediaStream, NextSegmentResult, SegmentData};
 use stream_download::source::{StreamControl, StreamMsg};
+use stream_download::storage::StorageHandle;
 use tokio::sync::mpsc;
 use tracing::trace;
 
@@ -73,10 +74,8 @@ pub struct HlsManager {
     downloader: ResourceDownloader,
     /// Cached wrapper for playlist/key reads (read-before-fetch using `StorageHandle`).
     cached_downloader: CachedResourceDownloader,
-    /// Optional control sender used to persist fetched resources via `StoreResource`.
-    ///
-    /// This is intentionally optional so unit tests and minimal setups don't need to wire it.
-    control_sender: Option<mpsc::Sender<StreamMsg>>,
+    /// Control sender used to persist fetched resources via `StoreResource`.
+    control_sender: mpsc::Sender<StreamMsg>,
 
     /// Cached master playlist, once loaded.
     master: Option<MasterPlaylist>,
@@ -118,16 +117,19 @@ impl HlsManager {
         master_url: impl Into<Arc<str>>,
         config: Arc<HlsSettings>,
         downloader: ResourceDownloader,
+        storage_handle: StorageHandle,
+        control_sender: mpsc::Sender<StreamMsg>,
     ) -> Self {
         let downloader = downloader;
-        let cached_downloader = CachedResourceDownloader::new_uncached(downloader.clone());
+        let cached_downloader =
+            CachedResourceDownloader::new(downloader.clone(), Some(storage_handle));
 
         Self {
             master_url: master_url.into(),
             config,
             downloader,
             cached_downloader,
-            control_sender: None,
+            control_sender,
             master: None,
             current_variant_index: None,
             current_media_playlist: None,
@@ -163,28 +165,7 @@ impl HlsManager {
         &mut self.downloader
     }
 
-    /// Enable read-before-fetch caching for playlists/keys using the provided storage handle.
-    ///
-    /// This keeps changes in the manager minimal: the cached downloader encapsulates the caching
-    /// policy, while key formatting stays in `crate::cache::keys`.
-    pub fn with_storage_handle(
-        mut self,
-        handle: Option<stream_download::storage::StorageHandle>,
-    ) -> Self {
-        self.cached_downloader = CachedResourceDownloader::new(self.downloader.clone(), handle);
-        self
-    }
-
-    /// Enable persistence of fetched resources (playlists/keys) by providing a control sender.
-    ///
-    /// On network misses, the manager will emit `StreamControl::StoreResource { key, data }`
-    /// through this channel.
-    pub fn with_control_sender(mut self, sender: mpsc::Sender<StreamMsg>) -> Self {
-        self.control_sender = Some(sender);
-        self
-    }
-
-    /// Best-effort emit of `StoreResource` after a network miss so storage can persist the blob.
+    /// Emit `StoreResource` after a network miss so storage can persist the blob.
     #[inline]
     fn emit_store_resource(&self, key: stream_download::source::ResourceKey, data: Bytes) {
         trace!(
@@ -193,20 +174,13 @@ impl HlsManager {
             data.len()
         );
 
-        let Some(sender) = &self.control_sender else {
-            trace!(
-                "store_resource: skipped (no control_sender) key='{}' ({} bytes)",
-                key.0,
-                data.len()
-            );
-            return;
-        };
-
         // Best-effort: if the channel is full/closed, we skip persistence rather than breaking playback.
-        match sender.try_send(StreamMsg::Control(StreamControl::StoreResource {
-            key,
-            data,
-        })) {
+        match self
+            .control_sender
+            .try_send(StreamMsg::Control(StreamControl::StoreResource {
+                key,
+                data,
+            })) {
             Ok(()) => {
                 trace!("store_resource: enqueued");
             }

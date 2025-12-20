@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use stream_download::source::DecodeError;
+use stream_download::storage::ProvidesStorageHandle;
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
     HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams, VariantId,
@@ -25,7 +26,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
     let manual_variant_idx = 0;
     let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
-    let params = HlsStreamParams::new(url, settings);
 
     // Persistent, deterministic on-disk storage layout:
     // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
@@ -42,16 +42,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Limit how many distinct HLS streams we keep in persistent storage (LRU by master playlist).
     let max_cached_streams = NonZeroUsize::new(10).unwrap();
 
-    let reader = match StreamDownload::new::<HlsStream>(
-        params,
-        HlsPersistentStorageProvider::new_hls_file_tree(
-            storage_root,
-            prefetch_bytes,
-            Some(max_cached_streams),
-        ),
-        Settings::default(),
-    )
-    .await
+    // Build the persistent storage provider first, then extract a StorageHandle for
+    // read-before-fetch caching of playlists/keys inside HLS.
+    let provider = HlsPersistentStorageProvider::new_hls_file_tree(
+        storage_root.clone(),
+        prefetch_bytes,
+        Some(max_cached_streams),
+    );
+    let storage_handle = provider
+        .storage_handle()
+        .expect("HLS persistent storage provider must vend a StorageHandle");
+
+    let params = HlsStreamParams::new(url, settings, storage_handle);
+
+    let reader = match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await
     {
         Ok(r) => r,
         Err(e) => {

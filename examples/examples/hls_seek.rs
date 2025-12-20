@@ -5,6 +5,7 @@ use rodio::{OutputStreamBuilder, Sink};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use stream_download::source::DecodeError;
+use stream_download::storage::ProvidesStorageHandle;
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
     HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams, VariantId,
@@ -32,7 +33,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Basic HLS settings: pick the first variant for determinism in the example
     let settings = HlsSettings::default().selection_manual(VariantId(0));
-    let params = HlsStreamParams::new(url, settings);
 
     // Persistent, deterministic on-disk storage layout:
     // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
@@ -40,14 +40,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     std::fs::create_dir_all(&storage_root)?;
     let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB
     let max_cached_streams = NonZeroUsize::new(10).unwrap();
+
+    // Build the persistent storage provider first, then extract a StorageHandle for
+    // read-before-fetch caching of playlists/keys inside HLS.
     let provider = HlsPersistentStorageProvider::new_hls_file_tree(
         storage_root,
         prefetch_bytes,
         Some(max_cached_streams),
     );
+    let storage_handle = provider
+        .storage_handle()
+        .expect("HLS persistent storage provider must vend a StorageHandle");
 
-    // Create a blocking reader over the HLS stream via StreamDownload, but store each HLS chunk
-    // (init/media segments) separately via SegmentedStorageProvider. This enables correct seeking.
+    let params = HlsStreamParams::new(url, settings, storage_handle);
+
+    // Create a blocking reader over the HLS stream via StreamDownload.
     let reader = match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await
     {
         Ok(r) => r,

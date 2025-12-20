@@ -4,9 +4,9 @@ use kanal::AsyncSender;
 use tokio_util::sync::CancellationToken;
 
 use stream_download::source::DecodeError;
-use stream_download::storage::temp::TempStorageProvider;
+use stream_download::storage::ProvidesStorageHandle;
 use stream_download::{Settings, StreamDownload};
-use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams};
+use stream_download_hls::{HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams};
 
 use crate::backends::common::{io_other, run_blocking_reading_loop};
 use crate::pipeline::Packet;
@@ -41,21 +41,37 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
         out: AsyncSender<Packet>,
         cancel: Option<CancellationToken>,
     ) -> std::io::Result<()> {
-        let params = HlsStreamParams::new(self.url.clone(), self.settings.clone());
+        // Persistent storage provider + StorageHandle are now mandatory for HLS so that
+        // read-before-fetch caching of playlists/keys is enabled.
+        //
+        // Note: this backend currently uses a fixed on-disk root. If you want to configure it,
+        // we can thread it through `HlsPacketProducer::new` / settings.
+        let storage_root = std::path::PathBuf::from("./hls-audio-cache");
+        std::fs::create_dir_all(&storage_root)?;
 
-        let reader = match StreamDownload::new::<HlsStream>(
-            params,
-            TempStorageProvider::default(),
-            Settings::default(),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                let msg: String = e.decode_error().await;
-                return Err(io_other(&msg));
-            }
-        };
+        let prefetch_bytes = std::num::NonZeroUsize::new(8 * 1024 * 1024).unwrap();
+        let max_cached_streams = std::num::NonZeroUsize::new(10).unwrap();
+
+        let provider = HlsPersistentStorageProvider::new_hls_file_tree(
+            storage_root,
+            prefetch_bytes,
+            Some(max_cached_streams),
+        );
+
+        let storage_handle = provider
+            .storage_handle()
+            .expect("HLS persistent storage provider must vend a StorageHandle");
+
+        let params = HlsStreamParams::new(self.url.clone(), self.settings.clone(), storage_handle);
+
+        let reader =
+            match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg: String = e.decode_error().await;
+                    return Err(io_other(&msg));
+                }
+            };
 
         // Run the blocking reading loop in a separate thread
         // This uses the same pattern as HttpPacketProducer
