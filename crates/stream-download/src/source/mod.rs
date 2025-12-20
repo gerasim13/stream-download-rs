@@ -476,9 +476,33 @@ where
         let bytes = match msg {
             Some(StreamMsg::Data(bytes)) => Some(bytes),
             Some(StreamMsg::Control(ctrl)) => {
-                // Control messages are ordered relative to `Data`. They do not advance the
-                // contiguous byte stream position, but can influence segmented storage.
+                // Control messages are ordered relative to `Data`.
+                //
+                // While they do not *directly* advance the contiguous byte stream, they can
+                // advance the writer's *logical* position (e.g. segmented writers may finalize a
+                // cached chunk on `ChunkEnd`, making bytes immediately available for readers).
+                //
+                // If the writer position advances due to a control message, we must:
+                // - update `downloaded` ranges,
+                // - satisfy any pending `requested_position` and notify `position_reached`.
+                //
+                // This unblocks reads/seeks for cache hits where we emit only control messages.
+                //
+                // IMPORTANT:
+                // Some storage writers (e.g. segmented) may error on `stream_position()` until the
+                // first logical stream/segment is initialized. In that case we treat the position
+                // probe as best-effort and just apply the control message.
+                let pos_before = self.writer.stream_position().ok();
                 self.writer.control(ctrl)?;
+                let pos_after = self.writer.stream_position().ok();
+
+                if let (Some(pos_before), Some(pos_after)) = (pos_before, pos_after) {
+                    if pos_after > pos_before {
+                        self.downloaded.add(pos_before..pos_after);
+                        self.notify_position_reached_if_needed(pos_after);
+                    }
+                }
+
                 return Ok(DownloadAction::Continue);
             }
             None => None,
@@ -530,19 +554,7 @@ where
                 self.downloaded.add(position..new_position);
             }
 
-            if let Some(requested) = self.requested_position.get() {
-                debug!(
-                    requested_position = requested,
-                    current_position = new_position,
-                    "received requested position"
-                );
-
-                if new_position >= requested {
-                    debug!("notifying position reached");
-                    self.requested_position.clear();
-                    self.position_reached.notify_position_reached();
-                }
-            }
+            self.notify_position_reached_if_needed(new_position);
             if new_written == 0 {
                 // We're not able to write any data, so we need to wait for space to be available
                 debug!("waiting for next read");
@@ -558,6 +570,22 @@ where
             );
         }
         Ok(new_position)
+    }
+
+    #[inline]
+    fn notify_position_reached_if_needed(&mut self, current_position: u64) {
+        if let Some(requested) = self.requested_position.get() {
+            debug!(
+                requested_position = requested,
+                current_position, "received requested position"
+            );
+
+            if current_position >= requested {
+                debug!("notifying position reached");
+                self.requested_position.clear();
+                self.position_reached.notify_position_reached();
+            }
+        }
     }
 
     fn should_seek(&mut self, stream: &S, position: u64) -> io::Result<bool> {
