@@ -2,6 +2,7 @@
 //! Pre-configured implementations are available for memory and temporary file-based storage.
 
 use std::io::{self, Read, Seek, Write};
+use std::ops::Range;
 
 pub mod adaptive;
 pub mod bounded;
@@ -12,6 +13,17 @@ pub mod memory;
 pub mod temp;
 
 pub use handle::{ProvidesStorageHandle, StorageHandle, StorageResourceReader};
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+/// Content length model for segmented streams.
+/// Holds per-segment dynamic lengths where `reported` is the best-known size
+/// before processing and `gathered` is the final size after processing (e.g., decryption).
+pub struct SegmentedLength {
+    /// Per-segment lengths. Each entry uses `reported` as the best-known size before
+    /// processing (e.g., playlist/header) and `gathered` as the final size after
+    /// processing (e.g., decryption), when known.
+    pub segments: Vec<DynamicLength>,
+}
 
 /// Represents a content length that can change during processing.
 ///
@@ -34,7 +46,7 @@ pub struct DynamicLength {
 /// `ContentLength` distinguishes between content with a fixed, knowable size,
 /// content whose final size is determined only after processing,
 /// and content where the length is unknown.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ContentLength {
     /// Static content length that remains constant throughout processing.
     ///
@@ -60,6 +72,13 @@ pub enum ContentLength {
     /// - Compressed streams/files (expanding during decompression)
     /// - Media content assembled from segments
     Dynamic(DynamicLength),
+
+    /// Content length for segmented streams.
+    ///
+    /// This represents multiple segments, each with its own dynamic length where
+    /// `reported` is the best-known size before processing and `gathered` is the
+    /// final size after processing (e.g., decryption), when known.
+    Segmented(SegmentedLength),
 
     /// Unknown content length.
     ///
@@ -106,6 +125,12 @@ impl ContentLength {
         match self {
             Self::Static(len) => Some(*len),
             Self::Dynamic(len) => Some(len.gathered.unwrap_or(len.reported)),
+            Self::Segmented(seg) => Some(
+                seg.segments
+                    .iter()
+                    .map(|d| d.gathered.unwrap_or(d.reported) as u64)
+                    .sum::<u64>(),
+            ),
             Self::Unknown => None,
         }
     }
@@ -134,6 +159,13 @@ impl PartialEq<u64> for ContentLength {
         match self {
             Self::Static(len) => len == other,
             Self::Dynamic(len) => len.gathered.unwrap_or(len.reported) == *other,
+            Self::Segmented(seg) => {
+                seg.segments
+                    .iter()
+                    .map(|d| d.gathered.unwrap_or(d.reported) as u64)
+                    .sum::<u64>()
+                    == *other
+            }
             Self::Unknown => false,
         }
     }
@@ -144,6 +176,13 @@ impl PartialOrd<u64> for ContentLength {
         match self {
             Self::Static(len) => len.partial_cmp(other),
             Self::Dynamic(len) => len.gathered.unwrap_or(len.reported).partial_cmp(other),
+            Self::Segmented(seg) => Some(
+                seg.segments
+                    .iter()
+                    .map(|d| d.gathered.unwrap_or(d.reported) as u64)
+                    .sum::<u64>()
+                    .cmp(other),
+            ),
             Self::Unknown => None,
         }
     }
@@ -187,6 +226,19 @@ pub trait StorageWriter: Write + Seek + Send + 'static {
     /// Storage providers that don't support segmented streams can ignore this (default no-op).
     fn control(&mut self, _msg: crate::source::StreamControl) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Returns available byte ranges for a logical stream identified by `stream_key`, if supported.
+    ///
+    /// This is a **best-effort** introspection hook used by segmented protocols (e.g. HLS) to
+    /// surface what is already available in storage (for progress/seek planning).
+    ///
+    /// Default returns `Ok(None)` meaning the provider does not expose introspection.
+    fn get_available_ranges_for(
+        &mut self,
+        _stream_key: &crate::source::ResourceKey,
+    ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
+        Ok(None)
     }
 }
 

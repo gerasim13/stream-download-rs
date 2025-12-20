@@ -188,7 +188,7 @@ impl SourceStream for OpendalStream {
     }
 
     fn content_length(&self) -> ContentLength {
-        self.content_length
+        self.content_length.clone()
     }
 
     async fn seek_range(&mut self, start: u64, end: Option<u64>) -> io::Result<()> {

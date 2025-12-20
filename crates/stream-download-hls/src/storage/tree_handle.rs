@@ -45,11 +45,6 @@ impl TreeStorageResourceReader {
         }
     }
 
-    /// Root directory where resources are stored.
-    pub fn storage_root(&self) -> &Path {
-        &self.storage_root
-    }
-
     /// Create a `StorageHandle` for this reader.
     pub fn into_handle(self) -> StorageHandle {
         StorageHandle::new(Arc::new(self))

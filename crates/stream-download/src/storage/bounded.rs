@@ -79,6 +79,12 @@ where
             ContentLength::Dynamic(dynamic_length) => {
                 dynamic_length.reported.min(self.buffer_size as u64)
             }
+            ContentLength::Segmented(segmented) => segmented
+                .segments
+                .iter()
+                .map(|d| d.gathered.unwrap_or(d.reported))
+                .sum::<u64>()
+                .min(self.buffer_size as u64),
             ContentLength::Unknown => self.buffer_size as u64,
         };
 

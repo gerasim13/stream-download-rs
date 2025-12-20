@@ -54,7 +54,7 @@ impl SourceHandle {
     }
 
     pub(crate) fn content_length(&self) -> ContentLength {
-        self.content_length
+        self.content_length.clone()
     }
 
     pub(crate) fn is_failed(&self) -> bool {

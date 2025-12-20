@@ -655,7 +655,7 @@ where
             notify_read: self.notify_read.clone(),
             position_reached: self.position_reached.clone(),
             seek_tx: self.seek_tx.clone(),
-            content_length: self.content_length,
+            content_length: self.content_length.clone(),
         }
     }
 }

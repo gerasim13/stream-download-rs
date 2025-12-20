@@ -80,7 +80,7 @@ where
     }
 
     fn content_length(&self) -> ContentLength {
-        self.content_length
+        self.content_length.clone()
     }
 
     fn supports_seek(&self) -> bool {

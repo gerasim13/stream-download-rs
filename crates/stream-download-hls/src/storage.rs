@@ -40,7 +40,9 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl};
-use stream_download::storage::{ContentLength, DynamicLength, StorageProvider, StorageWriter};
+use stream_download::storage::{
+    ContentLength, DynamicLength, SegmentedLength, StorageProvider, StorageWriter,
+};
 use tracing::trace;
 
 /// Optional integration: if the core provides these types/traits (they existed in earlier WIP),
@@ -307,31 +309,19 @@ where
     gathered_len: Mutex<u64>,
     /// Segment finalization flag.
     finalized: Mutex<bool>,
-    /// Chunk kind (Init/Media) for debugging / informational use.
-    kind: ChunkKind,
-    /// Optional filename hint for deterministic per-segment naming in file-based inners.
-    filename_hint: Option<Arc<str>>,
 }
 
 impl<P> Segment<P>
 where
     P: StorageProvider + Send + 'static,
 {
-    fn new(
-        reader: P::Reader,
-        writer: P::Writer,
-        reported: Option<u64>,
-        kind: ChunkKind,
-        filename_hint: Option<Arc<str>>,
-    ) -> Self {
+    fn new(reader: P::Reader, writer: P::Writer, reported: Option<u64>) -> Self {
         Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(Some(writer)),
             reported,
             gathered_len: Mutex::new(0),
             finalized: Mutex::new(false),
-            kind,
-            filename_hint,
         }
     }
 
@@ -567,13 +557,7 @@ where
         );
 
         let (reader, writer) = provider.into_reader_writer(content_length)?;
-        let segment = Arc::new(Segment::<F::Provider>::new(
-            reader,
-            writer,
-            reported,
-            kind,
-            filename_hint,
-        ));
+        let segment = Arc::new(Segment::<F::Provider>::new(reader, writer, reported));
 
         let mut guard = self.state.write();
         let stream = guard
@@ -886,9 +870,16 @@ where
             }
         }
     }
+
+    fn get_available_ranges_for(
+        &mut self,
+        stream_key: &ResourceKey,
+    ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
+        SegmentedWriter::get_available_ranges_for(self, stream_key)
+    }
 }
 
-/// Optional helper method (not part of core traits) to report cached ranges for a stream.
+/// Optional helper method (not part of core traits) to report available ranges for a stream.
 ///
 /// This is useful for debugging and for later “smart seek” behaviors.
 /// We keep it as an inherent method so we don't need to change core traits again.
@@ -896,8 +887,10 @@ impl<F> SegmentedWriter<F>
 where
     F: SegmentStorageFactory,
 {
-    /// Returns a synthetic segmented `ContentLength` and a list of cached ranges for `stream_key`.
-    pub fn get_cached_ranges_for(
+    /// Returns a segmented `ContentLength` and a list of available ranges for `stream_key`.
+    ///
+    /// This is used for best-effort introspection (progress/seek planning).
+    pub fn get_available_ranges_for(
         &self,
         stream_key: &ResourceKey,
     ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
@@ -910,13 +903,14 @@ where
         }
 
         let mut ranges = Vec::<Range<u64>>::with_capacity(stream.segments.len());
-        let mut lengths = Vec::<DynamicLength>::with_capacity(stream.segments.len());
+        let mut seg_lengths = Vec::<DynamicLength>::with_capacity(stream.segments.len());
         let mut offset = 0u64;
 
         for seg in &stream.segments {
             let gathered = seg.available_len();
             let reported = seg.reported.unwrap_or(gathered);
-            lengths.push(DynamicLength {
+
+            seg_lengths.push(DynamicLength {
                 reported,
                 gathered: Some(gathered),
             });
@@ -927,22 +921,9 @@ where
             offset = end;
         }
 
-        // Core `ContentLength` currently has Static/Dynamic/Unknown in `5c6cadb`.
-        // In `47e49d4` there was a `ContentLength::Segmented`. We cannot assume it exists now.
-        //
-        // To keep this file self-contained and compiling against current core, we return a Dynamic
-        // length with reported = sum(reported) and gathered = sum(gathered). This is enough for
-        // capacity planning and basic introspection.
-        let sum_reported = lengths.iter().map(|d| d.reported).sum::<u64>();
-        let sum_gathered = lengths
-            .iter()
-            .map(|d| d.gathered.unwrap_or(d.reported))
-            .sum::<u64>();
-
         Ok(Some((
-            ContentLength::Dynamic(DynamicLength {
-                reported: sum_reported,
-                gathered: Some(sum_gathered),
+            ContentLength::Segmented(SegmentedLength {
+                segments: seg_lengths,
             }),
             ranges,
         )))

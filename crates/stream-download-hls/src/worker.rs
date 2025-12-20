@@ -9,7 +9,7 @@ use crate::{
     MediaStream, ResourceDownloader, StreamEvent, StreamMiddleware, apply_middlewares,
 };
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
-use stream_download::storage::StorageHandle;
+use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -27,8 +27,11 @@ pub struct HlsStreamWorker {
     bytes_to_skip: u64,
     retry_delay: std::time::Duration,
 
-    /// Storage handle for read-before-fetch caching probes (segments, playlists/keys in manager).
+    // Storage handle for read-before-fetch caching probes (segments, playlists/keys in manager).
     storage_handle: StorageHandle,
+
+    /// Best-effort segmented length snapshot shared with `HlsStream::content_length()`.
+    segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
 
     // Stable identifier for persistent cache layout:
     // `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
@@ -430,6 +433,19 @@ impl HlsStreamWorker {
                 Ok(Some(len)) if len > 0 => {
                     tracing::trace!("segment cache: HIT key='{}' ({} bytes)", seg_key.0, len);
 
+                    // Update segmented length snapshot for a cached HIT: we "materialize" the
+                    // segment boundary without downloading bytes.
+                    {
+                        let mut guard = self
+                            .segmented_length
+                            .write()
+                            .map_err(|_| HlsStreamError::Cancelled)?;
+                        guard.segments.push(DynamicLength {
+                            reported: len,
+                            gathered: Some(len),
+                        });
+                    }
+
                     self.data_sender
                         .send(StreamMsg::Control(StreamControl::ChunkStart {
                             stream_key: stream_key.clone(),
@@ -476,6 +492,20 @@ impl HlsStreamWorker {
             tracing::trace!("segment cache: disabled for this segment (missing filename_hint)");
         }
 
+        // Update segmented length snapshot (best-effort) on ChunkStart.
+        // We append a new segment entry in the same order we emit ChunkStart boundaries.
+        {
+            let reported = seg_size.unwrap_or(0);
+            let mut guard = self
+                .segmented_length
+                .write()
+                .map_err(|_| HlsStreamError::Cancelled)?;
+            guard.segments.push(DynamicLength {
+                reported,
+                gathered: None,
+            });
+        }
+
         self.data_sender
             .send(StreamMsg::Control(StreamControl::ChunkStart {
                 stream_key: stream_key.clone(),
@@ -490,6 +520,27 @@ impl HlsStreamWorker {
         let middlewares = HlsStreamWorker::build_middlewares(drm_params_opt);
         let stream = apply_middlewares(stream, &middlewares);
         let gathered_len = self.pump_stream_chunks(stream).await?;
+
+        // Update segmented length snapshot (best-effort) on ChunkEnd.
+        {
+            let mut guard = self
+                .segmented_length
+                .write()
+                .map_err(|_| HlsStreamError::Cancelled)?;
+            if let Some(last) = guard.segments.last_mut() {
+                last.gathered = Some(gathered_len);
+                // If reported was unknown (0), keep reported in sync to avoid 0-length sums.
+                if last.reported == 0 {
+                    last.reported = gathered_len;
+                }
+            } else {
+                // Should not happen (ChunkEnd without ChunkStart), but keep it robust.
+                guard.segments.push(DynamicLength {
+                    reported: gathered_len,
+                    gathered: Some(gathered_len),
+                });
+            }
+        }
 
         // Emit ordered control message to finalize the chunk.
         self.data_sender
@@ -516,6 +567,7 @@ impl HlsStreamWorker {
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         master_hash: String,
+        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
     ) -> Result<Self, HlsStreamError> {
         // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
@@ -600,6 +652,7 @@ impl HlsStreamWorker {
             retry_delay: Self::INITIAL_RETRY_DELAY,
 
             storage_handle,
+            segmented_length,
 
             master_hash: Arc::<str>::from(master_hash),
         })

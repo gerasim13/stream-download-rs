@@ -316,7 +316,7 @@ impl<C: Client> SourceStream for HttpStream<C> {
     }
 
     fn content_length(&self) -> ContentLength {
-        self.content_length
+        self.content_length.clone()
     }
 
     #[instrument(skip(self))]

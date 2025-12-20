@@ -10,6 +10,10 @@
 //! This ordering is the foundation for segmented storage (init/media segments in separate files)
 //! while still exposing a single contiguous `Read + Seek` view via a stitched reader.
 //!
+//! In addition, this stream reports a **best-effort segmented content length** via
+//! [`SourceStream::content_length`]. The segmented length snapshot is updated by the background
+//! worker as it emits `ChunkStart/ChunkEnd` boundaries.
+//!
 //! # Performance Considerations for Mobile Devices
 //!
 //! - Uses `Arc` for shared configuration to avoid deep cloning
@@ -30,7 +34,7 @@ use tracing::{instrument, trace};
 
 use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
 use stream_download::source::{SourceStream, StreamControl, StreamMsg};
-use stream_download::storage::{ContentLength, StorageHandle};
+use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
 
 /// Parameters for creating an HLS stream.
 #[derive(Debug, Clone)]
@@ -72,6 +76,12 @@ pub struct HlsStream {
     streaming_task: tokio::task::JoinHandle<()>,
     /// Event broadcaster for out-of-band stream events.
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
+
+    /// Best-effort snapshot of segmented content length, updated by the background worker.
+    ///
+    /// This allows `content_length()` to return `ContentLength::Segmented(...)` instead of
+    /// `Unknown`, improving progress reporting and seek planning.
+    segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
 }
 
 impl HlsStream {
@@ -116,6 +126,8 @@ impl HlsStream {
         let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(64);
 
         // Start background streaming task
+        let segmented_length = Arc::new(std::sync::RwLock::new(SegmentedLength::default()));
+
         let streaming_task = Self::start_streaming_task(
             url,
             settings,
@@ -124,6 +136,7 @@ impl HlsStream {
             seek_receiver,
             cancel_token.clone(),
             event_sender.clone(),
+            segmented_length.clone(),
         )
         .await?;
 
@@ -133,6 +146,7 @@ impl HlsStream {
             cancel_token,
             streaming_task,
             event_sender,
+            segmented_length,
         })
     }
 
@@ -150,6 +164,7 @@ impl HlsStream {
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
+        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
     ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
         // Stable-ish identifier used for persistent cache layout:
         // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
@@ -167,6 +182,7 @@ impl HlsStream {
                     cancel_token,
                     event_sender,
                     master_hash,
+                    segmented_length,
                 )
                 .await?;
                 worker.run().await
@@ -220,8 +236,11 @@ impl SourceStream for HlsStream {
     }
 
     fn content_length(&self) -> ContentLength {
-        // HLS streams typically don't have a known content length
-        ContentLength::Unknown
+        // Best-effort: if the lock is poisoned, fall back to Unknown.
+        match self.segmented_length.read() {
+            Ok(guard) => ContentLength::Segmented(guard.clone()),
+            Err(_) => ContentLength::Unknown,
+        }
     }
 
     #[instrument(skip(self))]

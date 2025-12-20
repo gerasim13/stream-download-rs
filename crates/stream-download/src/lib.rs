@@ -379,7 +379,7 @@ impl<P: StorageProvider> StreamDownload<P> {
 
     /// Returns the content length of the stream, if available.
     pub fn content_length(&self) -> ContentLength {
-        self.content_length
+        self.content_length.clone()
     }
 
     async fn from_create_stream<S, F, Fut>(
@@ -398,11 +398,16 @@ impl<P: StorageProvider> StreamDownload<P> {
         let content_length = stream.content_length();
         let storage_capacity = storage_provider.max_capacity();
         let (reader, writer) = storage_provider
-            .into_reader_writer(content_length)
+            .into_reader_writer(content_length.clone())
             .map_err(StreamInitializationError::StorageCreationFailure)?;
         let cancellation_token = CancellationToken::new();
         let cancel_on_drop = settings.cancel_on_drop;
-        let mut source = Source::new(writer, content_length, settings, cancellation_token.clone());
+        let mut source = Source::new(
+            writer,
+            content_length.clone(),
+            settings,
+            cancellation_token.clone(),
+        );
         let handle = source.source_handle();
 
         tokio::spawn({
