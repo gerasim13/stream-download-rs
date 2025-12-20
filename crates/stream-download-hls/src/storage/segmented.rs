@@ -23,12 +23,6 @@
 //! - The writer is intentionally strict: **bytes must only be written after `ChunkStart`**.
 //!   If HLS emits data without an active chunk, we return an error to avoid corrupt outputs.
 
-pub mod hls_factory;
-
-pub mod cache_layer;
-
-pub mod tree_handle;
-
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
@@ -39,6 +33,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
+use super::{cache_layer, hls_factory};
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl};
 use stream_download::storage::{
     ContentLength, DynamicLength, SegmentedLength, StorageProvider, StorageWriter,
@@ -194,7 +189,7 @@ where
 {
     fn storage_handle(&self) -> Option<stream_download::storage::StorageHandle> {
         Some(
-            crate::storage::tree_handle::TreeStorageResourceReader::new(self.storage_root.clone())
+            super::tree_handle::TreeStorageResourceReader::new(self.storage_root.clone())
                 .into_handle(),
         )
     }
