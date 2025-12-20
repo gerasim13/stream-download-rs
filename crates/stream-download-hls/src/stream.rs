@@ -31,6 +31,7 @@ use futures_util::Stream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
+use url::Url;
 
 use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
 use stream_download::source::{SourceStream, StreamControl, StreamMsg};
@@ -40,7 +41,7 @@ use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
 #[derive(Debug, Clone)]
 pub struct HlsStreamParams {
     /// The URL of the HLS master playlist.
-    pub url: Arc<str>,
+    pub url: Url,
     /// Unified settings for HLS playback and downloader behavior.
     pub settings: Arc<crate::HlsSettings>,
     /// Storage handle used for read-before-fetch caching of playlists/keys.
@@ -53,12 +54,12 @@ pub struct HlsStreamParams {
 impl HlsStreamParams {
     /// Create new HLS stream parameters.
     pub fn new(
-        url: impl Into<Arc<str>>,
+        url: Url,
         settings: impl Into<Arc<crate::HlsSettings>>,
         storage_handle: StorageHandle,
     ) -> Self {
         Self {
-            url: url.into(),
+            url,
             settings: settings.into(),
             storage_handle,
         }
@@ -93,7 +94,7 @@ impl HlsStream {
     /// * `abr_config` - ABR configuration
     /// * `selection_mode` - Selection mode for variants
     pub async fn new(
-        url: impl Into<Arc<str>>,
+        url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
     ) -> Result<Self, HlsStreamError> {
@@ -109,12 +110,10 @@ impl HlsStream {
     /// * `selection_mode` - Selection mode for variants
     /// * `downloader_config` - Optional custom downloader configuration
     pub async fn new_with_config(
-        url: impl Into<Arc<str>>,
+        url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
     ) -> Result<Self, HlsStreamError> {
-        let url = url.into();
-
         // Create channels for data and commands
         // Use bounded channel for data to control backpressure with configurable buffer size
         let buffer_size = settings.prefetch_buffer_size;
@@ -157,7 +156,7 @@ impl HlsStream {
 
     /// Start the background streaming task.
     async fn start_streaming_task(
-        url: Arc<str>,
+        url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
         data_sender: mpsc::Sender<StreamMsg>,

@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::io::{self, ErrorKind};
 use std::time::Duration;
 
+use reqwest::Url;
 use rodio::{OutputStreamBuilder, Sink};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -27,7 +29,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     // Fixed demo parameters.
-    let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
+    let url = "https://stream.silvercomet.top/hls/master.m3u8";
+    let url = Url::parse(url)
+        .map_err(|e| io::Error::new(ErrorKind::Other, format!("invalid HLS url '{}': {e}", url)))?;
     let seek_after = Duration::from_secs(5);
     let seek_forward = Duration::from_secs(60);
 
@@ -37,7 +41,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Persistent, deterministic on-disk storage layout:
     // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
     let storage_root = PathBuf::from("./hls-cache-seek");
-    std::fs::create_dir_all(&storage_root)?;
     let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB
     let max_cached_streams = NonZeroUsize::new(10).unwrap();
 

@@ -28,7 +28,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 mod abr;
 mod cache;
@@ -94,8 +93,8 @@ pub use std::time::Duration;
 /// - This is stable within a given build/toolchain, but not guaranteed to be stable across
 ///   Rust versions because it relies on the standard library hasher.
 /// - If you need cross-version stability, replace this with a fixed hash function (e.g. SHA-256).
-pub fn master_hash_from_url(url: &Arc<str>) -> String {
+pub fn master_hash_from_url(url: &url::Url) -> String {
     let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
+    url.as_str().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }

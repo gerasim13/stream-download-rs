@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
+use url::Url;
 
 use crate::{
     AbrConfig, AbrController, Aes128CbcMiddleware, HlsErrorKind, HlsManager, HlsStreamError,
@@ -559,7 +560,7 @@ impl HlsStreamWorker {
     }
 
     pub async fn new(
-        url: Arc<str>,
+        url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
         data_sender: mpsc::Sender<StreamMsg>,

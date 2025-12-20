@@ -24,6 +24,7 @@
 //!   If HLS emits data without an active chunk, we return an error to avoid corrupt outputs.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -113,6 +114,9 @@ where
     ) -> SegmentedStorageProvider<cache_layer::HlsCacheLayer<hls_factory::HlsFileTreeSegmentFactory>>
     {
         let storage_root: PathBuf = storage_root.into();
+
+        // Best-effort ensure the root exists up front so later storage ops don't fail on missing dirs.
+        let _ = fs::create_dir_all(&storage_root);
 
         let file_tree =
             hls_factory::HlsFileTreeSegmentFactory::new(storage_root.clone(), prefetch_bytes);

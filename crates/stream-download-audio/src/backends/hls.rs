@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use kanal::AsyncSender;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 use stream_download::source::DecodeError;
 use stream_download::storage::ProvidesStorageHandle;
@@ -62,7 +63,9 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
             .storage_handle()
             .expect("HLS persistent storage provider must vend a StorageHandle");
 
-        let params = HlsStreamParams::new(self.url.clone(), self.settings.clone(), storage_handle);
+        let url = Url::parse(&self.url)
+            .map_err(|e| io_other(&format!("invalid HLS url '{}': {e}", self.url)))?;
+        let params = HlsStreamParams::new(url, self.settings.clone(), storage_handle);
 
         let reader =
             match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await {

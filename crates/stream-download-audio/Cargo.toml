@@ -17,10 +17,11 @@ keywords.workspace = true
 # Core ecosystem deps (use workspace versions where available)
 tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
 bytes = { workspace = true }
-tracing = { workspace = true }
+futures-util = { workspace = true }
 reqwest = { workspace = true }
 tokio-util = { workspace = true }
-futures-util = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
 
 # Stream-download ecosystem
 stream-download = { version = "0.22.9", path = "../stream-download" }

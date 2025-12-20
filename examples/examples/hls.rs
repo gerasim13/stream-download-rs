@@ -1,7 +1,9 @@
 use std::error::Error;
+use std::io::{self, ErrorKind};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use reqwest::Url;
 use stream_download::source::DecodeError;
 use stream_download::storage::ProvidesStorageHandle;
 use stream_download::{Settings, StreamDownload};
@@ -23,7 +25,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_file(false)
         .init();
 
-    let url = "https://stream.silvercomet.top/hls/master.m3u8".to_string();
+    let url = "https://stream.silvercomet.top/hls/master.m3u8";
+    let url = Url::parse(url)
+        .map_err(|e| io::Error::new(ErrorKind::Other, format!("invalid HLS url '{}': {e}", url)))?;
     let manual_variant_idx = 0;
     let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
 
@@ -34,7 +38,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // `StreamControl::StoreResource` (e.g. playlists/keys), using the tree layout:
     // `<storage_root>/<resource_key_as_path>`.
     let storage_root = PathBuf::from("./hls-cache");
-    std::fs::create_dir_all(&storage_root)?;
 
     // Base prefetch buffer size for the adaptive storage wrapper (factory multiplies it by 2).
     let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB

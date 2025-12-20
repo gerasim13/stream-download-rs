@@ -67,7 +67,7 @@ use tracing::trace;
 #[derive(Debug)]
 pub struct HlsManager {
     /// URL of the master playlist.
-    master_url: Arc<str>,
+    master_url: url::Url,
     /// Configuration parameters.
     config: Arc<HlsSettings>,
     /// Downloader used to fetch playlists and segments.
@@ -114,7 +114,7 @@ impl HlsManager {
     /// The `downloader` is injected so that callers can customize how
     /// HTTP/caching is configured (e.g., shared client, different backends).
     pub fn new(
-        master_url: impl Into<Arc<str>>,
+        master_url: url::Url,
         config: Arc<HlsSettings>,
         downloader: ResourceDownloader,
         storage_handle: StorageHandle,
@@ -125,7 +125,7 @@ impl HlsManager {
             CachedResourceDownloader::new(downloader.clone(), Some(storage_handle));
 
         Self {
-            master_url: master_url.into(),
+            master_url,
             config,
             downloader,
             cached_downloader,
@@ -143,7 +143,7 @@ impl HlsManager {
     }
 
     /// Get the master playlist URL associated with this manager.
-    pub fn master_url(&self) -> &str {
+    pub fn master_url(&self) -> &url::Url {
         &self.master_url
     }
 
@@ -191,14 +191,12 @@ impl HlsManager {
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
-        let base_url = if let Some(ref media_playlist_url) = self.media_playlist_url {
-            media_playlist_url.as_str()
+        let base = if let Some(ref media_playlist_url) = self.media_playlist_url {
+            url::Url::parse(media_playlist_url)
+                .map_err(|e| HlsError::Io(format!("Failed to parse base URL: {}", e)))?
         } else {
-            &*self.master_url
+            self.master_url.clone()
         };
-
-        let base = url::Url::parse(base_url)
-            .map_err(|e| HlsError::Io(format!("Failed to parse base URL: {}", e)))?;
         base.join(relative_url)
             .map(|u| u.into())
             .map_err(|e| HlsError::Io(format!("Failed to join URL: {}", e)))
@@ -392,14 +390,14 @@ impl HlsManager {
     /// For now this is a stub that always returns an error.
     pub async fn load_master(&mut self) -> HlsResult<&MasterPlaylist> {
         let master_hash = crate::master_hash_from_url(&self.master_url);
-        let key =
-            cache_keys::playlist_key_from_url(&master_hash, &self.master_url).ok_or_else(|| {
+        let key = cache_keys::playlist_key_from_url(&master_hash, self.master_url.as_str())
+            .ok_or_else(|| {
                 HlsError::Message("unable to derive master playlist basename".to_string())
             })?;
 
         let res = self
             .cached_downloader
-            .download_playlist_cached(&self.master_url, &key)
+            .download_playlist_cached(self.master_url.as_str(), &key)
             .await?;
 
         if res.source == CacheSource::Network {
