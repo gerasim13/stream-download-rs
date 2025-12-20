@@ -24,6 +24,8 @@
 //! - This wrapper does **not** write to cache. Persisting downloaded bytes is done by higher layers
 //!   (e.g. via `StreamControl::StoreResource` handled by the storage provider).
 //! - Cache read errors are treated as cache misses by default (best-effort).
+//! - Cached methods return [`CachedBytes`] so callers can decide whether to persist via `StoreResource`
+//!   only on network misses.
 
 use bytes::Bytes;
 use stream_download::source::ResourceKey;
@@ -31,6 +33,22 @@ use stream_download::storage::StorageHandle;
 
 use crate::downloader::ResourceDownloader;
 use crate::model::{HlsError, HlsResult};
+
+/// Where the returned bytes came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheSource {
+    /// The bytes were read from the storage handle (cache hit).
+    Cache,
+    /// The bytes were downloaded from the network (cache miss).
+    Network,
+}
+
+/// Bytes returned by a cached downloader method, with metadata describing the source.
+#[derive(Clone, Debug)]
+pub struct CachedBytes {
+    pub bytes: Bytes,
+    pub source: CacheSource,
+}
 
 /// A downloader wrapper that can read playlists and keys from a `StorageHandle` before hitting the network.
 #[derive(Clone, Debug)]
@@ -102,26 +120,48 @@ impl CachedResourceDownloader {
 
     /// Download a playlist file fully into memory, using cache if available.
     ///
-    /// On cache hit, returns the cached bytes and does not hit the network.
-    /// On cache miss, downloads via the inner downloader.
-    pub async fn download_playlist_cached(&self, url: &str, key: &ResourceKey) -> HlsResult<Bytes> {
+    /// On cache hit, returns `CacheSource::Cache` and does not hit the network.
+    /// On cache miss, downloads via the inner downloader and returns `CacheSource::Network`.
+    pub async fn download_playlist_cached(
+        &self,
+        url: &str,
+        key: &ResourceKey,
+    ) -> HlsResult<CachedBytes> {
         if let Some(bytes) = self.read_cache(key)? {
-            return Ok(bytes);
+            return Ok(CachedBytes {
+                bytes,
+                source: CacheSource::Cache,
+            });
         }
 
-        self.inner.download_playlist(url).await
+        let bytes = self.inner.download_playlist(url).await?;
+        Ok(CachedBytes {
+            bytes,
+            source: CacheSource::Network,
+        })
     }
 
     /// Download an encryption key fully into memory, using cache if available.
     ///
-    /// On cache hit, returns the cached bytes and does not hit the network.
-    /// On cache miss, downloads via the inner downloader.
-    pub async fn download_key_cached(&self, url: &str, key: &ResourceKey) -> HlsResult<Bytes> {
+    /// On cache hit, returns `CacheSource::Cache` and does not hit the network.
+    /// On cache miss, downloads via the inner downloader and returns `CacheSource::Network`.
+    pub async fn download_key_cached(
+        &self,
+        url: &str,
+        key: &ResourceKey,
+    ) -> HlsResult<CachedBytes> {
         if let Some(bytes) = self.read_cache(key)? {
-            return Ok(bytes);
+            return Ok(CachedBytes {
+                bytes,
+                source: CacheSource::Cache,
+            });
         }
 
-        self.inner.download_key(url).await
+        let bytes = self.inner.download_key(url).await?;
+        Ok(CachedBytes {
+            bytes,
+            source: CacheSource::Network,
+        })
     }
 
     // -------------------------------------------------------------------------

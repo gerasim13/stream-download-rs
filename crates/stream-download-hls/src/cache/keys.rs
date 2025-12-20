@@ -1,0 +1,147 @@
+//! HLS cache key utilities.
+//!
+//! This module centralizes the construction of [`ResourceKey`](stream_download::source::ResourceKey)
+//! values used for caching **small resources** (playlists and encryption keys) in the persistent
+//! on-disk storage.
+//!
+//! Why this exists
+//! ---------------
+//! You want **minimal changes** in `HlsManager`: it should not be littered with string formatting
+//! details and on-disk layout rules.
+//!
+//! Instead, all HLS-specific cache key formatting lives here (or in the cached downloader layer),
+//! and the manager only passes in the inputs it naturally has:
+//! - `master_hash`
+//! - `variant_id`
+//! - resource URL (or sometimes just the basename if already extracted)
+//!
+//! Agreed on-disk layout
+//! ---------------------
+//! - Playlists (master + variant): stored at
+//!   `storage_root/<master_hash>/<playlist_basename>`
+//!   and addressed by `ResourceKey("<master_hash>/<playlist_basename>")`.
+//!
+//! - Keys (variant-scoped): stored at
+//!   `storage_root/<master_hash>/<variant_id>/<key_basename>`
+//!   and addressed by `ResourceKey("<master_hash>/<variant_id>/<key_basename>")`.
+//!
+//! Notes
+//! -----
+//! - The basename is taken from the resource URI, with the query (`?`) stripped.
+//! - We do **not** synthesize extensions. If the URI has no extension, we keep it that way.
+//! - These keys are later mapped to disk paths by a tree-layout storage handle, which sanitizes
+//!   components to prevent traversal.
+//!
+//! This module does **not** perform any IO.
+
+use std::borrow::Cow;
+
+use stream_download::source::ResourceKey;
+
+use crate::model::VariantId;
+
+/// Best-effort basename extraction for a URI-like string.
+///
+/// Behavior:
+/// - strips query part (anything after `?`)
+/// - takes substring after the last `/`
+/// - returns `None` if result is empty
+///
+/// Examples:
+/// - `"https://a/b/master.m3u8?token=1"` -> `Some("master.m3u8")`
+/// - `"seg-001.ts"` -> `Some("seg-001.ts")`
+/// - `"https://a/b/"` -> `None`
+pub fn uri_basename_no_query(uri: &str) -> Option<&str> {
+    let no_query = uri.split('?').next().unwrap_or(uri);
+    let base = no_query.rsplit('/').next().unwrap_or(no_query);
+    if base.is_empty() { None } else { Some(base) }
+}
+
+/// Construct a playlist cache key (master or variant) given a URL string.
+///
+/// Key format:
+/// - `"<master_hash>/<playlist_basename>"`
+///
+/// Returns `None` if the URL does not have a usable basename.
+pub fn playlist_key_from_url(master_hash: &str, playlist_url: &str) -> Option<ResourceKey> {
+    let basename = uri_basename_no_query(playlist_url)?;
+    Some(playlist_key_from_basename(master_hash, basename))
+}
+
+/// Construct a playlist cache key (master or variant) given a basename.
+///
+/// Key format:
+/// - `"<master_hash>/<playlist_basename>"`
+#[inline]
+pub fn playlist_key_from_basename(master_hash: &str, playlist_basename: &str) -> ResourceKey {
+    // Keep it allocation-friendly: allocate one String once.
+    ResourceKey(format!("{}/{}", master_hash, playlist_basename).into())
+}
+
+/// Construct a variant-scoped key cache key given a URL string.
+///
+/// Key format:
+/// - `"<master_hash>/<variant_id>/<key_basename>"`
+///
+/// Returns `None` if the URL does not have a usable basename.
+pub fn key_key_from_url(
+    master_hash: &str,
+    variant_id: VariantId,
+    key_url: &str,
+) -> Option<ResourceKey> {
+    let basename = uri_basename_no_query(key_url)?;
+    Some(key_key_from_basename(master_hash, variant_id, basename))
+}
+
+/// Construct a variant-scoped key cache key given a basename.
+///
+/// Key format:
+/// - `"<master_hash>/<variant_id>/<key_basename>"`
+#[inline]
+pub fn key_key_from_basename(
+    master_hash: &str,
+    variant_id: VariantId,
+    key_basename: &str,
+) -> ResourceKey {
+    ResourceKey(format!("{}/{}/{}", master_hash, variant_id.0, key_basename).into())
+}
+
+/// Convenience: given a playlist URL, return an owned-or-borrowed basename (query stripped).
+///
+/// This is useful if the caller wants to log or reuse the basename string without extra parsing.
+///
+/// Returns `None` if the URL does not contain a usable basename.
+pub fn playlist_basename_cow(url: &str) -> Option<Cow<'_, str>> {
+    let base = uri_basename_no_query(url)?;
+    // We may have stripped query; if the slice differs from original, we still return a &str slice
+    // of the original input, so it is always borrowed.
+    Some(Cow::Borrowed(base))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uri_basename_no_query() {
+        assert_eq!(
+            uri_basename_no_query("https://a/b/master.m3u8?token=1"),
+            Some("master.m3u8")
+        );
+        assert_eq!(uri_basename_no_query("seg-001.ts"), Some("seg-001.ts"));
+        assert_eq!(uri_basename_no_query("https://a/b/"), None);
+        assert_eq!(uri_basename_no_query(""), None);
+    }
+
+    #[test]
+    fn test_playlist_key_format() {
+        let k = playlist_key_from_url("deadbeef", "https://x/y/index.m3u8?z=1").unwrap();
+        assert_eq!(&*k.0, "deadbeef/index.m3u8");
+    }
+
+    #[test]
+    fn test_key_key_format() {
+        let k = key_key_from_url("deadbeef", VariantId(3), "https://x/y/key.bin?z=1").unwrap();
+        assert_eq!(&*k.0, "deadbeef/3/key.bin");
+    }
+}

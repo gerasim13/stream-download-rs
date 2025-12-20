@@ -5,5 +5,8 @@
 //!
 //! In particular, we use a simple **lease file** mechanism to mark caches that are actively in use
 //! so that eviction does not delete directories for currently playing streams.
+//!
+//! It also centralizes HLS-specific cache key formatting for playlists and keys.
 
+pub mod keys;
 pub mod lease;
