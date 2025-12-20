@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use stream_download::source::DecodeError;
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
-    HlsFileTreeSegmentFactory, HlsSettings, HlsStream, HlsStreamParams, SegmentedStorageProvider,
-    VariantId,
+    HlsCacheLayer, HlsFileTreeSegmentFactory, HlsSettings, HlsStream, HlsStreamParams,
+    SegmentedStorageProvider, VariantId,
 };
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -28,15 +28,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
     let params = HlsStreamParams::new(url, settings);
 
-    // Persistent, deterministic on-disk cache layout:
-    // `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
-    let cache_root = PathBuf::from("./hls-cache");
-    std::fs::create_dir_all(&cache_root)?;
+    // Persistent, deterministic on-disk storage layout:
+    // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
+    let storage_root = PathBuf::from("./hls-cache");
+    std::fs::create_dir_all(&storage_root)?;
 
     // Base prefetch buffer size for the adaptive storage wrapper (factory multiplies it by 2).
     let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB
 
-    let factory = HlsFileTreeSegmentFactory::new(cache_root, prefetch_bytes);
+    // Limit how many distinct HLS streams we keep in persistent storage (LRU by master playlist).
+    let max_cached_streams = NonZeroUsize::new(10).unwrap();
+
+    let file_tree = HlsFileTreeSegmentFactory::new(storage_root.clone(), prefetch_bytes);
+    let factory =
+        HlsCacheLayer::new(file_tree, storage_root).with_max_cached_streams(max_cached_streams);
 
     let reader = match StreamDownload::new::<HlsStream>(
         params,

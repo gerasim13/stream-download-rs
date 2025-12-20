@@ -31,6 +31,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 mod abr;
+mod cache;
 mod downloader;
 mod manager;
 mod model;
@@ -52,8 +53,12 @@ pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
 pub use crate::storage::SegmentedStorageProvider;
 
-// File-tree (persistent) segment cache helpers (deterministic naming/layout).
+// File-tree (persistent) segment storage helpers (deterministic naming/layout).
 pub use crate::storage::hls_factory::HlsFileTreeSegmentFactory;
+
+// Cache/policy layer (leases + eviction) wrapping a segment factory.
+pub use crate::storage::cache_layer::HlsCacheLayer;
+
 pub use crate::stream::{HlsStream, HlsStreamParams};
 pub use crate::traits::{
     MediaStream, NextSegmentResult, SegmentData, SegmentType, StreamMiddleware, apply_middlewares,

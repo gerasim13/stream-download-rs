@@ -50,36 +50,6 @@ impl ResourceDownloader {
         }
     }
 
-    /// Create a downloader with default configuration.
-    pub fn new_default() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(30),
-            max_retries: 3,
-            retry_base_delay: Duration::from_millis(100),
-            max_retry_delay: Duration::from_secs(5),
-        }
-    }
-
-    /// Create a downloader optimized for mobile networks.
-    pub fn mobile() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(15),
-            max_retries: 5,
-            retry_base_delay: Duration::from_millis(50),
-            max_retry_delay: Duration::from_secs(3),
-        }
-    }
-
-    /// Create a downloader optimized for low-latency live streaming.
-    pub fn low_latency() -> Self {
-        Self {
-            request_timeout: Duration::from_secs(5),
-            max_retries: 1,
-            retry_base_delay: Duration::from_millis(50),
-            max_retry_delay: Duration::from_millis(500),
-        }
-    }
-
     // ----------------------------
     // Byte-oriented helper methods
     // ----------------------------

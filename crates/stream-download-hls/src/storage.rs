@@ -26,6 +26,9 @@
 // Public storage helpers (e.g. deterministic file-tree factory).
 pub mod hls_factory;
 
+// Cache/policy layer (leases + eviction) that wraps a segment factory.
+pub mod cache_layer;
+
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;

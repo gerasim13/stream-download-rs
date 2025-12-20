@@ -1,10 +1,10 @@
-//! Built-in HLS cache layout helpers.
+//! Built-in HLS storage layout helpers.
 //!
 //! This module provides a production-oriented segment storage factory that implements a
-//! per-segment file tree layout rooted at a single cache directory.
+//! per-segment **file tree layout** rooted at a single `storage_root` directory.
 //!
 //! Target layout (segments):
-//! `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
+//! `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
 //!
 //! Important note about `stream_key`:
 //! - The segmented orchestrator only knows about `stream_key` and `chunk_id`.
@@ -20,6 +20,10 @@
 //! This factory supports an optional `filename_hint` (playlist-derived basename, query ignored).
 //! If present, it is used "as is" as the segment filename (no extension inference).
 //! If absent (or empty), we return an error to surface the bug immediately.
+//!
+//! NOTE:
+//! - Eviction / leases / LRU policy are implemented in the cache layer wrapper (`HlsCacheLayer`).
+//!   This file-tree factory is intentionally "dumb": it only maps a segment to a deterministic path.
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -40,7 +44,7 @@ use crate::storage::SegmentStorageFactory;
 /// (not from each individual segment URL).
 #[derive(Clone, Debug)]
 pub struct HlsFileTreeSegmentFactory {
-    cache_root: PathBuf,
+    storage_root: PathBuf,
     /// Base prefetch buffer size used by the adaptive storage wrapper.
     ///
     /// The factory will multiply it by 2 (consistent with previous examples).
@@ -48,17 +52,17 @@ pub struct HlsFileTreeSegmentFactory {
 }
 
 impl HlsFileTreeSegmentFactory {
-    /// Create a new factory rooted at `cache_root`.
-    pub fn new(cache_root: impl Into<PathBuf>, prefetch_bytes: NonZeroUsize) -> Self {
+    /// Create a new factory rooted at `storage_root`.
+    pub fn new(storage_root: impl Into<PathBuf>, prefetch_bytes: NonZeroUsize) -> Self {
         Self {
-            cache_root: cache_root.into(),
+            storage_root: storage_root.into(),
             prefetch_bytes,
         }
     }
 
-    /// Root directory where all cached segment files will live.
-    pub fn cache_root(&self) -> &Path {
-        &self.cache_root
+    /// Root directory where all persistent segment files will live.
+    pub fn storage_root(&self) -> &Path {
+        &self.storage_root
     }
 
     /// Parse `stream_key` as `"<master_hash>/<variant_id>"`.
@@ -108,16 +112,14 @@ impl HlsFileTreeSegmentFactory {
         };
 
         Ok(self
-            .cache_root
+            .storage_root
             .join(master_hash)
             .join(variant_id)
             .join(filename))
     }
 
-    /// Create a per-segment storage provider, writing bytes to `<cache_root>/<...>/<segment_basename>`.
-    ///
-    /// This matches the layout used in earlier iterations: each HLS segment is stored as a
-    /// distinct file with the playlist-derived basename.
+    /// Create a per-segment storage provider, writing bytes to:
+    /// `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`.
     pub fn provider_for_segment(
         &self,
         stream_key: &ResourceKey,
