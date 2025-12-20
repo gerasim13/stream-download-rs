@@ -137,6 +137,10 @@ impl HlsStream {
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
+        // Stable-ish identifier used for persistent cache layout:
+        // `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
+        let master_hash = crate::master_hash_from_url(&url);
+
         let task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
             let result = async {
@@ -147,6 +151,7 @@ impl HlsStream {
                     seek_receiver,
                     cancel_token,
                     event_sender,
+                    master_hash,
                 )
                 .await?;
                 worker.run().await

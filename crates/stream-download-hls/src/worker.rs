@@ -25,6 +25,10 @@ pub struct HlsStreamWorker {
     current_position: u64,
     bytes_to_skip: u64,
     retry_delay: std::time::Duration,
+
+    // Stable identifier for persistent cache layout:
+    // `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
+    master_hash: Arc<str>,
 }
 
 impl HlsStreamWorker {
@@ -329,7 +333,10 @@ impl HlsStreamWorker {
         // If the variant changed, notify the storage layer so the stitched reader follows the
         // new logical stream key.
         if *last_variant_id != Some(desc.variant_id) {
-            let new_stream_key: ResourceKey = format!("hls/variant-{}", desc.variant_id.0).into();
+            // IMPORTANT: for persistent caching with deterministic file-tree layout, the stream key MUST be:
+            // `"<master_hash>/<variant_id>"`.
+            let new_stream_key: ResourceKey =
+                format!("{}/{}", self.master_hash, desc.variant_id.0).into();
             let _ =
                 self.data_sender
                     .try_send(StreamMsg::Control(StreamControl::SetDefaultStreamKey {
@@ -373,9 +380,12 @@ impl HlsStreamWorker {
         // Emit ordered control message to start a new chunk in segmented storage.
         //
         // We store chunks under a per-variant stream key so different variants/codecs do not mix.
+        // For persistent caching with deterministic file-tree layout, the stream key MUST be:
+        // `"<master_hash>/<variant_id>"`.
+        //
         // The stitched reader follows `SharedState::default_stream_key`, which we can switch via
         // `StreamControl::SetDefaultStreamKey`.
-        let stream_key: ResourceKey = format!("hls/variant-{}", desc.variant_id.0).into();
+        let stream_key: ResourceKey = format!("{}/{}", self.master_hash, desc.variant_id.0).into();
         let kind = if desc.is_init {
             ChunkKind::Init
         } else {
@@ -428,6 +438,7 @@ impl HlsStreamWorker {
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
+        master_hash: String,
     ) -> Result<Self, HlsStreamError> {
         // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
@@ -502,6 +513,7 @@ impl HlsStreamWorker {
             current_position: 0,
             bytes_to_skip: 0,
             retry_delay: Self::INITIAL_RETRY_DELAY,
+            master_hash: Arc::<str>::from(master_hash),
         })
     }
 
