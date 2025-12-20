@@ -3,7 +3,6 @@
 //! This module provides a wrapper around an inner [`SegmentStorageFactory`] that adds:
 //! - A filesystem "lease" marker to prevent eviction of currently active streams.
 //! - LRU-style eviction by `<storage_root>/<master_hash>` directory count.
-//! - `.access` marker updates for LRU ordering.
 //!
 //! Additionally, it can vend a read-only [`StorageHandle`] for persisted small resources
 //! (e.g. playlists/keys) stored under `storage_root` by treating `ResourceKey` as a relative path.
@@ -18,9 +17,15 @@
 //! - `stream_key` is `"<master_hash>/<variant_id>"`
 //! - segment path: `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
 //!
-//! Markers:
-//! - lease:  `<storage_root>/<master_hash>/.lease`
-//! - access: `<storage_root>/<master_hash>/.access`
+//! Marker:
+//! - lease: `<storage_root>/<master_hash>/.lease`
+//!
+//! The lease file serves two roles:
+//! - **Active-use protection**: eviction must not delete dirs with a fresh lease (mtime < TTL).
+//! - **LRU ordering**: eviction sorts master dirs by lease mtime (oldest evicted first).
+//!
+//! There is intentionally no separate ".access" marker and no in-memory lease guard.
+//! The lease file is not removed on shutdown; TTL-based eviction handles cleanup.
 
 use std::collections::HashSet;
 use std::fs;
@@ -28,15 +33,17 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use stream_download::source::{ChunkKind, ResourceKey};
 use stream_download::storage::{ProvidesStorageHandle, StorageHandle};
 
-use crate::cache::lease::{CacheLeaseGuard, DEFAULT_LEASE_TTL};
+use crate::cache::lease::{DEFAULT_LEASE_TTL, ensure_lease_marker, touch_lease_best_effort};
 use crate::storage::tree_handle::TreeStorageResourceReader;
 
 use super::SegmentStorageFactory;
+
+use tracing::trace;
 
 /// A cache-policy wrapper for an HLS segment storage factory.
 ///
@@ -62,12 +69,8 @@ where
 
 #[derive(Default)]
 struct State {
-    // Master hashes we've already initialized in this process (lease acquired and LRU touched).
+    // Master hashes we've already initialized in this process.
     seen_masters: HashSet<String>,
-
-    // Keep lease guards alive for the lifetime of this cache layer.
-    // Note: multiple concurrent playbacks may coexist; we keep one guard per master_hash.
-    leases: Vec<CacheLeaseGuard>,
 }
 
 impl<F> HlsCacheLayer<F>
@@ -128,37 +131,6 @@ where
         Ok(master_hash)
     }
 
-    fn master_dir(&self, master_hash: &str) -> PathBuf {
-        self.storage_root.join(master_hash)
-    }
-
-    fn access_marker_path(master_dir: &Path) -> PathBuf {
-        master_dir.join(".access")
-    }
-
-    fn now_secs() -> io::Result<u64> {
-        let dur = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("system time error: {e}")))?;
-        Ok(dur.as_secs())
-    }
-
-    fn touch_access_marker(&self, master_hash: &str) -> io::Result<()> {
-        let dir = self.master_dir(master_hash);
-        fs::create_dir_all(&dir)?;
-        let ts = Self::now_secs()?;
-        fs::write(Self::access_marker_path(&dir), ts.to_string().as_bytes())?;
-        Ok(())
-    }
-
-    fn read_access_ts(&self, master_dir: &Path) -> u64 {
-        let marker = Self::access_marker_path(master_dir);
-        let Ok(data) = fs::read_to_string(marker) else {
-            return 0;
-        };
-        data.trim().parse::<u64>().unwrap_or(0)
-    }
-
     fn is_lease_active_path(&self, master_dir: &Path) -> bool {
         let lease = master_dir.join(".lease");
         if !lease.exists() {
@@ -178,6 +150,23 @@ where
         }
     }
 
+    /// Best-effort read of lease mtime used for LRU ordering.
+    ///
+    /// Returns `0` if there is no lease or metadata cannot be read.
+    fn lease_mtime_ts(&self, master_dir: &Path) -> u64 {
+        let lease = master_dir.join(".lease");
+        let Ok(meta) = fs::metadata(&lease) else {
+            return 0;
+        };
+        let Ok(modified) = meta.modified() else {
+            return 0;
+        };
+        match modified.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => 0,
+        }
+    }
+
     /// Attempt to ensure cache state for `master_hash`:
     /// - acquire lease (keep guard alive)
     /// - touch LRU access marker
@@ -194,11 +183,20 @@ where
                 .unwrap_or_else(|poison| poison.into_inner());
 
             if st.seen_masters.insert(master_hash.to_string()) {
-                // First time we see this master_hash in this process: acquire lease.
-                if let Ok(Some(guard)) =
-                    crate::cache::lease::acquire_lease(&self.storage_root, master_hash)
-                {
-                    st.leases.push(guard);
+                trace!("cache: lease create start master_hash='{}'", master_hash);
+
+                // First time we see this master_hash in this process: ensure the lease marker exists.
+                // The lease file is *not* removed on shutdown; eviction uses mtime + TTL.
+                match ensure_lease_marker(&self.storage_root, master_hash) {
+                    Ok(true) => trace!("cache: lease create OK master_hash='{}'", master_hash),
+                    Ok(false) => trace!(
+                        "cache: lease create SKIP/FAIL master_hash='{}' (best-effort)",
+                        master_hash
+                    ),
+                    Err(e) => trace!(
+                        "cache: lease create ERROR master_hash='{}' err='{}' (best-effort)",
+                        master_hash, e
+                    ),
                 }
 
                 // Only consider eviction once per newly observed master.
@@ -206,8 +204,14 @@ where
             }
         }
 
-        // Touch access marker every time (LRU).
-        let _ = self.touch_access_marker(master_hash);
+        // Touch lease every time (LRU + keep fresh relative to TTL).
+        match touch_lease_best_effort(&self.storage_root, master_hash) {
+            Ok(()) => trace!("cache: lease touch OK master_hash='{}'", master_hash),
+            Err(e) => trace!(
+                "cache: lease touch ERROR master_hash='{}' err='{}' (best-effort)",
+                master_hash, e
+            ),
+        }
 
         if run_eviction {
             let _ = self.evict_if_needed_best_effort(Some(master_hash));
@@ -250,21 +254,33 @@ where
             // Never delete the protected master dir.
             if let Some(protect) = protect_master_hash {
                 if path.file_name().and_then(|s| s.to_str()) == Some(protect) {
+                    trace!("cache: evict skip protected dir='{}'", path.display());
                     continue;
                 }
             }
 
             // Do not evict active leases (unless stale by TTL).
             if self.is_lease_active_path(&path) {
+                trace!("cache: evict skip active-lease dir='{}'", path.display());
                 continue;
             }
 
-            let ts = self.read_access_ts(&path);
+            let ts = self.lease_mtime_ts(&path);
+            trace!(
+                "cache: evict candidate dir='{}' lease_mtime_ts={}",
+                path.display(),
+                ts
+            );
             masters.push((ts, path));
         }
 
         let max = max.get();
         if masters.len() <= max {
+            trace!(
+                "cache: evict not-needed masters={} max={}",
+                masters.len(),
+                max
+            );
             return Ok(());
         }
 
@@ -272,7 +288,15 @@ where
         masters.sort_by_key(|(ts, _)| *ts);
 
         let to_remove = masters.len().saturating_sub(max);
+        trace!(
+            "cache: evict start masters={} max={} to_remove={}",
+            masters.len(),
+            max,
+            to_remove
+        );
+
         for (_, dir) in masters.into_iter().take(to_remove) {
+            trace!("cache: evict removing dir='{}'", dir.display());
             // Best-effort remove.
             let _ = fs::remove_dir_all(dir);
         }

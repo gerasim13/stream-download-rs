@@ -45,20 +45,6 @@ use stream_download::storage::{
 };
 use tracing::trace;
 
-/// Optional integration: if the core provides these types/traits (they existed in earlier WIP),
-/// `SegmentedStorageProvider` can vend a handle to read stored resources.
-///
-/// If your current `stream-download` core does not have these, keep using the provider without
-/// resource retrieval for now, or add the handle types later.
-///
-/// We keep this behind a feature-like cfg by using `cfg(any())` as a placeholder. Replace it with
-/// a real feature flag if you want.
-///
-/// NOTE: This file is added "from scratch" for the current repo state; it intentionally avoids
-/// depending on non-existent core APIs.
-#[cfg(any())]
-use stream_download::storage::{ProvidesStorageHandle, StorageHandle, StorageResourceReader};
-
 /// Factory for creating a fresh per-segment [`StorageProvider`] instance.
 ///
 /// This is required for persistent caching with deterministic file layouts:

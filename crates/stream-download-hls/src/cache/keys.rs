@@ -39,8 +39,6 @@
 //! This module emits `trace` logs when it successfully derives basenames / keys (or fails to),
 //! to help debug cache key mapping issues.
 
-use std::borrow::Cow;
-
 use stream_download::source::ResourceKey;
 
 use crate::model::VariantId;
@@ -138,18 +136,6 @@ pub fn key_key_from_basename(
         master_hash, variant_id.0, key_basename, key.0
     );
     key
-}
-
-/// Convenience: given a playlist URL, return an owned-or-borrowed basename (query stripped).
-///
-/// This is useful if the caller wants to log or reuse the basename string without extra parsing.
-///
-/// Returns `None` if the URL does not contain a usable basename.
-pub fn playlist_basename_cow(url: &str) -> Option<Cow<'_, str>> {
-    let base = uri_basename_no_query(url)?;
-    // We may have stripped query; if the slice differs from original, we still return a &str slice
-    // of the original input, so it is always borrowed.
-    Some(Cow::Borrowed(base))
 }
 
 #[cfg(test)]
