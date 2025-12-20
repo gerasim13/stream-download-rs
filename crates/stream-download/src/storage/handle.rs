@@ -11,6 +11,8 @@
 //!
 //! This module defines a minimal, lock-free contract:
 //! - `StorageResourceReader`: "given a `ResourceKey`, return the full bytes if available"
+//! - `StorageResourceReader::exists`: "given a `ResourceKey`, return whether it exists"
+//! - `StorageResourceReader::len`: "given a `ResourceKey`, return byte length if known"
 //! - `StorageHandle`: a cheap cloneable wrapper around an implementation
 //! - `ProvidesStorageHandle`: optional trait for providers to vend such handles
 
@@ -22,13 +24,17 @@ use bytes::Bytes;
 
 use crate::source::ResourceKey;
 
-/// Read-only interface for retrieving whole resources addressed by [`ResourceKey`].
+/// Read-only interface for retrieving resources addressed by [`ResourceKey`].
 ///
 /// Notes:
-/// - The semantics are "read the full resource blob" (small objects like playlists / keys).
+/// - `read` semantics are "read the full resource blob" (small objects like playlists / keys).
 /// - Returning `Ok(None)` indicates cache miss / absent resource.
 /// - Implementations should be fast and should avoid global locks; callers may invoke this
 ///   opportunistically before network requests.
+///
+/// Additional best-effort probes:
+/// - `exists` allows callers to check for presence without reading bytes.
+/// - `len` allows callers to query file/blob length (if cheaply available) without reading bytes.
 pub trait StorageResourceReader: Send + Sync + 'static {
     /// Read a full resource blob by key.
     ///
@@ -37,6 +43,21 @@ pub trait StorageResourceReader: Send + Sync + 'static {
     /// - `Ok(None)` if the resource is not present (cache miss).
     /// - `Err(e)` on IO/read errors.
     fn read(&self, key: &ResourceKey) -> io::Result<Option<Bytes>>;
+
+    /// Check whether a resource exists in storage.
+    ///
+    /// Implementations should prefer a metadata/stat call rather than reading bytes.
+    fn exists(&self, key: &ResourceKey) -> io::Result<bool> {
+        Ok(self.read(key)?.is_some())
+    }
+
+    /// Return the resource length in bytes if known.
+    ///
+    /// This is intended for "cheap metadata" queries (e.g. file size).
+    /// Default implementation falls back to reading the whole resource.
+    fn len(&self, key: &ResourceKey) -> io::Result<Option<u64>> {
+        Ok(self.read(key)?.map(|b| b.len() as u64))
+    }
 }
 
 /// A cheap, cloneable handle for keyed resource reads.
@@ -64,6 +85,18 @@ impl StorageHandle {
     #[inline]
     pub fn read(&self, key: &ResourceKey) -> io::Result<Option<Bytes>> {
         self.inner.read(key)
+    }
+
+    /// Check whether a resource exists in storage.
+    #[inline]
+    pub fn exists(&self, key: &ResourceKey) -> io::Result<bool> {
+        self.inner.exists(key)
+    }
+
+    /// Return the resource length in bytes if known.
+    #[inline]
+    pub fn len(&self, key: &ResourceKey) -> io::Result<Option<u64>> {
+        self.inner.len(key)
     }
 }
 

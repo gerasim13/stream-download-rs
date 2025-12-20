@@ -99,6 +99,39 @@ impl StorageResourceReader for TreeStorageResourceReader {
             Ok(Some(Bytes::from(data)))
         }
     }
+
+    fn exists(&self, key: &ResourceKey) -> io::Result<bool> {
+        let path = self.path_for_key(key);
+
+        // Treat missing paths as miss.
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        // Treat directories as miss.
+        if path.is_dir() {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn len(&self, key: &ResourceKey) -> io::Result<Option<u64>> {
+        let path = self.path_for_key(key);
+
+        // Treat missing paths as miss.
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        // Treat directories as miss.
+        if path.is_dir() {
+            return Ok(None);
+        }
+
+        let meta = std::fs::metadata(&path)?;
+        Ok(Some(meta.len()))
+    }
 }
 
 /// Sanitize a single path component so it is safe to use under `storage_root`.

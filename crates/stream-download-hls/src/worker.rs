@@ -27,6 +27,9 @@ pub struct HlsStreamWorker {
     bytes_to_skip: u64,
     retry_delay: std::time::Duration,
 
+    /// Storage handle for read-before-fetch caching probes (segments, playlists/keys in manager).
+    storage_handle: StorageHandle,
+
     // Stable identifier for persistent cache layout:
     // `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`
     master_hash: Arc<str>,
@@ -401,6 +404,78 @@ impl HlsStreamWorker {
             no_query.rsplit('/').next().map(|s| Arc::<str>::from(s))
         };
 
+        // ---------------------------------------------------------------------
+        // Segment cache probe (best-effort)
+        //
+        // We address segments by a ResourceKey that is the relative path from storage_root:
+        // "<master_hash>/<variant_id>/<segment_basename>".
+        //
+        // On HIT:
+        // - do NOT hit the network,
+        // - still emit ChunkStart/ChunkEnd so segmented storage can attach the existing file
+        //   and readers can consume it,
+        // - use StorageHandle::len for gathered_len when possible.
+        //
+        // On error:
+        // - treat as MISS (best-effort), but log.
+        // ---------------------------------------------------------------------
+        let cached_segment_key: Option<ResourceKey> = filename_hint.as_deref().map(|base| {
+            // NOTE: variant_id is encoded into stream_key as "<master_hash>/<variant_id>".
+            // We want the full path including the segment basename.
+            ResourceKey(format!("{}/{}", stream_key.0, base).into())
+        });
+
+        if let Some(seg_key) = cached_segment_key.as_ref() {
+            match self.storage_handle.len(seg_key) {
+                Ok(Some(len)) if len > 0 => {
+                    tracing::trace!("segment cache: HIT key='{}' ({} bytes)", seg_key.0, len);
+
+                    self.data_sender
+                        .send(StreamMsg::Control(StreamControl::ChunkStart {
+                            stream_key: stream_key.clone(),
+                            kind,
+                            reported_len: seg_size,
+                            filename_hint: filename_hint.clone(),
+                        }))
+                        .await
+                        .map_err(|_| HlsStreamError::Cancelled)?;
+
+                    self.data_sender
+                        .send(StreamMsg::Control(StreamControl::ChunkEnd {
+                            stream_key,
+                            kind,
+                            gathered_len: len,
+                        }))
+                        .await
+                        .map_err(|_| HlsStreamError::Cancelled)?;
+
+                    // Emit segment boundary events after finishing streaming
+                    self.emit_post_segment_events(&desc);
+
+                    return Ok(());
+                }
+                Ok(Some(_len)) => {
+                    // Exists but empty: treat as miss to allow refetch.
+                    tracing::trace!(
+                        "segment cache: MISS (empty) key='{}' - treating as miss",
+                        seg_key.0
+                    );
+                }
+                Ok(None) => {
+                    tracing::trace!("segment cache: MISS key='{}'", seg_key.0);
+                }
+                Err(e) => {
+                    tracing::trace!(
+                        "segment cache: READ ERROR key='{}' err='{}' (treating as miss)",
+                        seg_key.0,
+                        e
+                    );
+                }
+            }
+        } else {
+            tracing::trace!("segment cache: disabled for this segment (missing filename_hint)");
+        }
+
         self.data_sender
             .send(StreamMsg::Control(StreamControl::ChunkStart {
                 stream_key: stream_key.clone(),
@@ -463,7 +538,7 @@ impl HlsStreamWorker {
             url.clone(),
             settings.clone(),
             manager_downloader,
-            storage_handle,
+            storage_handle.clone(),
             data_sender.clone(),
         );
 
@@ -518,11 +593,14 @@ impl HlsStreamWorker {
             data_sender,
             seek_receiver,
             cancel_token,
-            event_sender,
+            event_sender: event_sender.clone(),
             controller,
             current_position: 0,
             bytes_to_skip: 0,
             retry_delay: Self::INITIAL_RETRY_DELAY,
+
+            storage_handle,
+
             master_hash: Arc::<str>::from(master_hash),
         })
     }
