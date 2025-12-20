@@ -5,6 +5,7 @@ use rodio::{OutputStreamBuilder, Sink};
 use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
+use stream_download_hls::SegmentedStorageProvider;
 use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams, VariantId};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -31,10 +32,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let settings = HlsSettings::default().selection_manual(VariantId(0));
     let params = HlsStreamParams::new(url, settings);
 
-    // Create a blocking reader over the HLS stream via StreamDownload
+    // Create a blocking reader over the HLS stream via StreamDownload, but store each HLS chunk
+    // (init/media segments) separately via SegmentedStorageProvider. This enables correct seeking.
     let reader = match StreamDownload::new::<HlsStream>(
         params,
-        TempStorageProvider::default(),
+        SegmentedStorageProvider::new(|| TempStorageProvider::default()),
         Settings::default(),
     )
     .await
