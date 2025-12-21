@@ -624,9 +624,17 @@ impl HlsStreamWorker {
             if master.variants.is_empty() {
                 return Err(HlsStreamError::Hls(HlsErrorKind::NoVariants));
             }
-            match settings.selection_manual_variant_id {
+
+            // If selector returns Some(VariantId) => start in MANUAL mode at that variant.
+            // If selector is absent or returns None => start in AUTO mode, using manager default.
+            let selected = settings
+                .variant_stream_selector
+                .as_ref()
+                .and_then(|cb| (cb)(master));
+
+            match selected {
                 None => manager.current_variant_index().unwrap_or(0),
-                Some(index) => index.0,
+                Some(id) => id.0,
             }
         };
 
@@ -642,7 +650,10 @@ impl HlsStreamWorker {
             down_hysteresis_ratio: settings.abr_down_hysteresis_ratio,
             min_switch_interval: settings.abr_min_switch_interval,
         };
-        let manual_variant_id = settings.selection_manual_variant_id;
+        let manual_variant_id = settings
+            .variant_stream_selector
+            .as_ref()
+            .and_then(|cb| (cb)(master));
 
         let mut controller = AbrController::new(
             manager,

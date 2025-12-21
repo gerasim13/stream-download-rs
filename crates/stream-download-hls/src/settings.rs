@@ -11,19 +11,53 @@
 //! - Variant selection mode (manual vs. auto)
 //!
 //! Notes:
-//! - Manual selection is represented as `selection_manual_variant_id: Option<VariantId>`.
-//!   When `None`, selection is AUTO; when `Some(id)`, selection is MANUAL for that variant.
+//! - Manual selection is represented by `variant_stream_selector` callback returning `Some(id)`.
+//!   When it returns `None`, selection is AUTO (ABR-controlled).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use url::Url;
+
 use crate::model::{KeyProcessorCallback, VariantId};
+
+/// Type alias for variant stream selector callback.
+///
+/// - Return `Some(VariantId)` to force MANUAL selection for that variant.
+/// - Return `None` to allow AUTO selection (ABR-controlled).
+///
+/// The callback receives the parsed master playlist so you can make an
+/// informed choice (bandwidth, codecs, resolution, etc.).
+pub type VariantStreamSelector =
+    dyn Fn(&crate::model::MasterPlaylist) -> Option<VariantId> + Send + Sync;
 
 /// Unified settings for HLS streaming.
 #[derive(Clone)]
 pub struct HlsSettings {
+    // ----------------------------
+    // URL resolution
+    // ----------------------------
+    /// Optional base URL override used to form final URLs for:
+    /// - media playlists (variant URIs in master playlist)
+    /// - segments
+    /// - encryption keys
+    ///
+    /// When `None`, URL resolution falls back to the relevant playlist URL.
+    pub base_url: Option<Url>,
+
+    // ----------------------------
+    // Variant selection
+    // ----------------------------
+    /// Variant selector callback.
+    ///
+    /// If it returns `None`, selection is AUTO (ABR-controlled).
+    /// If it returns `Some(id)`, selection is MANUAL for that variant.
+    ///
+    /// The callback is given the parsed master playlist.
+    pub variant_stream_selector: Option<Arc<Box<VariantStreamSelector>>>,
+
     // ----------------------------
     // HTTP downloader (flattened from `DownloaderConfig`)
     // ----------------------------
@@ -101,18 +135,17 @@ pub struct HlsSettings {
     /// Minimal interval between consecutive switches to avoid oscillations.
     /// Default: 4 seconds.
     pub abr_min_switch_interval: Duration,
-
-    // ----------------------------
-    // Variant selection mode (flattened from `SelectionMode`)
-    // ----------------------------
-    /// Manual selection target. If `None`, selection is AUTO.
-    /// If `Some(id)`, selection is MANUAL for that variant.
-    pub selection_manual_variant_id: Option<VariantId>,
 }
 
 impl Default for HlsSettings {
     fn default() -> Self {
         Self {
+            // URL resolution defaults
+            base_url: None,
+
+            // Variant selection defaults
+            variant_stream_selector: None,
+
             // Downloader defaults (from previous `DownloaderConfig::default`)
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
@@ -134,9 +167,6 @@ impl Default for HlsSettings {
             abr_up_hysteresis_ratio: 0.15,
             abr_down_hysteresis_ratio: 0.05,
             abr_min_switch_interval: Duration::from_secs(4),
-
-            // Selection mode default: AUTO
-            selection_manual_variant_id: None,
         }
     }
 }
@@ -145,6 +175,9 @@ impl fmt::Debug for HlsSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Do not print `key_processor_cb` to keep Debug output clean.
         f.debug_struct("HlsSettings")
+            // URL resolution + Selection
+            .field("base_url", &self.base_url)
+            .field("variant_stream_selector", &"<callback>")
             // Downloader
             .field("request_timeout", &self.request_timeout)
             .field("max_retries", &self.max_retries)
@@ -169,11 +202,6 @@ impl fmt::Debug for HlsSettings {
             .field("abr_up_hysteresis_ratio", &self.abr_up_hysteresis_ratio)
             .field("abr_down_hysteresis_ratio", &self.abr_down_hysteresis_ratio)
             .field("abr_min_switch_interval", &self.abr_min_switch_interval)
-            // Selection
-            .field(
-                "selection_manual_variant_id",
-                &self.selection_manual_variant_id,
-            )
             .finish()
     }
 }
@@ -188,48 +216,55 @@ impl HlsSettings {
         Self::default()
     }
 
-    /// Create settings optimized for mobile networks.
-    /// - Shorter timeouts
-    /// - More aggressive retries
-    pub fn mobile(mut self) -> Self {
-        self.request_timeout = Duration::from_secs(15);
-        self.max_retries = 5;
-        self.retry_base_delay = Duration::from_millis(50);
-        self.max_retry_delay = Duration::from_secs(3);
+    // -------------------------
+    // URL resolution helpers
+    // -------------------------
+
+    /// Override base URL used to form final URLs for segments and keys.
+    pub fn base_url(mut self, base_url: Url) -> Self {
+        self.base_url = Some(base_url);
         self
     }
 
-    /// Create settings optimized for low-latency live streaming.
-    /// - Shorter timeouts
-    /// - Fewer retries
-    /// - Faster backoff cadence
-    pub fn low_latency(mut self) -> Self {
-        self.request_timeout = Duration::from_secs(5);
-        self.max_retries = 1;
-        self.retry_base_delay = Duration::from_millis(50);
-        self.max_retry_delay = Duration::from_millis(500);
+    /// Clear the base URL override.
+    pub fn clear_base_url(mut self) -> Self {
+        self.base_url = None;
         self
     }
 
     // -------------------------
-    // Selection mode helpers
+    // Variant selection helpers
     // -------------------------
 
     /// Select AUTO variant selection (ABR-controlled).
+    ///
+    /// Equivalent to clearing the selector callback.
     pub fn selection_auto(mut self) -> Self {
-        self.selection_manual_variant_id = None;
+        self.variant_stream_selector = None;
         self
     }
 
-    /// Select MANUAL variant selection by VariantId.
+    /// Set a variant selector callback.
+    ///
+    /// - Return `None` to allow AUTO selection (ABR-controlled).
+    /// - Return `Some(VariantId)` to force MANUAL selection for that variant.
+    pub fn variant_stream_selector(
+        mut self,
+        cb: impl Fn(&crate::model::MasterPlaylist) -> Option<VariantId> + Send + Sync + 'static,
+    ) -> Self {
+        self.variant_stream_selector = Some(Arc::new(Box::new(cb)));
+        self
+    }
+
+    /// Convenience helper for fixed MANUAL selection.
     pub fn selection_manual(mut self, variant_id: VariantId) -> Self {
-        self.selection_manual_variant_id = Some(variant_id);
+        self.variant_stream_selector = Some(Arc::new(Box::new(move |_master| Some(variant_id))));
         self
     }
 
-    /// Returns true if selection is AUTO (no manual variant id set).
+    /// Returns true if selection is AUTO (no selector callback set).
     pub fn is_selection_auto(&self) -> bool {
-        self.selection_manual_variant_id.is_none()
+        self.variant_stream_selector.is_none()
     }
 
     // -------------------------

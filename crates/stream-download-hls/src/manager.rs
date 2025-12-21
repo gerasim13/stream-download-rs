@@ -191,12 +191,23 @@ impl HlsManager {
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
-        let base = if let Some(ref media_playlist_url) = self.media_playlist_url {
+        // If caller already passed an absolute URL, keep it as-is.
+        if let Ok(u) = url::Url::parse(relative_url) {
+            return Ok(u.to_string());
+        }
+
+        // Prefer explicit base_url override (mirrors old `hls_client_rs` behavior).
+        // Otherwise resolve relative to the active media playlist URL (if any),
+        // and fall back to master URL.
+        let base = if let Some(ref base_url) = self.config.base_url {
+            base_url.clone()
+        } else if let Some(ref media_playlist_url) = self.media_playlist_url {
             url::Url::parse(media_playlist_url)
                 .map_err(|e| HlsError::Io(format!("Failed to parse base URL: {}", e)))?
         } else {
             self.master_url.clone()
         };
+
         base.join(relative_url)
             .map(|u| u.into())
             .map_err(|e| HlsError::Io(format!("Failed to join URL: {}", e)))
