@@ -58,11 +58,3 @@ required-features = ["hls"]
 [[example]]
 name = "hls_seek"
 required-features = ["hls"]
-
-[[example]]
-name = "audio_hls"
-required-features = ["audio"]
-
-[[example]]
-name = "audio_mp3"
-required-features = ["audio"]
