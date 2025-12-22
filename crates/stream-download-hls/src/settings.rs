@@ -155,8 +155,11 @@ impl Default for HlsSettings {
             // HLS defaults (from previous `HlsConfig::default`)
             live_refresh_interval: None,
             retry_timeout: Duration::from_secs(5),
+            #[cfg(feature = "aes-decrypt")]
             key_processor_cb: None,
+            #[cfg(feature = "aes-decrypt")]
             key_query_params: None,
+            #[cfg(feature = "aes-decrypt")]
             key_request_headers: None,
             prefetch_buffer_size: 2,
 
@@ -186,8 +189,6 @@ impl fmt::Debug for HlsSettings {
             // HLS
             .field("live_refresh_interval", &self.live_refresh_interval)
             .field("retry_timeout", &self.retry_timeout)
-            .field("key_query_params", &self.key_query_params)
-            .field("key_request_headers", &self.key_request_headers)
             .field("prefetch_buffer_size", &self.prefetch_buffer_size)
             // ABR
             .field(
@@ -305,16 +306,19 @@ impl HlsSettings {
         self
     }
 
+    #[cfg(feature = "aes-decrypt")]
     pub fn key_processor_cb(mut self, cb: Option<Arc<Box<KeyProcessorCallback>>>) -> Self {
         self.key_processor_cb = cb;
         self
     }
 
+    #[cfg(feature = "aes-decrypt")]
     pub fn key_query_params(mut self, params: Option<HashMap<String, String>>) -> Self {
         self.key_query_params = params;
         self
     }
 
+    #[cfg(feature = "aes-decrypt")]
     pub fn key_request_headers(mut self, headers: Option<HashMap<String, String>>) -> Self {
         self.key_request_headers = headers;
         self

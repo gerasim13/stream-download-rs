@@ -162,28 +162,6 @@ pub trait MediaStream {
     /// * `Ok(NextSegmentResult::NeedsRefresh { wait })`: No segment available,
     ///   caller should wait `wait` duration before retrying.
     /// * `Err(HlsError)`: An error occurred.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// loop {
-    ///     tokio::select! {
-    ///         _ = cancel_token.cancelled() => break,
-    ///         result = stream.next_segment_nonblocking() => {
-    ///             match result? {
-    ///                 NextSegmentResult::Segment(seg) => process(seg),
-    ///                 NextSegmentResult::EndOfStream => break,
-    ///                 NextSegmentResult::NeedsRefresh { wait } => {
-    ///                     tokio::select! {
-    ///                         _ = cancel_token.cancelled() => break,
-    ///                         _ = tokio::time::sleep(wait) => continue,
-    ///                     }
-    ///                 }
-    ///             }
-    ///         }
-    ///     }
-    /// }
-    /// ```
     async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult>;
 }
 

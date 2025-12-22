@@ -177,19 +177,24 @@ impl HlsStreamWorker {
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
     ) -> Option<([u8; 16], [u8; 16])> {
-        self.controller
-            .inner_stream_mut()
-            .resolve_aes128_cbc_params(
-                desc.key.as_ref(),
-                if desc.is_init {
-                    None
-                } else {
-                    Some(desc.sequence)
-                },
-            )
-            .await
-            .ok()
-            .flatten()
+        #[cfg(feature = "aes-decrypt")]
+        {
+            return self
+                .controller
+                .inner_stream_mut()
+                .resolve_aes128_cbc_params(
+                    desc.key.as_ref(),
+                    if desc.is_init {
+                        None
+                    } else {
+                        Some(desc.sequence)
+                    },
+                )
+                .await
+                .ok()
+                .flatten();
+        }
+        return None;
     }
 
     /// Handle live refresh wait with cancellation and seek support.
@@ -347,15 +352,14 @@ impl HlsStreamWorker {
         }
 
         // Resolve DRM (AES-128-CBC) parameters before emitting events or building middlewares
-        let drm_params_opt = self.resolve_drm_params_for_desc(&desc).await;
-        let drm_applied = drm_params_opt.is_some();
-
-        // Emit events around init boundaries and variant changes
-        let init_len_opt = if desc.is_init {
-            if drm_applied { None } else { seg_size }
-        } else {
+        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
+            self.resolve_drm_params_for_desc(&desc).await;
+        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
             None
+        } else {
+            seg_size
         };
+
         // If the variant changed, notify the storage layer so the stitched reader follows the
         // new logical stream key.
         if *last_variant_id != Some(desc.variant_id) {

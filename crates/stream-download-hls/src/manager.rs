@@ -552,6 +552,7 @@ impl HlsManager {
     /// Download data by URI with optional encryption key.
     /// Handles AES-128 decryption if needed.
     /// sequence is used for IV generation for media segments (None for init segments).
+    #[cfg(feature = "aes-decrypt")]
     fn finalize_key_url(&self, abs_key_url: &str) -> HlsResult<String> {
         if let Some(params) = &self.config.key_query_params {
             let mut url = url::Url::parse(abs_key_url).map_err(|e| HlsError::Io(e.to_string()))?;
@@ -567,6 +568,7 @@ impl HlsManager {
         }
     }
 
+    #[cfg(feature = "aes-decrypt")]
     async fn fetch_key_bytes(&mut self, final_key_url: &str) -> HlsResult<Bytes> {
         if let Some(cached) = self.key_cache.get(final_key_url) {
             return Ok(cached.clone());
@@ -626,6 +628,7 @@ impl HlsManager {
     ///
     /// This method is intended to be used by streaming middleware in order to
     /// construct a per-segment decryptor without buffering the entire segment.
+    #[cfg(feature = "aes-decrypt")]
     pub async fn resolve_aes128_cbc_params(
         &mut self,
         key: Option<&SegmentKey>,
