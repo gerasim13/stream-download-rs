@@ -15,12 +15,11 @@
 //! This allows consumers to start integrating the API while the internals
 //! are iterated on.
 
-use async_trait::async_trait;
-
 use self::bandwidth_estimator::BandwidthEstimator;
+use crate::HlsManager;
+use crate::manager::NextSegmentDescResult;
 use crate::model::{VariantId, VariantStream};
-use crate::traits::{NextSegmentResult, SegmentType};
-use crate::{HlsError, HlsResult, MediaStream};
+use crate::{HlsResult, MediaStream};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -169,6 +168,69 @@ impl<S: MediaStream> AbrController<S> {
     /// Get the manual selection target if set (manual mode).
     pub fn manual_selection(&self) -> Option<VariantId> {
         self.manual_variant_id
+    }
+
+    /// Initialize the controller by initializing the underlying stream and selecting the initial variant.
+    ///
+    /// This replaces the previous `MediaStream for AbrController`-based init path.
+    pub async fn init(&mut self) -> HlsResult<()> {
+        self.stream.init().await?;
+
+        // After init, the variants are available. Let's select the initial one.
+        let initial_variant_id = self
+            .stream
+            .variants()
+            .get(self.initial_variant_index)
+            .map(|v| v.id);
+
+        if let Some(id) = initial_variant_id {
+            self.stream.select_variant(id).await?;
+            self.current_variant_id = Some(id);
+        }
+
+        Ok(())
+    }
+
+    /// NOTE: Descriptor-based ABR iteration is implemented specifically for `HlsManager`
+    /// in a dedicated impl block below (`impl AbrController<HlsManager>`).
+    ///
+    /// Rationale:
+    /// - The worker currently owns the descriptor streaming pipeline (network streaming,
+    ///   cache probes, DRM middlewares).
+    /// - A generic "pass a closure/future" API tends to run into borrow-checker issues
+    ///   when the caller needs to mutably borrow both the controller and the inner stream.
+
+    /// Report a successfully downloaded *media* segment to the ABR controller.
+    ///
+    /// This updates:
+    /// - throughput estimator (EWMA) based on (elapsed, byte_len)
+    /// - buffer estimate by adding the segment duration
+    ///
+    /// If `from_cache` is true, the update is skipped entirely to avoid:
+    /// - inflating throughput due to near-zero "download time"
+    /// - triggering ABR up-switch to a non-cached variant, which would break offline playback
+    pub fn on_media_segment_downloaded(
+        &mut self,
+        duration: Duration,
+        byte_len: u64,
+        elapsed: Duration,
+        from_cache: bool,
+    ) {
+        if from_cache {
+            // Deliberately do NOT touch throughput or buffer estimates when consuming cache hits.
+            // This keeps ABR from switching away from the cached variant when the network is absent.
+            return;
+        }
+
+        // Feed sample to bandwidth estimator.
+        self.bandwidth_estimator.add_sample(
+            elapsed.as_millis() as f64,
+            byte_len.min(u32::MAX as u64) as u32,
+        );
+
+        // Increase buffer estimate by the segment duration.
+        self.buffer_seconds_estimate += duration.as_secs_f32();
+        self.last_buffer_update = Instant::now();
     }
 
     /// Switch to AUTO mode (ABR).
@@ -332,62 +394,15 @@ impl<S: MediaStream> AbrController<S> {
     }
 }
 
-#[async_trait]
-impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
-    async fn init(&mut self) -> HlsResult<()> {
-        self.stream.init().await?;
-
-        // After init, the variants are available. Let's select the initial one.
-        // We get the id first to solve a borrow checker issue, since `select_variant`
-        // needs a mutable borrow of `self.stream` while the variant list is also
-        // being borrowed.
-        let initial_variant_id = self
-            .stream
-            .variants()
-            .get(self.initial_variant_index)
-            .map(|v| v.id);
-
-        if let Some(id) = initial_variant_id {
-            self.stream.select_variant(id).await?;
-            self.current_variant_id = Some(id);
-            Ok(())
-        } else if self.stream.variants().is_empty() {
-            // This is a valid state for master playlists with no variants.
-            Ok(())
-        } else {
-            Err(HlsError::msg(format!(
-                "initial_variant_index {} is out of bounds for {} variants",
-                self.initial_variant_index,
-                self.stream.variants().len()
-            )))
-        }
-    }
-
-    fn variants(&self) -> &[VariantStream] {
-        self.stream.variants()
-    }
-
-    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()> {
-        // Treat direct select_variant calls as manual override, as in typical players.
-        self.manual_variant_id = Some(variant_id);
-        self.current_variant_id = Some(variant_id);
-        self.stream.select_variant(variant_id).await
-    }
-
-    async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>> {
-        // Blocking version: loop until we get a segment or end of stream
-        loop {
-            match self.next_segment_nonblocking().await? {
-                NextSegmentResult::Segment(seg) => return Ok(Some(seg)),
-                NextSegmentResult::EndOfStream => return Ok(None),
-                NextSegmentResult::NeedsRefresh { wait } => {
-                    tokio::time::sleep(wait).await;
-                }
-            }
-        }
-    }
-
-    async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult> {
+impl AbrController<HlsManager> {
+    /// Descriptor-based next-segment API with ABR switching, specialized for `HlsManager`.
+    ///
+    /// This avoids borrow-checker issues in the worker by keeping:
+    /// - ABR decision (`maybe_switch`) inside the controller
+    /// - descriptor selection inside the wrapped `HlsManager`
+    pub async fn next_segment_descriptor_nonblocking(
+        &mut self,
+    ) -> HlsResult<NextSegmentDescResult> {
         // Update simple buffer estimate by accounting for wall-clock elapsed time
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_buffer_update).as_secs_f32();
@@ -403,39 +418,9 @@ impl<S: MediaStream + Send + Sync> MediaStream for AbrController<S> {
             dropped_frames: 0,
         };
 
-        // 1. Run the ABR logic to decide if we should switch streams.
+        // Run ABR switching logic before asking the manager for the next descriptor.
         self.maybe_switch(&metrics).await?;
 
-        // 2. Fetch the next segment using non-blocking method, measuring the time it takes.
-        let start_time = Instant::now();
-        let result = self.stream.next_segment_nonblocking().await?;
-        let duration = start_time.elapsed();
-
-        match &result {
-            NextSegmentResult::Segment(segment_type) => {
-                match segment_type {
-                    SegmentType::Init(_) => {
-                        // For init segments, we don't update bandwidth estimator or buffer
-                        // because they don't contain media data
-                    }
-                    SegmentType::Media(segment_data) => {
-                        // 3. Feed the measurement to the bandwidth estimator.
-                        self.bandwidth_estimator.add_sample(
-                            duration.as_millis() as f64,
-                            segment_data.data.len() as u32,
-                        );
-
-                        // 4. Increase buffer estimate by the segment duration.
-                        self.buffer_seconds_estimate += segment_data.duration.as_secs_f32();
-                        self.last_buffer_update = Instant::now();
-                    }
-                }
-            }
-            NextSegmentResult::EndOfStream | NextSegmentResult::NeedsRefresh { .. } => {
-                // No segment to process
-            }
-        }
-
-        Ok(result)
+        self.stream.next_segment_descriptor_nonblocking().await
     }
 }

@@ -6,9 +6,12 @@ use tracing::instrument;
 use url::Url;
 
 use crate::{
-    AbrConfig, AbrController, Aes128CbcMiddleware, HlsErrorKind, HlsManager, HlsStreamError,
-    MediaStream, ResourceDownloader, StreamEvent, StreamMiddleware, apply_middlewares,
+    AbrConfig, AbrController, HlsErrorKind, HlsManager, HlsStreamError, ResourceDownloader,
+    StreamEvent, StreamMiddleware, apply_middlewares,
 };
+
+#[cfg(feature = "aes-decrypt")]
+use crate::Aes128CbcMiddleware;
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
 use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 
@@ -481,7 +484,8 @@ impl HlsStreamWorker {
                         .await
                         .map_err(|_| HlsStreamError::Cancelled)?;
 
-                    // Emit segment boundary events after finishing streaming
+                    // Do NOT update ABR on cache HIT: offline-safe behavior.
+                    // Emit segment boundary events after finishing streaming.
                     self.emit_post_segment_events(&desc);
 
                     return Ok(());
@@ -533,9 +537,21 @@ impl HlsStreamWorker {
             .map_err(|_| HlsStreamError::Cancelled)?;
 
         // Apply streaming middlewares (DRM, etc.) and pump data
+        let start_time = std::time::Instant::now();
         let middlewares = HlsStreamWorker::build_middlewares(drm_params_opt);
         let stream = apply_middlewares(stream, &middlewares);
         let gathered_len = self.pump_stream_chunks(stream).await?;
+        let elapsed = start_time.elapsed();
+
+        // Report download to ABR (network only). Cache HIT is handled above and intentionally ignored.
+        if !desc.is_init {
+            self.controller.on_media_segment_downloaded(
+                desc.duration,
+                gathered_len,
+                elapsed,
+                false,
+            );
+        }
 
         // Update segmented length snapshot (best-effort) on ChunkEnd.
         {
@@ -689,13 +705,15 @@ impl HlsStreamWorker {
     pub async fn run(mut self) -> Result<(), HlsStreamError> {
         let mut last_variant_id: Option<crate::model::VariantId> = None;
         loop {
-            // Fetch next segment descriptor using non-blocking method with unified race
+            // Fetch next segment descriptor using non-blocking method with unified race.
+            //
+            // Important: we must avoid overlapping mutable borrows of `self.controller`.
+            // We do this by letting the controller run ABR logic first, and only then
+            // calling into the inner stream to obtain the next descriptor.
             let next_desc = match Self::race_with_seek(
                 &self.cancel_token,
                 &mut self.seek_receiver,
-                self.controller
-                    .inner_stream_mut()
-                    .next_segment_descriptor_nonblocking(),
+                self.controller.next_segment_descriptor_nonblocking(),
             )
             .await?
             {
