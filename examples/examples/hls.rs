@@ -29,7 +29,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = Url::parse(url)
         .map_err(|e| io::Error::new(ErrorKind::Other, format!("invalid HLS url '{}': {e}", url)))?;
     let manual_variant_idx = 0;
-    let settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
+    let settings = Settings::default();
+    let hls_settings = HlsSettings::default().selection_manual(VariantId(manual_variant_idx));
 
     // Persistent, deterministic on-disk storage layout:
     // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
@@ -38,11 +39,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // `StreamControl::StoreResource` (e.g. playlists/keys), using the tree layout:
     // `<storage_root>/<resource_key_as_path>`.
     let storage_root = PathBuf::from("./hls-cache");
-
-    // Base prefetch buffer size for the adaptive storage wrapper (factory multiplies it by 2).
-    let prefetch_bytes = NonZeroUsize::new(8 * 1024 * 1024).unwrap(); // 8MB
-
-    // Limit how many distinct HLS streams we keep in persistent storage (LRU by master playlist).
+    let prefetch_bytes = NonZeroUsize::new((settings.get_prefetch_bytes() * 2) as usize).unwrap();
     let max_cached_streams = NonZeroUsize::new(10).unwrap();
 
     // Build the persistent storage provider first, then extract a StorageHandle for
@@ -56,10 +53,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .storage_handle()
         .expect("HLS persistent storage provider must vend a StorageHandle");
 
-    let params = HlsStreamParams::new(url, settings, storage_handle);
-
-    let reader = match StreamDownload::new::<HlsStream>(params, provider, Settings::default()).await
-    {
+    let params = HlsStreamParams::new(url, hls_settings, storage_handle);
+    let reader = match StreamDownload::new::<HlsStream>(params, provider, settings).await {
         Ok(r) => r,
         Err(e) => {
             return Err(e.decode_error().await)?;
