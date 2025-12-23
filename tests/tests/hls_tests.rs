@@ -213,10 +213,30 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         let storage_kind =
             build_fixture_storage_kind("hls-cache-warmup-fixture", variant_count, storage);
 
-        let want = 512 * 1024;
+        // The fixture payloads are intentionally tiny (short ASCII strings), so we can't "force"
+        // large reads. This test should validate *storage reuse* without overfitting to HTTP
+        // fetch patterns (which can legitimately re-fetch due to playlist reloads, cache headers,
+        // TTL, etc).
+        //
+        // What we assert:
+        // - each run reads at least some bytes (smoke)
+        // - for persistent storage, the storage root becomes non-empty after run #1
+        //   (i.e. something was persisted and can be reused across runs)
+        let min_total = 1usize;
         let timeout = Duration::from_secs(10);
 
+        let assert_persistent_reuse = storage == "persistent";
+        let persistent_root = if assert_persistent_reuse {
+            match &storage_kind {
+                HlsFixtureStorageKind::Persistent { storage_root } => Some(storage_root.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         for run_idx in 0..2 {
+
             let (_base_url, mut reader) = fixture
                 .stream_download_boxed(
                     storage_kind.clone(),
@@ -229,11 +249,17 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
             let mut total = 0usize;
             let start = Instant::now();
 
-            while total < want && start.elapsed() < timeout {
-                let to_read = std::cmp::min(buf.len(), want - total);
-                match std::io::Read::read(&mut reader, &mut buf[..to_read]) {
+            while start.elapsed() < timeout {
+                // Just keep draining until we have at least 1 byte, then stop.
+                // The purpose is to trigger at least some real work in the pipeline.
+                match std::io::Read::read(&mut reader, &mut buf) {
                     Ok(0) => break,
-                    Ok(n) => total += n,
+                    Ok(n) => {
+                        total += n;
+                        if total >= min_total {
+                            break;
+                        }
+                    }
                     Err(e) => panic!(
                         "run {run_idx}: read error after {total} bytes (variant_count={variant_count}, v0_delay={:?}, storage={storage}): {e}",
                         v0_delay
@@ -242,10 +268,25 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
             }
 
             assert!(
-                total > 0,
-                "run {run_idx}: expected to read some bytes from HLS stream, got 0 (variant_count={variant_count}, v0_delay={:?}, storage={storage})",
+                total >= min_total,
+                "run {run_idx}: expected to read at least {min_total} byte(s) from HLS stream within timeout (got {total}) (variant_count={variant_count}, v0_delay={:?}, storage={storage})",
                 v0_delay
             );
+
+            // For persistent storage, assert that the on-disk root becomes non-empty after the first run.
+            // This is a concrete "cache warmup happened" signal without assuming anything about HTTP re-fetch.
+            if assert_persistent_reuse && run_idx == 0 {
+                let root = persistent_root
+                    .as_ref()
+                    .expect("persistent storage kind should provide storage_root");
+                assert!(
+                    dir_nonempty_recursive(root),
+                    "expected persistent storage root to contain files after run 0, but it is empty: {} (variant_count={}, v0_delay={:?})",
+                    root.display(),
+                    variant_count,
+                    v0_delay
+                );
+            }
         }
     });
 }
@@ -455,20 +496,30 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             .await
             .expect("failed to load master playlist");
 
-        async fn first_media_prefix(
+        async fn first_media_payload(
             manager: &mut HlsManager,
             variant_index: usize,
-        ) -> Vec<u8> {
+        ) -> (String, Vec<u8>) {
             manager
                 .select_variant(variant_index)
                 .await
                 .unwrap_or_else(|e| panic!("select variant {variant_index} failed: {e}"));
+
+            // Keep pulling descriptors until we find the first MEDIA segment for the selected variant.
+            // This test asserts that selection affects which segment URI we fetch.
             let desc = loop {
                 match manager.next_segment_descriptor_nonblocking().await {
                     Ok(NextSegmentDescResult::Segment(d)) => {
                         if d.is_init {
                             continue;
                         }
+                        // Fixture URIs are deterministic and include `seg/v{idx}_...`.
+                        // Assert that the descriptor we're about to fetch belongs to the selected variant.
+                        let uri_s = d.uri.to_string();
+                        assert!(
+                            uri_s.contains(&format!("/seg/v{variant_index}_")),
+                            "expected selected variant {variant_index} media segment URI to contain '/seg/v{variant_index}_', got: {uri_s}"
+                        );
                         break d;
                     }
                     Ok(other) => panic!(
@@ -479,38 +530,52 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
                 }
             };
 
+            let uri_s = desc.uri.to_string();
             let mut stream = manager
                 .downloader()
                 .stream_segment(&desc.uri)
                 .await
-                .unwrap_or_else(|e| panic!("failed to stream segment for variant {variant_index}: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("failed to stream segment for variant {variant_index} (uri={uri_s}): {e}")
+                });
 
+            // Read the whole payload (fixture segments are tiny strings like "V{v}-SEG-{i}").
             let mut out: Vec<u8> = Vec::new();
             while let Some(item) = stream.next().await {
                 let chunk = item.unwrap_or_else(|e| {
-                    panic!("error while reading segment stream for variant {variant_index}: {e}")
+                    panic!(
+                        "error while reading segment stream for variant {variant_index} (uri={uri_s}): {e}"
+                    )
                 });
                 out.extend_from_slice(&chunk);
-                if out.len() >= 6 {
-                    break;
-                }
             }
+
             assert!(
                 !out.is_empty(),
-                "expected some bytes for variant {variant_index} media segment"
+                "expected non-empty payload for variant {variant_index} media segment (uri={uri_s})"
             );
-            out.truncate(std::cmp::min(out.len(), 6));
-            out
+
+            (uri_s, out)
         }
 
-        let a = first_media_prefix(&mut manager, from_variant).await;
-        let b = first_media_prefix(&mut manager, to_variant).await;
+        let (uri_a, a) = first_media_payload(&mut manager, from_variant).await;
+        let (uri_b, b) = first_media_payload(&mut manager, to_variant).await;
 
         assert_ne!(
-            a,
-            b,
-            "expected media bytes to change after select_variant; got same prefix (variant {from_variant} -> {to_variant}, storage={storage}) = {:?}",
-            a
+            uri_a, uri_b,
+            "expected different segment URIs after select_variant (variant {from_variant} -> {to_variant}, storage={storage})"
+        );
+
+        let a_s = std::str::from_utf8(&a).expect("fixture bytes should be utf-8");
+        let b_s = std::str::from_utf8(&b).expect("fixture bytes should be utf-8");
+
+        assert!(
+            a_s.starts_with(&format!("V{from_variant}-SEG-")),
+            "unexpected media payload for from_variant={from_variant} (storage={storage}); got={a_s:?}, uri={uri_a}"
+        );
+        assert!(
+            b_s.starts_with(&format!("V{to_variant}-SEG-")),
+            "unexpected media payload for to_variant={to_variant} (storage={storage}); got={b_s:?}, uri={uri_b}"
         );
     });
 }

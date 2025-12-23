@@ -162,10 +162,13 @@ impl StorageProvider for BoxedStorageProvider {
 /// Notes:
 /// - Optional delay can be injected for v0 media segment responses to simulate poor network.
 /// - Variants and their segment ranges are configurable (to simulate "variant starts later").
+/// - Request counters are tracked per-path so tests can assert caching behavior (e.g. second run
+///   should not re-fetch segments when the cache is warm).
 #[derive(Clone)]
 pub struct HlsFixture {
     blobs: Arc<HashMap<String, Bytes>>,
     slow_v0_segment_delay: Duration,
+    request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 /// Which storage backend to use for tests.
@@ -255,6 +258,7 @@ impl HlsFixture {
         Self {
             blobs: Arc::new(blobs),
             slow_v0_segment_delay,
+            request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -262,6 +266,33 @@ impl HlsFixture {
     pub fn with_slow_v0_segment_delay(mut self, d: Duration) -> Self {
         self.slow_v0_segment_delay = d;
         self
+    }
+
+    /// Return how many times the fixture served a given request path (e.g. "/master.m3u8",
+    /// "/v0.m3u8", "/seg/v0_0.bin").
+    ///
+    /// This is intended for tests to assert caching behavior (e.g. warm cache avoids re-fetching).
+    pub fn request_count_for(&self, path: &str) -> Result<u64, String> {
+        let p = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let lock = self
+            .request_counts
+            .lock()
+            .map_err(|_| "request_counts mutex poisoned".to_string())?;
+        Ok(*lock.get(&p).unwrap_or(&0))
+    }
+
+    /// Clear all request counters (useful if a test wants to isolate phases within a single run).
+    pub fn reset_request_counts(&self) -> Result<(), String> {
+        let mut lock = self
+            .request_counts
+            .lock()
+            .map_err(|_| "request_counts mutex poisoned".to_string())?;
+        lock.clear();
+        Ok(())
     }
 
     /// Start the fixture server and return the base URL (ending with `/`).
@@ -506,13 +537,22 @@ impl HlsFixture {
     fn build_router(&self) -> Router {
         let blobs = self.blobs.clone();
         let slow_v0_segment_delay = self.slow_v0_segment_delay;
+        let request_counts = self.request_counts.clone();
 
         async fn serve_blob(
             Path(path): Path<String>,
             blobs: Arc<HashMap<String, Bytes>>,
             slow_v0_segment_delay: Duration,
+            request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
         ) -> impl IntoResponse {
+            // `path` is already without a leading slash due to router patterns.
             let key = path.trim_start_matches('/');
+            let req_path = format!("/{}", key);
+
+            // Count every request (including 404s) so tests can assert "was this fetched".
+            if let Ok(mut lock) = request_counts.lock() {
+                *lock.entry(req_path).or_insert(0) += 1;
+            }
 
             // Optional artificial latency for v0 media segments.
             if slow_v0_segment_delay != Duration::ZERO && key.starts_with("seg/v0_") {
@@ -548,9 +588,15 @@ impl HlsFixture {
                 "/seg/{name}",
                 get({
                     let blobs = blobs.clone();
+                    let request_counts = request_counts.clone();
                     move |Path(name): Path<String>| {
                         let key = format!("seg/{}", name);
-                        serve_blob(Path(key), blobs.clone(), slow_v0_segment_delay)
+                        serve_blob(
+                            Path(key),
+                            blobs.clone(),
+                            slow_v0_segment_delay,
+                            request_counts.clone(),
+                        )
                     }
                 }),
             )
@@ -558,8 +604,14 @@ impl HlsFixture {
                 "/{path}",
                 get({
                     let blobs = blobs.clone();
+                    let request_counts = request_counts.clone();
                     move |Path(path): Path<String>| {
-                        serve_blob(Path(path), blobs.clone(), slow_v0_segment_delay)
+                        serve_blob(
+                            Path(path),
+                            blobs.clone(),
+                            slow_v0_segment_delay,
+                            request_counts.clone(),
+                        )
                     }
                 }),
             )
