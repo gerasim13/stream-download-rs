@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io;
+use std::io::{Seek, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +10,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bytes::Bytes;
-use stream_download::storage::ProvidesStorageHandle;
+use stream_download::source::StreamControl;
+use stream_download::storage::memory::MemoryStorageProvider;
+use stream_download::storage::{
+    ContentLength, ProvidesStorageHandle, StorageProvider, StorageReader, StorageWriter,
+};
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
     HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams,
@@ -16,6 +22,126 @@ use stream_download_hls::{
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+
+/// Boxed storage provider adapter for tests.
+///
+/// Motivation
+/// ----------
+/// `StreamDownload<P>` is generic over the concrete `StorageProvider` `P`. That makes it awkward to
+/// parameterize integration tests over multiple storage backends (persistent file-tree, temp,
+/// memory) because you can't easily return a single `StreamDownload<...>` type from helper
+/// functions.
+///
+/// This module provides `BoxedStorageProvider`, a type-erasing adapter that turns any
+/// `StorageProvider` into a single uniform provider where:
+/// - `Reader = Box<dyn StorageReader>`
+/// - `Writer = DynStorageWriter` (a newtype around `Box<dyn StorageWriter>`)
+///
+/// We need the `DynStorageWriter` wrapper because `StorageWriter` is not implemented for
+/// `Box<dyn StorageWriter>` automatically, and `StorageProvider::Writer` must implement
+/// `StorageWriter`.
+pub struct BoxedStorageProvider {
+    inner: BoxedStorageProviderInner,
+}
+
+enum BoxedStorageProviderInner {
+    Factory(
+        Option<
+            Box<
+                dyn FnOnce(ContentLength) -> io::Result<(Box<dyn StorageReader>, DynStorageWriter)>
+                    + Send,
+            >,
+        >,
+    ),
+}
+
+/// Newtype wrapper so we can implement `StorageWriter` for a boxed trait object.
+pub struct DynStorageWriter(Box<dyn StorageWriter>);
+
+impl DynStorageWriter {
+    pub fn new(inner: Box<dyn StorageWriter>) -> Self {
+        Self(inner)
+    }
+}
+
+impl Write for DynStorageWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Seek for DynStorageWriter {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl StorageWriter for DynStorageWriter {
+    fn control(&mut self, msg: StreamControl) -> io::Result<()> {
+        self.0.control(msg)
+    }
+
+    fn get_available_ranges_for(
+        &mut self,
+        stream_key: &stream_download::source::ResourceKey,
+    ) -> io::Result<Option<(ContentLength, Vec<std::ops::Range<u64>>)>> {
+        self.0.get_available_ranges_for(stream_key)
+    }
+}
+
+impl BoxedStorageProvider {
+    /// Wrap any concrete storage provider into a boxed provider.
+    pub fn new<P>(provider: P) -> Self
+    where
+        P: StorageProvider + Send + 'static,
+        P::Reader: StorageReader + 'static,
+        P::Writer: StorageWriter + 'static,
+    {
+        let factory: Box<
+            dyn FnOnce(ContentLength) -> io::Result<(Box<dyn StorageReader>, DynStorageWriter)>
+                + Send,
+        > = Box::new(move |content_length| {
+            let (reader, writer) = provider.into_reader_writer(content_length)?;
+            Ok((
+                Box::new(reader) as Box<dyn StorageReader>,
+                DynStorageWriter::new(Box::new(writer) as Box<dyn StorageWriter>),
+            ))
+        });
+
+        Self {
+            inner: BoxedStorageProviderInner::Factory(Some(factory)),
+        }
+    }
+}
+
+impl StorageProvider for BoxedStorageProvider {
+    type Reader = Box<dyn StorageReader>;
+    type Writer = DynStorageWriter;
+
+    fn into_reader_writer(
+        self,
+        content_length: ContentLength,
+    ) -> io::Result<(Self::Reader, Self::Writer)> {
+        match self.inner {
+            BoxedStorageProviderInner::Factory(mut opt) => {
+                let f = opt
+                    .take()
+                    .expect("BoxedStorageProvider factory already consumed");
+                f(content_length)
+            }
+        }
+    }
+
+    fn max_capacity(&self) -> Option<usize> {
+        // Best-effort: we can't introspect the wrapped provider's capacity without extending this
+        // adapter to store a separate capacity probe. Tests generally don't rely on this.
+        None
+    }
+}
 
 /// Minimal in-memory HLS fixture server used by integration tests.
 ///
@@ -40,6 +166,60 @@ use tokio_util::sync::CancellationToken;
 pub struct HlsFixture {
     blobs: Arc<HashMap<String, Bytes>>,
     slow_v0_segment_delay: Duration,
+}
+
+/// Which storage backend to use for tests.
+///
+/// Notes:
+/// - `Persistent` uses the HLS segmented file-tree provider (the "real" persistent cache layout).
+/// - `Temp` uses the same persistent provider but places data under a per-test temp directory.
+///   This is still file-based, but not intended to be reused across runs.
+/// - `Memory` uses in-memory storage for the main stream bytes, while still using a file-tree
+///   `StorageHandle` for HLS resource caching (playlists/keys/resources).
+#[derive(Clone, Debug)]
+pub enum HlsFixtureStorageKind {
+    /// Persistent segmented file-tree storage rooted at the provided directory.
+    Persistent { storage_root: std::path::PathBuf },
+    /// Temp directory-based storage (still file-tree), created under `std::env::temp_dir()`.
+    Temp { subdir: String },
+    /// In-memory stream storage (for `StreamDownload`), plus file-tree `StorageHandle` for HLS
+    /// resource caching under the provided directory.
+    Memory {
+        resource_cache_root: std::path::PathBuf,
+    },
+}
+
+/// Storage bundle returned by the fixture for a chosen backend.
+///
+/// This exists because HLS uses two distinct storage concepts:
+/// - `StreamDownload` needs a `StorageProvider` for the main byte stream.
+/// - `HlsManager`/`HlsStreamWorker` need a keyed `StorageHandle` for read-before-fetch caching
+///   (playlists/keys/etc).
+///
+/// We keep this as a simple enum with concrete provider types (no generic `impl Trait` escapes).
+pub enum HlsFixtureStorage {
+    Persistent {
+        provider: HlsPersistentStorageProvider,
+        storage_handle: stream_download::storage::StorageHandle,
+    },
+    Temp {
+        provider: HlsPersistentStorageProvider,
+        storage_handle: stream_download::storage::StorageHandle,
+    },
+    Memory {
+        provider: MemoryStorageProvider,
+        storage_handle: stream_download::storage::StorageHandle,
+    },
+}
+
+impl HlsFixtureStorage {
+    pub fn storage_handle(&self) -> stream_download::storage::StorageHandle {
+        match self {
+            Self::Persistent { storage_handle, .. } => storage_handle.clone(),
+            Self::Temp { storage_handle, .. } => storage_handle.clone(),
+            Self::Memory { storage_handle, .. } => storage_handle.clone(),
+        }
+    }
 }
 
 impl Default for HlsFixture {
@@ -110,45 +290,131 @@ impl HlsFixture {
         reqwest::Url::parse(&format!("http://{}/", addr)).expect("failed to build base url")
     }
 
-    /// Start the fixture server and construct a `StreamDownload<HlsStream>` wired to it.
+    /// Build a storage bundle (provider + keyed `StorageHandle`) for a given backend kind.
     ///
-    /// This initializes the reader the same way as `examples/examples/hls.rs`, but uses:
-    /// - the local in-memory fixture (`self.start()`),
-    /// - a deterministic on-disk storage root unique per test (you pass it in),
-    /// - the fixture-generated playlists/segments.
-    ///
-    /// `storage_root` should be unique per test (or parameterization) to avoid cross-test interference.
-    pub async fn stream_download(
+    /// This is the core "storage matryoshka" hook:
+    /// - `StreamDownload` uses the returned provider.
+    /// - `HlsManager`/`HlsStreamWorker` use the returned `StorageHandle`.
+    pub fn build_storage(
         &self,
-        storage_root: std::path::PathBuf,
+        kind: HlsFixtureStorageKind,
+        settings: &Settings<HlsStream>,
+    ) -> HlsFixtureStorage {
+        match kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => {
+                let prefetch_bytes = std::num::NonZeroUsize::new(
+                    (settings.get_prefetch_bytes().saturating_mul(2)) as usize,
+                )
+                .expect("prefetch_bytes must be non-zero");
+                let max_cached_streams = std::num::NonZeroUsize::new(10).unwrap();
+
+                let provider = HlsPersistentStorageProvider::new_hls_file_tree(
+                    storage_root,
+                    prefetch_bytes,
+                    Some(max_cached_streams),
+                );
+                let storage_handle = provider
+                    .storage_handle()
+                    .expect("persistent HLS storage provider must vend a StorageHandle");
+
+                HlsFixtureStorage::Persistent {
+                    provider,
+                    storage_handle,
+                }
+            }
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let storage_root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+
+                let prefetch_bytes = std::num::NonZeroUsize::new(
+                    (settings.get_prefetch_bytes().saturating_mul(2)) as usize,
+                )
+                .expect("prefetch_bytes must be non-zero");
+                let max_cached_streams = std::num::NonZeroUsize::new(10).unwrap();
+
+                let provider = HlsPersistentStorageProvider::new_hls_file_tree(
+                    storage_root,
+                    prefetch_bytes,
+                    Some(max_cached_streams),
+                );
+                let storage_handle = provider
+                    .storage_handle()
+                    .expect("temp HLS storage provider must vend a StorageHandle");
+
+                HlsFixtureStorage::Temp {
+                    provider,
+                    storage_handle,
+                }
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => {
+                // Main stream bytes are stored in memory (fast, non-persistent).
+                // For keyed HLS resources (playlists/keys), we still need a `StorageHandle`.
+                //
+                // We reuse the HLS file-tree handle implementation by creating a small-resource
+                // provider rooted at `resource_cache_root` and extracting its handle.
+                let prefetch_bytes = std::num::NonZeroUsize::new(
+                    (settings.get_prefetch_bytes().saturating_mul(2)) as usize,
+                )
+                .expect("prefetch_bytes must be non-zero");
+                let max_cached_streams = std::num::NonZeroUsize::new(10).unwrap();
+
+                let resource_provider = HlsPersistentStorageProvider::new_hls_file_tree(
+                    resource_cache_root,
+                    prefetch_bytes,
+                    Some(max_cached_streams),
+                );
+                let storage_handle = resource_provider
+                    .storage_handle()
+                    .expect("resource cache provider must vend a StorageHandle");
+
+                HlsFixtureStorage::Memory {
+                    provider: MemoryStorageProvider::default(),
+                    storage_handle,
+                }
+            }
+        }
+    }
+
+    /// Start the fixture server and construct a `StreamDownload<HlsStream>` wired to it using any
+    /// storage backend, returning a single uniform type: `StreamDownload<BoxedStorageProvider>`.
+    ///
+    /// This is the preferred helper for tests that are parameterized over storage backends.
+    pub async fn stream_download_boxed(
+        &self,
+        storage_kind: HlsFixtureStorageKind,
         hls_settings: HlsSettings,
         settings: Settings<HlsStream>,
-    ) -> (reqwest::Url, StreamDownload<HlsPersistentStorageProvider>) {
+    ) -> (reqwest::Url, StreamDownload<BoxedStorageProvider>) {
         let base_url = self.start().await;
         let url = base_url
             .join("master.m3u8")
             .expect("failed to build master url");
-
-        // Keep the same storage provider style as the example: persistent HLS file tree.
-        let prefetch_bytes =
-            std::num::NonZeroUsize::new((settings.get_prefetch_bytes().saturating_mul(2)) as usize)
-                .expect("prefetch_bytes must be non-zero");
-        let max_cached_streams = std::num::NonZeroUsize::new(10).unwrap();
-
-        let provider = HlsPersistentStorageProvider::new_hls_file_tree(
-            storage_root,
-            prefetch_bytes,
-            Some(max_cached_streams),
-        );
-        let storage_handle = provider
-            .storage_handle()
-            .expect("persistent HLS storage provider must vend a StorageHandle");
-
+        let storage = self.build_storage(storage_kind, &settings);
+        let storage_handle = storage.storage_handle();
         let params = HlsStreamParams::new(url, hls_settings, storage_handle);
-
-        let reader = StreamDownload::new::<HlsStream>(params, provider, settings)
-            .await
-            .expect("failed to create StreamDownload<HlsStream> for fixture server");
+        let reader = match storage {
+            HlsFixtureStorage::Persistent { provider, .. } => {
+                let provider = BoxedStorageProvider::new(provider);
+                StreamDownload::new::<HlsStream>(params, provider, settings)
+                    .await
+                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+            }
+            HlsFixtureStorage::Temp { provider, .. } => {
+                let provider = BoxedStorageProvider::new(provider);
+                StreamDownload::new::<HlsStream>(params, provider, settings)
+                    .await
+                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+            }
+            HlsFixtureStorage::Memory { provider, .. } => {
+                let provider = BoxedStorageProvider::new(provider);
+                StreamDownload::new::<HlsStream>(params, provider, settings)
+                    .await
+                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+            }
+        };
 
         (base_url, reader)
     }
