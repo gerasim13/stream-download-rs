@@ -44,6 +44,7 @@ use tokio_util::sync::CancellationToken;
 /// `StorageWriter`.
 pub struct BoxedStorageProvider {
     inner: BoxedStorageProviderInner,
+    capacity: Option<usize>,
 }
 
 enum BoxedStorageProviderInner {
@@ -103,10 +104,16 @@ impl BoxedStorageProvider {
         P::Reader: StorageReader + 'static,
         P::Writer: StorageWriter + 'static,
     {
+        let mut provider_opt = Some(provider);
+        let capacity = provider_opt.as_ref().and_then(|p| p.max_capacity());
+
         let factory: Box<
             dyn FnOnce(ContentLength) -> io::Result<(Box<dyn StorageReader>, DynStorageWriter)>
                 + Send,
         > = Box::new(move |content_length| {
+            let provider = provider_opt
+                .take()
+                .expect("BoxedStorageProvider factory already consumed");
             let (reader, writer) = provider.into_reader_writer(content_length)?;
             Ok((
                 Box::new(reader) as Box<dyn StorageReader>,
@@ -116,6 +123,7 @@ impl BoxedStorageProvider {
 
         Self {
             inner: BoxedStorageProviderInner::Factory(Some(factory)),
+            capacity,
         }
     }
 }
@@ -139,9 +147,7 @@ impl StorageProvider for BoxedStorageProvider {
     }
 
     fn max_capacity(&self) -> Option<usize> {
-        // Best-effort: we can't introspect the wrapped provider's capacity without extending this
-        // adapter to store a separate capacity probe. Tests generally don't rely on this.
-        None
+        self.capacity
     }
 }
 
@@ -592,7 +598,18 @@ impl HlsFixture {
         let out = f(data_rx).await;
 
         cancel.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+        let join = tokio::time::timeout(Duration::from_secs(2), worker_task)
+            .await
+            .expect("worker task did not shut down in time");
+
+        let worker_result = join.expect("worker task panicked");
+        match worker_result {
+            Ok(()) => {}
+            Err(stream_download_hls::HlsStreamError::Cancelled) => {
+                // Expected when we stop the worker after collecting data.
+            }
+            Err(e) => panic!("worker exited with error: {:?}", e),
+        }
 
         out
     }

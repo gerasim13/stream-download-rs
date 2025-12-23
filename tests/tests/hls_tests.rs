@@ -66,6 +66,14 @@ fn count_files_recursive(root: &std::path::Path) -> usize {
     n
 }
 
+fn clean_dir(root: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(root) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            panic!("failed to clean directory {}: {e}", root.display());
+        }
+    }
+}
+
 fn is_variant_stream_key(
     stream_key: &stream_download::source::ResourceKey,
     variant_id: u64,
@@ -165,18 +173,18 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         // Ensure we start from a clean slate so the "warmup happened" assertion is meaningful.
         match &storage_kind {
             HlsFixtureStorageKind::Persistent { storage_root } => {
-                let _ = std::fs::remove_dir_all(storage_root);
+                clean_dir(storage_root);
             }
             HlsFixtureStorageKind::Temp { subdir } => {
                 let root = std::env::temp_dir()
                     .join("stream-download-tests")
                     .join(subdir);
-                let _ = std::fs::remove_dir_all(root);
+                clean_dir(&root);
             }
             HlsFixtureStorageKind::Memory {
                 resource_cache_root,
             } => {
-                let _ = std::fs::remove_dir_all(resource_cache_root);
+                clean_dir(resource_cache_root);
             }
         }
         fixture
@@ -673,7 +681,7 @@ fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count
             .join(format!("hls-disk-files-persistent-v{variant_count}"));
 
         // Best-effort cleanup: ensure the directory starts empty/non-existent.
-        let _ = std::fs::remove_dir_all(&storage_root);
+        clean_dir(&storage_root);
 
         let storage_kind = HlsFixtureStorageKind::Persistent {
             storage_root: storage_root.clone(),
@@ -716,7 +724,7 @@ fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] varia
             .join("stream-download-tests")
             .join(format!("hls-disk-files-memory-resources-v{variant_count}"));
 
-        let _ = std::fs::remove_dir_all(&resource_cache_root);
+        clean_dir(&resource_cache_root);
         let before_files = count_files_recursive(&resource_cache_root);
 
         let storage_kind = HlsFixtureStorageKind::Memory {
