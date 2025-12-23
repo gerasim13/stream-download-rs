@@ -18,14 +18,12 @@
 //! - Memory stream storage should NOT create segment files on disk (resource cache may still touch disk).
 
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use rstest::rstest;
 use tokio::sync::mpsc;
 
-use stream_download::Settings;
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 
 use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, VariantId};
@@ -162,10 +160,8 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
     #[case] storage: &str,
 ) {
     setup::SERVER_RT.block_on(async {
-        let fixture =
-            HlsFixture::with_variant_count(variant_count).with_slow_v0_segment_delay(v0_delay);
-
-        let hls_settings = HlsSettings::default();
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(v0_delay);
 
         let storage_kind =
             build_fixture_storage_kind("hls-cache-warmup-fixture", variant_count, storage);
@@ -225,8 +221,6 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
                 .stream_download_boxed_with_base(
                     base_url.clone(),
                     storage_kind.clone(),
-                    hls_settings.clone(),
-                    Settings::default(),
                 )
                 .await;
 
@@ -312,19 +306,16 @@ fn hls_manager_parses_exact_variant_count_from_master(
     #[case] storage: &str,
 ) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+        let fixture =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
         let storage_kind =
             build_fixture_storage_kind("hls-manager-parse-master", variant_count, storage);
-        // Avoid shadowing the `storage: &str` test parameter.
-        let storage_bundle = fixture.build_storage(storage_kind, &Settings::default());
+        let storage_bundle = fixture.build_storage(storage_kind);
         let storage_handle = storage_bundle.storage_handle();
 
-        let settings = Arc::new(HlsSettings::default());
-
         let (data_tx, _data_rx) = mpsc::channel::<StreamMsg>(1);
-        let (_base_url, mut manager) = fixture.manager(storage_handle, settings, data_tx).await;
+        let (_base_url, mut manager) = fixture.manager(storage_handle, data_tx).await;
 
         manager
             .load_master()
@@ -365,13 +356,17 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
 ) {
     setup::SERVER_RT.block_on(async {
         // Use 4 variants so we can parameterize across multiple variant selections.
-        let fixture = HlsFixture::with_variant_count(4).with_slow_v0_segment_delay(Duration::ZERO);
+        let fixture = HlsFixture::with_variant_count(4)
+            .with_segment_delay(Duration::ZERO)
+            .with_hls_config(
+                HlsSettings::default()
+                    .selection_manual(VariantId(variant_idx as usize)),
+            );
 
         let storage_kind = build_fixture_storage_kind("hls-worker-manual", 4, storage);
 
         let chunkstarts = fixture
             .run_worker_collecting(
-                HlsSettings::default().selection_manual(VariantId(variant_idx as usize)),
                 4096,
                 storage_kind,
                 |rx| Box::pin(async move { collect_first_n_chunkstarts(rx, 8).await }),
@@ -423,13 +418,12 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
 ) {
     setup::SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+            .with_segment_delay(Duration::ZERO);
 
         let storage_kind = build_fixture_storage_kind("hls-worker-auto", variant_count, storage);
 
         let first = fixture
             .run_worker_collecting(
-                HlsSettings::default(),
                 2048,
                 storage_kind,
                 |rx| Box::pin(async move { wait_first_chunkstart(rx).await }),
@@ -464,19 +458,15 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
 #[test]
 fn hls_abr_downswitches_after_low_throughput_sample() {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(2)
-            .with_slow_v0_segment_delay(Duration::from_millis(200));
-
-        let hls_settings = HlsSettings::default()
-            .abr_min_switch_interval(Duration::ZERO)
-            .abr_down_switch_buffer(5.0);
+        let fixture = HlsFixture::with_variant_count(2).with_abr_config(|cfg| {
+            cfg.abr_min_switch_interval = Duration::ZERO;
+            cfg.abr_down_switch_buffer = 5.0;
+        });
 
         let storage_kind = build_fixture_storage_kind("hls-abr-downswitch", 2, "memory");
 
         // Start on variant 1 (higher bandwidth), then force a low throughput sample to push a downswitch.
-        let (_base_url, mut controller) = fixture
-            .abr_controller(storage_kind, hls_settings, Settings::default(), 1, None)
-            .await;
+        let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 1, None).await;
 
         assert_eq!(
             controller.current_variant_id(),
@@ -522,6 +512,103 @@ fn hls_abr_downswitches_after_low_throughput_sample() {
     });
 }
 
+#[test]
+fn hls_abr_upswitch_continues_from_current_segment_index() {
+    setup::SERVER_RT.block_on(async {
+        let fixture = HlsFixture::with_variant_count(2)
+            .with_segment_delay(Duration::ZERO)
+            .with_abr_config(|cfg| {
+                cfg.abr_min_switch_interval = Duration::ZERO;
+                cfg.abr_min_buffer_for_up_switch = 0.0;
+                cfg.abr_up_hysteresis_ratio = 0.0;
+                cfg.abr_throughput_safety_factor = 1.0;
+            });
+
+        let storage_kind = build_fixture_storage_kind("hls-abr-upswitch", 2, "memory");
+
+        let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 0, None).await;
+
+        // Drain init + first media segment on variant 0.
+        let first_init = controller
+            .next_segment_descriptor_nonblocking()
+            .await
+            .expect("descriptor for first init");
+        let first_seg = controller
+            .next_segment_descriptor_nonblocking()
+            .await
+            .expect("descriptor for first segment");
+
+        let first_seg = match first_seg {
+            NextSegmentDescResult::Segment(s) => s,
+            other => panic!("expected first segment descriptor, got {:?}", other),
+        };
+
+        assert_eq!(
+            controller.current_variant_id(),
+            Some(VariantId(0)),
+            "ABR controller should start on variant 0"
+        );
+        assert!(matches!(
+            first_init,
+            NextSegmentDescResult::Segment(ref d) if d.variant_id == VariantId(0) && d.is_init
+        ));
+        assert_eq!(
+            first_seg.variant_id,
+            VariantId(0),
+            "first media descriptor should be variant 0"
+        );
+
+        // Feed a fast/large sample to encourage an upswitch.
+        controller.on_media_segment_downloaded(
+            Duration::from_secs(1),
+            2_000_000,
+            Duration::from_millis(100),
+        );
+
+        let switched_init = controller
+            .next_segment_descriptor_nonblocking()
+            .await
+            .expect("descriptor after upswitch");
+        let switched_seg = controller
+            .next_segment_descriptor_nonblocking()
+            .await
+            .expect("media descriptor after upswitch");
+
+        let switched_init = match switched_init {
+            NextSegmentDescResult::Segment(s) => s,
+            other => panic!("expected init descriptor after switch, got {:?}", other),
+        };
+        let switched_seg = match switched_seg {
+            NextSegmentDescResult::Segment(s) => s,
+            other => panic!("expected media descriptor after switch, got {:?}", other),
+        };
+
+        assert_eq!(
+            controller.current_variant_id(),
+            Some(VariantId(1)),
+            "ABR should upswitch to variant 1"
+        );
+        assert!(
+            switched_init.is_init && switched_init.variant_id == VariantId(1),
+            "first descriptor after switch should be init for variant 1 (got {:?})",
+            switched_init
+        );
+        assert_eq!(
+            switched_seg.variant_id,
+            VariantId(1),
+            "media descriptor after switch should target variant 1"
+        );
+
+        // Next segment index should be preserved across the switch: we consumed one media segment
+        // on variant 0, so after switching we expect the second media segment of variant 1.
+        let expected_sequence = first_seg.sequence + 1;
+        assert_eq!(
+            switched_seg.sequence, expected_sequence,
+            "upswitch should continue from current segment index, not restart from the first segment"
+        );
+    });
+}
+
 #[rstest]
 #[case(2, 0, 1, "persistent")]
 #[case(2, 0, 1, "temp")]
@@ -547,21 +634,18 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             "invalid parameterization: variant_count={variant_count} from_variant={from_variant} to_variant={to_variant}"
         );
         let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+            .with_segment_delay(Duration::ZERO);
 
         let storage_kind = build_fixture_storage_kind(
             "hls-manager-select-variant",
             variant_count,
             storage,
         );
-        // Avoid shadowing the `storage: &str` test parameter.
-        let storage_bundle = fixture.build_storage(storage_kind, &Settings::default());
+        let storage_bundle = fixture.build_storage(storage_kind);
         let storage_handle = storage_bundle.storage_handle();
 
-        let settings = Arc::new(HlsSettings::default());
-
         let (data_tx, _data_rx) = mpsc::channel::<StreamMsg>(8);
-        let (_base_url, mut manager) = fixture.manager(storage_handle, settings, data_tx).await;
+        let (_base_url, mut manager) = fixture.manager(storage_handle, data_tx).await;
 
         manager
             .load_master()
@@ -684,15 +768,12 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
     #[case] storage: &str,
 ) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+        let fixture =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
-        let hls_settings = HlsSettings::default();
         let storage_kind = build_fixture_storage_kind("hls-read-seek-e2e", variant_count, storage);
 
-        let (_base_url, mut reader) = fixture
-            .stream_download_boxed(storage_kind, hls_settings, Settings::default())
-            .await;
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Ensure the pipeline is started (worker emits ChunkStart before data).
         // This avoids "no active segment; expected ChunkStart before data" on early seeks.
@@ -732,13 +813,11 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
 #[test]
 fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes() {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(2).with_slow_v0_segment_delay(Duration::ZERO);
+        let fixture = HlsFixture::with_variant_count(2).with_segment_delay(Duration::ZERO);
 
         let storage_kind = build_fixture_storage_kind("hls-read-seek-boundary", 2, "memory");
 
-        let (_base_url, mut reader) = fixture
-            .stream_download_boxed(storage_kind, HlsSettings::default(), Settings::default())
-            .await;
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Warm up pipeline so seek won't race with first ChunkStart.
         let mut warm = [0u8; 1];
@@ -780,8 +859,8 @@ fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes() {
 #[case(4)]
 fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count: usize) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+        let fixture =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
         let storage_root = std::env::temp_dir()
             .join("stream-download-tests")
@@ -794,9 +873,7 @@ fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count
             storage_root: storage_root.clone(),
         };
 
-        let (_base_url, mut reader) = fixture
-            .stream_download_boxed(storage_kind, HlsSettings::default(), Settings::default())
-            .await;
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Trigger actual work.
         let mut buf = [0u8; 32];
@@ -818,7 +895,7 @@ fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count
 fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] variant_count: usize) {
     setup::SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_slow_v0_segment_delay(Duration::ZERO);
+            .with_segment_delay(Duration::ZERO);
 
         // In memory mode, main stream bytes are stored in memory, but HLS resource caching uses a
         // disk-backed file-tree handle rooted at `resource_cache_root`.
@@ -839,7 +916,7 @@ fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] varia
         };
 
         let (_base_url, mut reader) = fixture
-            .stream_download_boxed(storage_kind, HlsSettings::default(), Settings::default())
+            .stream_download_boxed(storage_kind)
             .await;
 
         // Trigger actual work.

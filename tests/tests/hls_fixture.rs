@@ -175,8 +175,9 @@ impl StorageProvider for BoxedStorageProvider {
 #[derive(Clone)]
 pub struct HlsFixture {
     blobs: Arc<HashMap<String, Bytes>>,
-    slow_v0_segment_delay: Duration,
+    segment_delay: Duration,
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    hls_settings: HlsSettings,
 }
 
 /// Which storage backend to use for tests.
@@ -235,18 +236,37 @@ impl HlsFixtureStorage {
 
 impl Default for HlsFixture {
     fn default() -> Self {
-        Self::new()
+        Self::new_default()
     }
 }
 
 impl HlsFixture {
+    pub const VARIANT_COUNT: usize = 2;
+    pub const SEGMENTS_PER_VARIANT: usize = 12;
+    pub const SEGMENT_DELAY: Duration = Duration::from_millis(250);
+
+    pub fn new(variant_count: usize, segments_per_variant: usize, segment_delay: Duration) -> Self {
+        assert!(variant_count >= 1, "variant_count must be >= 1");
+        let blobs = Self::build_blobs_with_variants(variant_count, segments_per_variant);
+        Self {
+            blobs: Arc::new(blobs),
+            segment_delay,
+            request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            hls_settings: HlsSettings::default(),
+        }
+    }
+
     /// Default fixture layout:
     /// - 2 variants: v0 and v1
     /// - v0 segments: `0..11`
     /// - v1 segments: `12..23`
     /// - v0 media segments are delayed by 250ms each (optional ABR/probing scenarios)
-    pub fn new() -> Self {
-        Self::with_variant_count(2)
+    pub fn new_default() -> Self {
+        Self::new(
+            Self::VARIANT_COUNT,
+            Self::SEGMENTS_PER_VARIANT,
+            Self::SEGMENT_DELAY,
+        )
     }
 
     /// Construct a fixture with `variant_count` variants.
@@ -259,20 +279,28 @@ impl HlsFixture {
     /// - v0: 0..11
     /// - v1: 12..23
     pub fn with_variant_count(variant_count: usize) -> Self {
-        assert!(variant_count >= 1, "variant_count must be >= 1");
-        const SEGMENTS_PER_VARIANT: usize = 12;
-        let slow_v0_segment_delay = Duration::from_millis(250);
-        let blobs = Self::build_blobs_with_variants(variant_count, SEGMENTS_PER_VARIANT);
-        Self {
-            blobs: Arc::new(blobs),
-            slow_v0_segment_delay,
-            request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        }
+        Self::new(
+            variant_count,
+            Self::SEGMENTS_PER_VARIANT,
+            Self::SEGMENT_DELAY,
+        )
     }
 
     /// Override delay for `seg/v0_*` responses (use `Duration::ZERO` to disable).
-    pub fn with_slow_v0_segment_delay(mut self, d: Duration) -> Self {
-        self.slow_v0_segment_delay = d;
+    pub fn with_segment_delay(mut self, d: Duration) -> Self {
+        self.segment_delay = d;
+        self
+    }
+
+    /// Override the full HLS settings used by this fixture (downloader/ABR/etc).
+    pub fn with_hls_config(mut self, hls_settings: HlsSettings) -> Self {
+        self.hls_settings = hls_settings;
+        self
+    }
+
+    /// Mutate only the ABR-related knobs on the fixture settings.
+    pub fn with_abr_config(mut self, f: impl FnOnce(&mut HlsSettings)) -> Self {
+        f(&mut self.hls_settings);
         self
     }
 
@@ -334,11 +362,8 @@ impl HlsFixture {
     /// This is the core "storage matryoshka" hook:
     /// - `StreamDownload` uses the returned provider.
     /// - `HlsManager`/`HlsStreamWorker` use the returned `StorageHandle`.
-    pub fn build_storage(
-        &self,
-        kind: HlsFixtureStorageKind,
-        settings: &Settings<HlsStream>,
-    ) -> HlsFixtureStorage {
+    pub fn build_storage(&self, kind: HlsFixtureStorageKind) -> HlsFixtureStorage {
+        let settings = Settings::<HlsStream>::default();
         match kind {
             HlsFixtureStorageKind::Persistent { storage_root } => {
                 let prefetch_bytes = std::num::NonZeroUsize::new(
@@ -424,12 +449,10 @@ impl HlsFixture {
     pub async fn stream_download_boxed(
         &self,
         storage_kind: HlsFixtureStorageKind,
-        hls_settings: HlsSettings,
-        settings: Settings<HlsStream>,
     ) -> (reqwest::Url, StreamDownload<BoxedStorageProvider>) {
         let base_url = self.start().await;
         let reader = self
-            .stream_download_boxed_with_base(base_url.clone(), storage_kind, hls_settings, settings)
+            .stream_download_boxed_with_base(base_url.clone(), storage_kind)
             .await;
         (base_url, reader)
     }
@@ -442,31 +465,31 @@ impl HlsFixture {
         &self,
         base_url: reqwest::Url,
         storage_kind: HlsFixtureStorageKind,
-        hls_settings: HlsSettings,
-        settings: Settings<HlsStream>,
     ) -> StreamDownload<BoxedStorageProvider> {
         let url = base_url
             .join("master.m3u8")
             .expect("failed to build master url");
-        let storage = self.build_storage(storage_kind, &settings);
+        let storage = self.build_storage(storage_kind);
         let storage_handle = storage.storage_handle();
-        let params = HlsStreamParams::new(url, hls_settings, storage_handle);
+        let params = HlsStreamParams::new(url, self.hls_settings.clone(), storage_handle);
         match storage {
             HlsFixtureStorage::Persistent { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
-                StreamDownload::new::<HlsStream>(params, provider, settings).await.expect(
+                StreamDownload::new::<HlsStream>(params, provider, Settings::default())
+                .await
+                .expect(
                     "failed to create StreamDownload<HlsStream> for fixture server (persistent)",
                 )
             }
             HlsFixtureStorage::Temp { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
-                StreamDownload::new::<HlsStream>(params, provider, settings)
+                StreamDownload::new::<HlsStream>(params, provider, Settings::default())
                     .await
                     .expect("failed to create StreamDownload<HlsStream> for fixture server (temp)")
             }
             HlsFixtureStorage::Memory { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
-                StreamDownload::new::<HlsStream>(params, provider, settings)
+                StreamDownload::new::<HlsStream>(params, provider, Settings::default())
                     .await
                     .expect(
                         "failed to create StreamDownload<HlsStream> for fixture server (memory)",
@@ -486,7 +509,6 @@ impl HlsFixture {
     pub async fn manager(
         &self,
         storage_handle: stream_download::storage::StorageHandle,
-        hls_settings: Arc<HlsSettings>,
         data_tx: mpsc::Sender<stream_download::source::StreamMsg>,
     ) -> (reqwest::Url, HlsManager) {
         let base_url = self.start().await;
@@ -494,6 +516,7 @@ impl HlsFixture {
             .join("master.m3u8")
             .expect("failed to build master url");
 
+        let hls_settings = Arc::new(self.hls_settings.clone());
         let downloader = ResourceDownloader::new(
             hls_settings.request_timeout,
             hls_settings.max_retries,
@@ -513,19 +536,15 @@ impl HlsFixture {
     pub async fn abr_controller(
         &self,
         storage_kind: HlsFixtureStorageKind,
-        hls_settings: HlsSettings,
-        settings: Settings<HlsStream>,
         initial_variant_index: usize,
         manual_variant_id: Option<VariantId>,
     ) -> (reqwest::Url, AbrController<HlsManager>) {
-        let storage = self.build_storage(storage_kind, &settings);
+        let storage = self.build_storage(storage_kind);
         let storage_handle = storage.storage_handle();
-        let hls_settings = Arc::new(hls_settings);
+        let hls_settings = Arc::new(self.hls_settings.clone());
 
         let (data_tx, _data_rx) = mpsc::channel::<StreamMsg>(16);
-        let (base_url, mut manager) = self
-            .manager(storage_handle, hls_settings.clone(), data_tx)
-            .await;
+        let (base_url, mut manager) = self.manager(storage_handle, data_tx).await;
 
         manager
             .load_master()
@@ -578,16 +597,13 @@ impl HlsFixture {
     pub async fn worker(
         &self,
         storage_handle: stream_download::storage::StorageHandle,
-        hls_settings: Arc<HlsSettings>,
         data_tx: mpsc::Sender<stream_download::source::StreamMsg>,
         seek_rx: mpsc::Receiver<u64>,
         cancel: CancellationToken,
         event_tx: broadcast::Sender<stream_download_hls::StreamEvent>,
         segmented_length: Arc<std::sync::RwLock<stream_download::storage::SegmentedLength>>,
     ) -> (reqwest::Url, HlsStreamWorker) {
-        let (base_url, manager) = self
-            .manager(storage_handle.clone(), hls_settings, data_tx.clone())
-            .await;
+        let (base_url, manager) = self.manager(storage_handle.clone(), data_tx.clone()).await;
         let master_hash = stream_download_hls::master_hash_from_url(&base_url);
 
         let worker = HlsStreamWorker::new_with_manager(
@@ -609,7 +625,6 @@ impl HlsFixture {
     /// Convenience wrapper: spawn a worker, hand its data channel to a collector, then shut it down.
     pub async fn run_worker_collecting<F, T>(
         self,
-        hls_settings: HlsSettings,
         data_channel_capacity: usize,
         storage_kind: HlsFixtureStorageKind,
         f: F,
@@ -625,13 +640,12 @@ impl HlsFixture {
         let cancel = CancellationToken::new();
         let (event_tx, _event_rx) = broadcast::channel(16);
 
-        let storage_bundle = self.build_storage(storage_kind, &Settings::default());
+        let storage_bundle = self.build_storage(storage_kind);
         let storage_handle = storage_bundle.storage_handle();
 
         let (_base_url, worker) = self
             .worker(
                 storage_handle,
-                Arc::new(hls_settings),
                 data_tx,
                 seek_rx,
                 cancel.clone(),
@@ -663,13 +677,13 @@ impl HlsFixture {
 
     fn build_router(&self) -> Router {
         let blobs = self.blobs.clone();
-        let slow_v0_segment_delay = self.slow_v0_segment_delay;
+        let segment_delay = self.segment_delay;
         let request_counts = self.request_counts.clone();
 
         async fn serve_blob(
             Path(path): Path<String>,
             blobs: Arc<HashMap<String, Bytes>>,
-            slow_v0_segment_delay: Duration,
+            segment_delay: Duration,
             request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
         ) -> impl IntoResponse {
             // `path` is already without a leading slash due to router patterns.
@@ -682,8 +696,8 @@ impl HlsFixture {
             }
 
             // Optional artificial latency for v0 media segments.
-            if slow_v0_segment_delay != Duration::ZERO && key.starts_with("seg/v0_") {
-                tokio::time::sleep(slow_v0_segment_delay).await;
+            if segment_delay != Duration::ZERO && key.starts_with("seg/v0_") {
+                tokio::time::sleep(segment_delay).await;
             }
 
             let Some(bytes) = blobs.get(key) else {
@@ -721,7 +735,7 @@ impl HlsFixture {
                         serve_blob(
                             Path(key),
                             blobs.clone(),
-                            slow_v0_segment_delay,
+                            segment_delay,
                             request_counts.clone(),
                         )
                     }
@@ -736,7 +750,7 @@ impl HlsFixture {
                         serve_blob(
                             Path(path),
                             blobs.clone(),
-                            slow_v0_segment_delay,
+                            segment_delay,
                             request_counts.clone(),
                         )
                     }
