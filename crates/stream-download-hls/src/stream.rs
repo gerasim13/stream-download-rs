@@ -103,12 +103,10 @@ impl HlsStream {
 
     /// Create a new HLS stream with custom downloader configuration.
     ///
-    /// # Arguments
-    /// * `url` - URL of the HLS master playlist
-    /// * `config` - HLS configuration
-    /// * `abr_config` - ABR configuration
-    /// * `selection_mode` - Selection mode for variants
-    /// * `downloader_config` - Optional custom downloader configuration
+    /// This is the primary constructor used by `SourceStream::create`.
+    ///
+    /// Internally, it now delegates to `new_with_worker(...)` by constructing a default
+    /// `HlsStreamWorker` using `HlsStreamWorker::new(...)`.
     pub async fn new_with_config(
         url: Url,
         settings: Arc<crate::HlsSettings>,
@@ -124,10 +122,15 @@ impl HlsStream {
         // Create event broadcast channel (out-of-band metadata)
         let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(64);
 
-        // Start background streaming task
+        // Best-effort segmented length snapshot shared with `content_length()`.
         let segmented_length = Arc::new(std::sync::RwLock::new(SegmentedLength::default()));
 
-        let streaming_task = Self::start_streaming_task(
+        // Stable-ish identifier used for persistent cache layout:
+        // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
+        let master_hash = crate::master_hash_from_url(&url);
+
+        // Construct the default worker (previous behavior).
+        let worker = HlsStreamWorker::new(
             url,
             settings,
             storage_handle,
@@ -135,9 +138,52 @@ impl HlsStream {
             seek_receiver,
             cancel_token.clone(),
             event_sender.clone(),
+            master_hash,
             segmented_length.clone(),
         )
         .await?;
+
+        Self::new_with_worker(
+            data_receiver,
+            seek_sender,
+            cancel_token,
+            event_sender,
+            segmented_length,
+            worker,
+        )
+    }
+
+    /// Create an HLS stream by supplying a fully constructed worker.
+    ///
+    /// This is useful for tests/fixtures where you want to:
+    /// - provide a pre-built `HlsManager` / customized downloader,
+    /// - inject a pre-configured `HlsStreamWorker`,
+    /// - control initialization order deterministically.
+    ///
+    /// Important: the provided `worker` must be wired to the same `data_receiver`/`seek_sender`
+    /// channels and cancellation token passed here.
+    pub fn new_with_worker(
+        data_receiver: mpsc::Receiver<StreamMsg>,
+        seek_sender: mpsc::Sender<u64>,
+        cancel_token: CancellationToken,
+        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
+        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
+        worker: HlsStreamWorker,
+    ) -> Result<Self, HlsStreamError> {
+        let streaming_task = tokio::spawn(async move {
+            tracing::trace!("HLS streaming task started");
+            let result = worker.run().await;
+
+            if let Err(e) = result {
+                match e {
+                    HlsStreamError::Cancelled => {
+                        tracing::trace!("HLS streaming task cancelled")
+                    }
+                    _ => tracing::error!("HLS streaming loop error: {}", e),
+                }
+            }
+            tracing::trace!("HLS streaming task finished");
+        });
 
         Ok(Self {
             data_receiver,
@@ -152,54 +198,6 @@ impl HlsStream {
     /// Subscribe to out-of-band stream events (variant changes, init boundaries, etc).
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<StreamEvent> {
         self.event_sender.subscribe()
-    }
-
-    /// Start the background streaming task.
-    async fn start_streaming_task(
-        url: Url,
-        settings: Arc<crate::HlsSettings>,
-        storage_handle: StorageHandle,
-        data_sender: mpsc::Sender<StreamMsg>,
-        seek_receiver: mpsc::Receiver<u64>,
-        cancel_token: CancellationToken,
-        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
-    ) -> Result<tokio::task::JoinHandle<()>, HlsStreamError> {
-        // Stable-ish identifier used for persistent cache layout:
-        // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-        let master_hash = crate::master_hash_from_url(&url);
-
-        let task = tokio::spawn(async move {
-            tracing::trace!("HLS streaming task started");
-            let result = async {
-                let worker = HlsStreamWorker::new(
-                    url,
-                    settings,
-                    storage_handle,
-                    data_sender,
-                    seek_receiver,
-                    cancel_token,
-                    event_sender,
-                    master_hash,
-                    segmented_length,
-                )
-                .await?;
-                worker.run().await
-            }
-            .await;
-
-            if let Err(e) = result {
-                match e {
-                    HlsStreamError::Cancelled => {
-                        tracing::trace!("HLS streaming task cancelled")
-                    }
-                    _ => tracing::error!("HLS streaming loop error: {}", e),
-                }
-            }
-            tracing::trace!("HLS streaming task finished");
-        });
-
-        Ok(task)
     }
 
     /// Seek to a specific position in the stream.

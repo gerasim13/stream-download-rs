@@ -177,24 +177,23 @@ impl HlsStreamWorker {
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
     ) -> Option<([u8; 16], [u8; 16])> {
-        #[cfg(feature = "aes-decrypt")]
-        {
-            return self
-                .controller
-                .inner_stream_mut()
-                .resolve_aes128_cbc_params(
-                    desc.key.as_ref(),
-                    if desc.is_init {
-                        None
-                    } else {
-                        Some(desc.sequence)
-                    },
-                )
-                .await
-                .ok()
-                .flatten();
-        }
+        #[cfg(not(feature = "aes-decrypt"))]
         return None;
+        #[cfg(feature = "aes-decrypt")]
+        return self
+            .controller
+            .inner_stream_mut()
+            .resolve_aes128_cbc_params(
+                desc.key.as_ref(),
+                if desc.is_init {
+                    None
+                } else {
+                    Some(desc.sequence)
+                },
+            )
+            .await
+            .ok()
+            .flatten();
     }
 
     /// Handle live refresh wait with cancellation and seek support.
@@ -548,14 +547,8 @@ impl HlsStreamWorker {
         let elapsed = start_time.elapsed();
 
         // Report download to ABR (network only). Cache HIT is handled above and intentionally ignored.
-        if !desc.is_init {
-            self.controller.on_media_segment_downloaded(
-                desc.duration,
-                gathered_len,
-                elapsed,
-                false,
-            );
-        }
+        self.controller
+            .on_media_segment_downloaded(desc.duration, gathered_len, elapsed);
 
         // Update segmented length snapshot (best-effort) on ChunkEnd.
         {
@@ -594,6 +587,10 @@ impl HlsStreamWorker {
         Ok(())
     }
 
+    /// Construct a worker by building an `HlsManager` internally (production/default path).
+    ///
+    /// This is kept for backwards compatibility. Internally it now delegates to
+    /// `new_with_manager(...)`, allowing tests/fixtures to inject a pre-built manager.
     pub async fn new(
         url: Url,
         settings: Arc<crate::HlsSettings>,
@@ -622,7 +619,7 @@ impl HlsStreamWorker {
 
         // Read-before-fetch caching for playlists/keys uses the storage handle.
         // Persistence is performed by emitting `StoreResource` via the same ordered stream channel.
-        let mut manager = HlsManager::new(
+        let manager = HlsManager::new(
             url.clone(),
             settings.clone(),
             manager_downloader,
@@ -630,6 +627,39 @@ impl HlsStreamWorker {
             data_sender.clone(),
         );
 
+        Self::new_with_manager(
+            manager,
+            storage_handle,
+            data_sender,
+            seek_receiver,
+            cancel_token,
+            event_sender,
+            master_hash,
+            segmented_length,
+        )
+        .await
+    }
+
+    /// Construct a worker from a pre-built `HlsManager`.
+    ///
+    /// This enables a "matryoshka" style fixture composition:
+    /// fixture server -> manager -> worker -> stream -> StreamDownload reader.
+    ///
+    /// Expectations:
+    /// - `manager` must be configured to point at the desired master playlist URL.
+    /// - `manager` should be wired to the same `data_sender` if it emits ordered persistence
+    ///   controls (e.g. `StreamControl::StoreResource`).
+    /// - This method will call `manager.load_master()` as part of initialization (same as `new`).
+    pub async fn new_with_manager(
+        mut manager: HlsManager,
+        storage_handle: StorageHandle,
+        data_sender: mpsc::Sender<StreamMsg>,
+        seek_receiver: mpsc::Receiver<u64>,
+        cancel_token: CancellationToken,
+        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
+        master_hash: String,
+        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
+    ) -> Result<Self, HlsStreamError> {
         // Initialize manager and ABR controller
         manager
             .load_master()
@@ -639,6 +669,8 @@ impl HlsStreamWorker {
         let master = manager
             .master()
             .ok_or_else(|| HlsStreamError::Hls(HlsErrorKind::StreamingLoopNotInitialized))?;
+
+        let settings = manager.settings().clone();
 
         let initial_variant_index = {
             if master.variants.is_empty() {

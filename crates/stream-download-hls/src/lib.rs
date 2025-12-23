@@ -43,7 +43,7 @@ mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
 pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
-pub use crate::manager::HlsManager;
+pub use crate::manager::{HlsManager, NextSegmentDescResult};
 pub use crate::model::{
     HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,
     MediaPlaylist, MediaSegment, StreamEvent, VariantId, VariantStream,

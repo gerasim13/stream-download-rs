@@ -142,6 +142,16 @@ impl HlsManager {
         }
     }
 
+    /// Access the manager's settings/config.
+    ///
+    /// This is intentionally a lightweight accessor to support worker initialization paths
+    /// (e.g. `HlsStreamWorker::new_with_manager(...)`) without having to thread `Arc<HlsSettings>`
+    /// separately when a pre-built manager is injected (tests/fixtures).
+    #[inline]
+    pub fn settings(&self) -> &Arc<HlsSettings> {
+        &self.config
+    }
+
     /// Get the master playlist URL associated with this manager.
     pub fn master_url(&self) -> &url::Url {
         &self.master_url

@@ -214,14 +214,7 @@ impl<S: MediaStream> AbrController<S> {
         duration: Duration,
         byte_len: u64,
         elapsed: Duration,
-        from_cache: bool,
     ) {
-        if from_cache {
-            // Deliberately do NOT touch throughput or buffer estimates when consuming cache hits.
-            // This keeps ABR from switching away from the cached variant when the network is absent.
-            return;
-        }
-
         // Feed sample to bandwidth estimator.
         self.bandwidth_estimator.add_sample(
             elapsed.as_millis() as f64,

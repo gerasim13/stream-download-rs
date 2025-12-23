@@ -12,10 +12,13 @@ stream-download = { path = "../crates/stream-download", features = [
   "registry",
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal" }
+stream-download-hls = { path = "../crates/stream-download-hls", features = ["aes-decrypt"] }
+
 rstest = { workspace = true }
 axum = { workspace = true }
 opendal = { workspace = true, features = ["services-http"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio-util = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 reqwest = { workspace = true }
