@@ -19,8 +19,8 @@ use stream_download::storage::{
 };
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
-    HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams,
-    HlsStreamWorker, ResourceDownloader,
+    AbrConfig, AbrController, HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream,
+    HlsStreamParams, HlsStreamWorker, ResourceDownloader, VariantId,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -505,6 +505,71 @@ impl HlsFixture {
         (base_url, manager)
     }
 
+    /// Build an `AbrController<HlsManager>` wired to the fixture server.
+    ///
+    /// This lets tests exercise ABR logic without spinning up a full worker/stream pipeline.
+    /// The controller is initialized (master loaded + initial variant selected) before being
+    /// returned.
+    pub async fn abr_controller(
+        &self,
+        storage_kind: HlsFixtureStorageKind,
+        hls_settings: HlsSettings,
+        settings: Settings<HlsStream>,
+        initial_variant_index: usize,
+        manual_variant_id: Option<VariantId>,
+    ) -> (reqwest::Url, AbrController<HlsManager>) {
+        let storage = self.build_storage(storage_kind, &settings);
+        let storage_handle = storage.storage_handle();
+        let hls_settings = Arc::new(hls_settings);
+
+        let (data_tx, _data_rx) = mpsc::channel::<StreamMsg>(16);
+        let (base_url, mut manager) = self
+            .manager(storage_handle, hls_settings.clone(), data_tx)
+            .await;
+
+        manager
+            .load_master()
+            .await
+            .expect("failed to load master playlist");
+
+        let master = manager
+            .master()
+            .cloned()
+            .expect("master playlist should be loaded for abr_controller");
+        assert!(
+            initial_variant_index < master.variants.len(),
+            "initial variant index {initial_variant_index} is out of bounds for {} variants",
+            master.variants.len()
+        );
+        let initial_bandwidth = master.variants[initial_variant_index]
+            .bandwidth
+            .unwrap_or(0) as f64;
+
+        let abr_cfg = AbrConfig {
+            min_buffer_for_up_switch: hls_settings.abr_min_buffer_for_up_switch,
+            down_switch_buffer: hls_settings.abr_down_switch_buffer,
+            throughput_safety_factor: hls_settings.abr_throughput_safety_factor,
+            up_hysteresis_ratio: hls_settings.abr_up_hysteresis_ratio,
+            down_hysteresis_ratio: hls_settings.abr_down_hysteresis_ratio,
+            min_switch_interval: hls_settings.abr_min_switch_interval,
+        };
+
+        let mut controller = AbrController::new(
+            manager,
+            abr_cfg,
+            manual_variant_id,
+            initial_variant_index,
+            initial_bandwidth,
+        );
+
+        controller
+            .init()
+            .await
+            .expect("failed to initialize abr controller");
+
+        (base_url, controller)
+    }
+
     /// Start the fixture server and build an `HlsStreamWorker` wired to it.
     ///
     /// This allows tests to construct a worker explicitly (and later pass it into `HlsStream` via
@@ -520,27 +585,9 @@ impl HlsFixture {
         event_tx: broadcast::Sender<stream_download_hls::StreamEvent>,
         segmented_length: Arc<std::sync::RwLock<stream_download::storage::SegmentedLength>>,
     ) -> (reqwest::Url, HlsStreamWorker) {
-        let base_url = self.start().await;
-        let url = base_url
-            .join("master.m3u8")
-            .expect("failed to build master url");
-
-        // Build an injected manager (so tests can "matryoshka" components:
-        // server -> manager -> worker -> stream -> StreamDownload).
-        let downloader = ResourceDownloader::new(
-            hls_settings.request_timeout,
-            hls_settings.max_retries,
-            hls_settings.retry_base_delay,
-            hls_settings.max_retry_delay,
-        );
-        let manager = HlsManager::new(
-            url,
-            hls_settings,
-            downloader,
-            storage_handle.clone(),
-            data_tx.clone(),
-        );
-
+        let (base_url, manager) = self
+            .manager(storage_handle.clone(), hls_settings, data_tx.clone())
+            .await;
         let master_hash = stream_download_hls::master_hash_from_url(&base_url);
 
         let worker = HlsStreamWorker::new_with_manager(

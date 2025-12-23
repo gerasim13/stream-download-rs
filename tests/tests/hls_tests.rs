@@ -461,6 +461,67 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
     });
 }
 
+#[test]
+fn hls_abr_downswitches_after_low_throughput_sample() {
+    setup::SERVER_RT.block_on(async {
+        let fixture = HlsFixture::with_variant_count(2)
+            .with_slow_v0_segment_delay(Duration::from_millis(200));
+
+        let hls_settings = HlsSettings::default()
+            .abr_min_switch_interval(Duration::ZERO)
+            .abr_down_switch_buffer(5.0);
+
+        let storage_kind = build_fixture_storage_kind("hls-abr-downswitch", 2, "memory");
+
+        // Start on variant 1 (higher bandwidth), then force a low throughput sample to push a downswitch.
+        let (_base_url, mut controller) = fixture
+            .abr_controller(storage_kind, hls_settings, Settings::default(), 1, None)
+            .await;
+
+        assert_eq!(
+            controller.current_variant_id(),
+            Some(VariantId(1)),
+            "ABR controller should initialize on variant 1"
+        );
+
+        // Feed a deliberately slow/large sample to drop estimated bandwidth below variant 1.
+        controller.on_media_segment_downloaded(
+            Duration::from_secs(2),
+            200_000,
+            Duration::from_millis(2000),
+        );
+
+        let desc = controller
+            .next_segment_descriptor_nonblocking()
+            .await
+            .expect("descriptor after throughput drop");
+
+        let seg = match desc {
+            NextSegmentDescResult::Segment(s) => s,
+            other => panic!(
+                "expected Segment descriptor after throughput drop, got {:?}",
+                other
+            ),
+        };
+
+        assert_eq!(
+            controller.current_variant_id(),
+            Some(VariantId(0)),
+            "expected ABR to downswitch to variant 0 after bandwidth drop"
+        );
+        assert_eq!(
+            seg.variant_id,
+            VariantId(0),
+            "descriptor returned after switch should target variant 0"
+        );
+        assert!(
+            seg.is_init,
+            "first descriptor after switch should be init for new variant (uri={})",
+            seg.uri
+        );
+    });
+}
+
 #[rstest]
 #[case(2, 0, 1, "persistent")]
 #[case(2, 0, 1, "temp")]
@@ -664,6 +725,52 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
             std::str::from_utf8(&b0).unwrap(),
             "INIT-V0",
             "expected INIT-V0 at start after roundtrip seek (storage={storage})"
+        );
+    });
+}
+
+#[test]
+fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes() {
+    setup::SERVER_RT.block_on(async {
+        let fixture = HlsFixture::with_variant_count(2).with_slow_v0_segment_delay(Duration::ZERO);
+
+        let storage_kind = build_fixture_storage_kind("hls-read-seek-boundary", 2, "memory");
+
+        let (_base_url, mut reader) = fixture
+            .stream_download_boxed(storage_kind, HlsSettings::default(), Settings::default())
+            .await;
+
+        // Warm up pipeline so seek won't race with first ChunkStart.
+        let mut warm = [0u8; 1];
+        let _ = Read::read(&mut reader, &mut warm).expect("warmup read failed");
+
+        let init = "INIT-V0";
+        let seg0 = "V0-SEG-0";
+        let seg1 = "V0-SEG-1";
+        let combined = format!("{init}{seg0}{seg1}");
+        let offset = (init.len() + seg0.len() - 3) as u64;
+        let read_len = 6usize;
+
+        let p =
+            Seek::seek(&mut reader, SeekFrom::Start(offset)).expect("seek across boundary failed");
+        assert_eq!(p, offset, "seek returned unexpected position");
+
+        let mut buf = vec![0u8; read_len];
+        Read::read_exact(&mut reader, &mut buf).expect("read_exact across boundary failed");
+
+        let expected_slice = &combined.as_bytes()[offset as usize..offset as usize + read_len];
+        assert_eq!(
+            &buf, expected_slice,
+            "bytes across segment boundary did not match expected payload"
+        );
+
+        let remaining = combined.len() - (offset as usize + read_len);
+        let mut trailing = vec![0u8; remaining];
+        Read::read_exact(&mut reader, &mut trailing).expect("read_exact for trailing bytes failed");
+        assert_eq!(
+            &trailing,
+            &combined.as_bytes()[offset as usize + read_len..],
+            "trailing bytes after boundary seek did not align with expected sequence"
         );
     });
 }
