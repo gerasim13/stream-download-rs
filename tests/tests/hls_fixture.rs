@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::{Seek, Write};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,10 +11,11 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bytes::Bytes;
-use stream_download::source::StreamControl;
+use stream_download::source::{StreamControl, StreamMsg};
 use stream_download::storage::memory::MemoryStorageProvider;
 use stream_download::storage::{
-    ContentLength, ProvidesStorageHandle, StorageProvider, StorageReader, StorageWriter,
+    ContentLength, ProvidesStorageHandle, SegmentedLength, StorageProvider, StorageReader,
+    StorageWriter,
 };
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
@@ -420,34 +422,51 @@ impl HlsFixture {
         settings: Settings<HlsStream>,
     ) -> (reqwest::Url, StreamDownload<BoxedStorageProvider>) {
         let base_url = self.start().await;
+        let reader = self
+            .stream_download_boxed_with_base(base_url.clone(), storage_kind, hls_settings, settings)
+            .await;
+        (base_url, reader)
+    }
+
+    /// Same as [`stream_download_boxed`], but reuse an existing fixture server/base URL.
+    ///
+    /// This is useful when a test wants multiple runs against the *same* HLS URL to assert cache
+    /// reuse (persistent storage warmup).
+    pub async fn stream_download_boxed_with_base(
+        &self,
+        base_url: reqwest::Url,
+        storage_kind: HlsFixtureStorageKind,
+        hls_settings: HlsSettings,
+        settings: Settings<HlsStream>,
+    ) -> StreamDownload<BoxedStorageProvider> {
         let url = base_url
             .join("master.m3u8")
             .expect("failed to build master url");
         let storage = self.build_storage(storage_kind, &settings);
         let storage_handle = storage.storage_handle();
         let params = HlsStreamParams::new(url, hls_settings, storage_handle);
-        let reader = match storage {
+        match storage {
             HlsFixtureStorage::Persistent { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
-                StreamDownload::new::<HlsStream>(params, provider, settings)
-                    .await
-                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+                StreamDownload::new::<HlsStream>(params, provider, settings).await.expect(
+                    "failed to create StreamDownload<HlsStream> for fixture server (persistent)",
+                )
             }
             HlsFixtureStorage::Temp { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
                 StreamDownload::new::<HlsStream>(params, provider, settings)
                     .await
-                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+                    .expect("failed to create StreamDownload<HlsStream> for fixture server (temp)")
             }
             HlsFixtureStorage::Memory { provider, .. } => {
                 let provider = BoxedStorageProvider::new(provider);
                 StreamDownload::new::<HlsStream>(params, provider, settings)
                     .await
-                    .expect("failed to create StreamDownload<HlsStream> for fixture server")
+                    .expect(
+                        "failed to create StreamDownload<HlsStream> for fixture server (memory)",
+                    )
             }
-        };
-
-        (base_url, reader)
+        }
     }
 
     /// Start the fixture server and build an `HlsManager` wired to the same fixture URLs.
@@ -532,6 +551,50 @@ impl HlsFixture {
         .expect("failed to create HlsStreamWorker for fixture server");
 
         (base_url, worker)
+    }
+
+    /// Convenience wrapper: spawn a worker, hand its data channel to a collector, then shut it down.
+    pub async fn run_worker_collecting<F, T>(
+        self,
+        hls_settings: HlsSettings,
+        data_channel_capacity: usize,
+        storage_kind: HlsFixtureStorageKind,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce(
+            mpsc::Receiver<StreamMsg>,
+        ) -> Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+        T: Send + 'static,
+    {
+        let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(data_channel_capacity);
+        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(16);
+        let cancel = CancellationToken::new();
+        let (event_tx, _event_rx) = broadcast::channel(16);
+
+        let storage_bundle = self.build_storage(storage_kind, &Settings::default());
+        let storage_handle = storage_bundle.storage_handle();
+
+        let (_base_url, worker) = self
+            .worker(
+                storage_handle,
+                Arc::new(hls_settings),
+                data_tx,
+                seek_rx,
+                cancel.clone(),
+                event_tx.clone(),
+                Arc::new(std::sync::RwLock::new(SegmentedLength::default())),
+            )
+            .await;
+
+        let worker_task = tokio::spawn(async move { worker.run().await });
+
+        let out = f(data_rx).await;
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
+
+        out
     }
 
     fn build_router(&self) -> Router {

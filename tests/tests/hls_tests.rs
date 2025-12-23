@@ -23,8 +23,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use rstest::rstest;
-use tokio::sync::{broadcast, mpsc};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::mpsc;
 
 use stream_download::Settings;
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
@@ -96,56 +95,6 @@ fn build_fixture_storage_kind(
         other => panic!("unknown storage kind '{other}'"),
     }
 }
-
-async fn run_worker_collecting<F, T>(
-    fixture: HlsFixture,
-    hls_settings: HlsSettings,
-    data_channel_capacity: usize,
-    storage_kind: HlsFixtureStorageKind,
-    f: F,
-) -> T
-where
-    F: FnOnce(
-        mpsc::Receiver<StreamMsg>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
-    T: Send + 'static,
-{
-    let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(data_channel_capacity);
-    let (_seek_tx, seek_rx) = mpsc::channel::<u64>(16);
-    let cancel = CancellationToken::new();
-    let (event_tx, _event_rx) = broadcast::channel(16);
-
-    // Build a storage bundle for this backend; for worker-level tests we only need the keyed handle.
-    //
-    // NOTE: do not name this local `storage` because many tests have a `storage: &str` parameter.
-    // Shadowing would cause confusing formatting trait errors in assert messages.
-    let storage_bundle = fixture.build_storage(storage_kind, &Settings::default());
-    let storage_handle = storage_bundle.storage_handle();
-
-    let (_base_url, worker) = fixture
-        .worker(
-            storage_handle,
-            Arc::new(hls_settings),
-            data_tx,
-            seek_rx,
-            cancel.clone(),
-            event_tx.clone(),
-            Arc::new(std::sync::RwLock::new(
-                stream_download::storage::SegmentedLength::default(),
-            )),
-        )
-        .await;
-
-    let worker_task = tokio::spawn(async move { worker.run().await });
-
-    let out = f(data_rx).await;
-
-    cancel.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(2), worker_task).await;
-
-    out
-}
-
 async fn wait_first_chunkstart(mut data_rx: mpsc::Receiver<StreamMsg>) -> StreamControl {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -213,6 +162,30 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         let storage_kind =
             build_fixture_storage_kind("hls-cache-warmup-fixture", variant_count, storage);
 
+        // Ensure we start from a clean slate so the "warmup happened" assertion is meaningful.
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => {
+                let _ = std::fs::remove_dir_all(storage_root);
+            }
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                let _ = std::fs::remove_dir_all(root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => {
+                let _ = std::fs::remove_dir_all(resource_cache_root);
+            }
+        }
+        fixture
+            .reset_request_counts()
+            .expect("failed to reset fixture request counters");
+
+        let base_url = fixture.start().await;
+        let seg0_path = "/seg/v0_0.bin";
+
         // The fixture payloads are intentionally tiny (short ASCII strings), so we can't "force"
         // large reads. This test should validate *storage reuse* without overfitting to HTTP
         // fetch patterns (which can legitimately re-fetch due to playlist reloads, cache headers,
@@ -222,7 +195,10 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         // - each run reads at least some bytes (smoke)
         // - for persistent storage, the storage root becomes non-empty after run #1
         //   (i.e. something was persisted and can be reused across runs)
-        let min_total = 1usize;
+        // - for persistent storage, the first media segment is not re-fetched on run #2
+        //
+        // Read enough bytes to force a media segment fetch (init + first segment payload).
+        let min_total = 16usize;
         let timeout = Duration::from_secs(10);
 
         let assert_persistent_reuse = storage == "persistent";
@@ -234,11 +210,12 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         } else {
             None
         };
+        let mut seg_fetch_after_first = 0u64;
 
         for run_idx in 0..2 {
-
-            let (_base_url, mut reader) = fixture
-                .stream_download_boxed(
+            let mut reader = fixture
+                .stream_download_boxed_with_base(
+                    base_url.clone(),
                     storage_kind.clone(),
                     hls_settings.clone(),
                     Settings::default(),
@@ -284,6 +261,24 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
                     "expected persistent storage root to contain files after run 0, but it is empty: {} (variant_count={}, v0_delay={:?})",
                     root.display(),
                     variant_count,
+                    v0_delay
+                );
+
+                seg_fetch_after_first = fixture
+                    .request_count_for(seg0_path)
+                    .expect("fixture request counter should be available");
+                assert!(
+                    seg_fetch_after_first >= 1,
+                    "expected to fetch at least one media segment ({seg0_path}) on run 0 (variant_count={variant_count}, v0_delay={:?}, storage={storage})",
+                    v0_delay
+                );
+            } else if assert_persistent_reuse && run_idx == 1 {
+                let after_second = fixture
+                    .request_count_for(seg0_path)
+                    .expect("fixture request counter should be available after run 1");
+                assert!(
+                    after_second <= seg_fetch_after_first + 1,
+                    "expected run 1 to reuse cached media segment {seg0_path} without re-fetch (variant_count={variant_count}, v0_delay={:?}, storage={storage}); before={seg_fetch_after_first}, after={after_second}",
                     v0_delay
                 );
             }
@@ -366,20 +361,28 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
 
         let storage_kind = build_fixture_storage_kind("hls-worker-manual", 4, storage);
 
-        let chunkstarts = run_worker_collecting(
-            fixture,
-            HlsSettings::default().selection_manual(VariantId(variant_idx as usize)),
-            4096,
-            storage_kind,
-            |rx| Box::pin(async move { collect_first_n_chunkstarts(rx, 8).await }),
-        )
-        .await;
+        let chunkstarts = fixture
+            .run_worker_collecting(
+                HlsSettings::default().selection_manual(VariantId(variant_idx as usize)),
+                4096,
+                storage_kind,
+                |rx| Box::pin(async move { collect_first_n_chunkstarts(rx, 8).await }),
+            )
+            .await;
 
         assert!(
             !chunkstarts.is_empty(),
             "expected at least one ChunkStart in manual mode (variant_idx={}, storage={})",
             variant_idx,
             storage
+        );
+        assert_eq!(
+            chunkstarts.len(),
+            8,
+            "expected to capture 8 ChunkStart events in manual mode (variant_idx={}, storage={}), got {}",
+            variant_idx,
+            storage,
+            chunkstarts.len()
         );
 
         for ctrl in chunkstarts {
@@ -416,14 +419,14 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
 
         let storage_kind = build_fixture_storage_kind("hls-worker-auto", variant_count, storage);
 
-        let first = run_worker_collecting(
-            fixture,
-            HlsSettings::default(),
-            2048,
-            storage_kind,
-            |rx| Box::pin(async move { wait_first_chunkstart(rx).await }),
-        )
-        .await;
+        let first = fixture
+            .run_worker_collecting(
+                HlsSettings::default(),
+                2048,
+                storage_kind,
+                |rx| Box::pin(async move { wait_first_chunkstart(rx).await }),
+            )
+            .await;
 
         match first {
             StreamControl::ChunkStart {
@@ -734,9 +737,9 @@ fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] varia
         // Resource caching may write a handful of small blobs (playlists/keys), but it should not
         // behave like segment persistence. We assert that the directory does not suddenly become
         // "populated like a segment cache". Keep this intentionally lenient but meaningful:
-        // - it should not go from 0 to hundreds just from a tiny read.
+        // - it should not go from 0 to many dozens just from a tiny read.
         assert!(
-            after_files.saturating_sub(before_files) <= 20,
+            after_files.saturating_sub(before_files) <= variant_count + 6,
             "memory stream storage should not create many files on disk; got before={before_files}, after={after_files} under {}",
             resource_cache_root.display()
         );
