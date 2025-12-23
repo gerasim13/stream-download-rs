@@ -174,10 +174,13 @@ impl StorageProvider for BoxedStorageProvider {
 ///   should not re-fetch segments when the cache is warm).
 #[derive(Clone)]
 pub struct HlsFixture {
+    variant_count: usize,
+    segments_per_variant: usize,
     blobs: Arc<HashMap<String, Bytes>>,
     segment_delay: Duration,
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
+    media_payload_bytes: Option<usize>,
 }
 
 /// Which storage backend to use for tests.
@@ -247,12 +250,15 @@ impl HlsFixture {
 
     pub fn new(variant_count: usize, segments_per_variant: usize, segment_delay: Duration) -> Self {
         assert!(variant_count >= 1, "variant_count must be >= 1");
-        let blobs = Self::build_blobs_with_variants(variant_count, segments_per_variant);
+        let blobs = Self::build_blobs_with_variants(variant_count, segments_per_variant, None);
         Self {
+            variant_count,
+            segments_per_variant,
             blobs: Arc::new(blobs),
             segment_delay,
             request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hls_settings: HlsSettings::default(),
+            media_payload_bytes: None,
         }
     }
 
@@ -272,12 +278,12 @@ impl HlsFixture {
     /// Construct a fixture with `variant_count` variants.
     ///
     /// Segment layout policy (deterministic):
-    /// - Each variant `v{i}` gets `SEGMENTS_PER_VARIANT` segments.
-    /// - Variant `v{i}` segment indices start at `i * SEGMENTS_PER_VARIANT`.
+    /// - Each variant `v{i}` gets `SEGMENTS_PER_VARIANT` segments starting at sequence 0.
+    ///   (Segments are still namespaced by variant in paths/payloads.)
     ///
     /// This preserves the original 2-variant layout:
     /// - v0: 0..11
-    /// - v1: 12..23
+    /// - v1: 0..11
     pub fn with_variant_count(variant_count: usize) -> Self {
         Self::new(
             variant_count,
@@ -289,6 +295,19 @@ impl HlsFixture {
     /// Override delay for `seg/v0_*` responses (use `Duration::ZERO` to disable).
     pub fn with_segment_delay(mut self, d: Duration) -> Self {
         self.segment_delay = d;
+        self
+    }
+
+    /// Override media payload size for generated segments. When set, payloads are padded/truncated
+    /// to this size (while keeping the variant/segment prefix intact) to drive ABR heuristics.
+    pub fn with_media_payload_bytes(mut self, bytes: usize) -> Self {
+        self.media_payload_bytes = Some(bytes);
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+        );
+        self.blobs = Arc::new(blobs);
         self
     }
 
@@ -632,13 +651,14 @@ impl HlsFixture {
     where
         F: FnOnce(
             mpsc::Receiver<StreamMsg>,
+            broadcast::Receiver<stream_download_hls::StreamEvent>,
         ) -> Pin<Box<dyn std::future::Future<Output = T> + Send>>,
         T: Send + 'static,
     {
         let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(data_channel_capacity);
         let (_seek_tx, seek_rx) = mpsc::channel::<u64>(16);
         let cancel = CancellationToken::new();
-        let (event_tx, _event_rx) = broadcast::channel(16);
+        let (event_tx, event_rx) = broadcast::channel(16);
 
         let storage_bundle = self.build_storage(storage_kind);
         let storage_handle = storage_bundle.storage_handle();
@@ -656,7 +676,7 @@ impl HlsFixture {
 
         let worker_task = tokio::spawn(async move { worker.run().await });
 
-        let out = f(data_rx).await;
+        let out = f(data_rx, event_rx).await;
 
         cancel.cancel();
         let join = tokio::time::timeout(Duration::from_secs(2), worker_task)
@@ -761,13 +781,19 @@ impl HlsFixture {
     fn build_blobs_with_variants(
         variant_count: usize,
         segments_per_variant: usize,
+        media_payload_bytes: Option<usize>,
     ) -> HashMap<String, Bytes> {
         let mut blobs: HashMap<String, Bytes> = HashMap::new();
         Self::put_master(&mut blobs, variant_count);
         for v in 0..variant_count {
-            let seg_start = v * segments_per_variant;
-            let seg_end = seg_start + segments_per_variant;
-            Self::put_variant_playlist_and_payloads(&mut blobs, v, seg_start..seg_end);
+            let seg_start = 0;
+            let seg_end = segments_per_variant;
+            Self::put_variant_playlist_and_payloads(
+                &mut blobs,
+                v,
+                seg_start..seg_end,
+                media_payload_bytes,
+            );
         }
         blobs
     }
@@ -777,11 +803,11 @@ impl HlsFixture {
         out.push_str("#EXTM3U\n");
         out.push_str("#EXT-X-VERSION:7\n\n");
         for v in 0..variant_count {
-            // Keep the original 2-variant bandwidths for v0/v1, and scale beyond that.
+            // Keep bandwidths monotonic but modest so ABR tests can trigger switches quickly.
             let bw = match v {
                 0 => 128_000,
-                1 => 2_560_000,
-                _ => 2_560_000 + (v as u64 * 640_000),
+                1 => 256_000,
+                _ => 256_000 + (v as u64 * 128_000),
             };
             out.push_str(&format!("#EXT-X-STREAM-INF:BANDWIDTH={bw}\n"));
             out.push_str(&format!("v{v}.m3u8\n"));
@@ -793,6 +819,7 @@ impl HlsFixture {
         blobs: &mut HashMap<String, Bytes>,
         variant_index: usize,
         seg_range: std::ops::Range<usize>,
+        media_payload_bytes: Option<usize>,
     ) {
         fn put_text(blobs: &mut HashMap<String, Bytes>, path: String, body: String) {
             blobs.insert(path, Bytes::from(body));
@@ -833,8 +860,21 @@ impl HlsFixture {
         put_static(blobs, init_path, init_payload);
 
         // Media payloads (unique per variant/sequence).
-        for i in seg_range {
-            put_segment_text(blobs, format!("seg/v{v}_{i}.bin"), format!("V{v}-SEG-{i}"));
+        for (idx, i) in seg_range.enumerate() {
+            let base = format!("V{v}-SEG-{i}");
+            let payload = if let Some(n) = media_payload_bytes {
+                if n <= base.len() {
+                    base.clone()
+                } else {
+                    let reps = (n / base.len()) + 1;
+                    let mut repeated = base.repeat(reps);
+                    repeated.truncate(n);
+                    repeated
+                }
+            } else {
+                base.clone()
+            };
+            put_segment_text(blobs, format!("seg/v{v}_{idx}.bin"), payload);
         }
     }
 }

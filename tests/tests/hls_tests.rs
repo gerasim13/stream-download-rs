@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 
-use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, VariantId};
+use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, StreamEvent, VariantId};
 
 mod hls_fixture;
 mod setup;
@@ -163,8 +163,14 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(v0_delay);
 
-        let storage_kind =
-            build_fixture_storage_kind("hls-cache-warmup-fixture", variant_count, storage);
+        let storage_kind = build_fixture_storage_kind(
+            &format!(
+                "hls-cache-warmup-fixture-d{}",
+                v0_delay.as_millis()
+            ),
+            variant_count,
+            storage,
+        );
 
         // Ensure we start from a clean slate so the "warmup happened" assertion is meaningful.
         match &storage_kind {
@@ -369,7 +375,7 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
             .run_worker_collecting(
                 4096,
                 storage_kind,
-                |rx| Box::pin(async move { collect_first_n_chunkstarts(rx, 8).await }),
+                |rx, _events| Box::pin(async move { collect_first_n_chunkstarts(rx, 8).await }),
             )
             .await;
 
@@ -426,7 +432,7 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
             .run_worker_collecting(
                 2048,
                 storage_kind,
-                |rx| Box::pin(async move { wait_first_chunkstart(rx).await }),
+                |rx, _events| Box::pin(async move { wait_first_chunkstart(rx).await }),
             )
             .await;
 
@@ -455,15 +461,18 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
     });
 }
 
-#[test]
-fn hls_abr_downswitches_after_low_throughput_sample() {
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(2).with_abr_config(|cfg| {
+        let fixture = HlsFixture::with_variant_count(variant_count).with_abr_config(|cfg| {
             cfg.abr_min_switch_interval = Duration::ZERO;
             cfg.abr_down_switch_buffer = 5.0;
         });
 
-        let storage_kind = build_fixture_storage_kind("hls-abr-downswitch", 2, "memory");
+        let storage_kind =
+            build_fixture_storage_kind("hls-abr-downswitch", variant_count, "memory");
 
         // Start on variant 1 (higher bandwidth), then force a low throughput sample to push a downswitch.
         let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 1, None).await;
@@ -477,8 +486,8 @@ fn hls_abr_downswitches_after_low_throughput_sample() {
         // Feed a deliberately slow/large sample to drop estimated bandwidth below variant 1.
         controller.on_media_segment_downloaded(
             Duration::from_secs(2),
-            200_000,
-            Duration::from_millis(2000),
+            50_000,
+            Duration::from_millis(4000),
         );
 
         let desc = controller
@@ -512,10 +521,12 @@ fn hls_abr_downswitches_after_low_throughput_sample() {
     });
 }
 
-#[test]
-fn hls_abr_upswitch_continues_from_current_segment_index() {
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: usize) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(2)
+        let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
             .with_abr_config(|cfg| {
                 cfg.abr_min_switch_interval = Duration::ZERO;
@@ -524,8 +535,7 @@ fn hls_abr_upswitch_continues_from_current_segment_index() {
                 cfg.abr_throughput_safety_factor = 1.0;
             });
 
-        let storage_kind = build_fixture_storage_kind("hls-abr-upswitch", 2, "memory");
-
+        let storage_kind = build_fixture_storage_kind("hls-abr-upswitch", variant_count, "memory");
         let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 0, None).await;
 
         // Drain init + first media segment on variant 0.
@@ -583,20 +593,24 @@ fn hls_abr_upswitch_continues_from_current_segment_index() {
             other => panic!("expected media descriptor after switch, got {:?}", other),
         };
 
+        let current_variant_id = variant_count - 1;
         assert_eq!(
             controller.current_variant_id(),
-            Some(VariantId(1)),
-            "ABR should upswitch to variant 1"
+            Some(VariantId(current_variant_id)),
+            "ABR should upswitch to variant {}",
+            current_variant_id
         );
         assert!(
-            switched_init.is_init && switched_init.variant_id == VariantId(1),
-            "first descriptor after switch should be init for variant 1 (got {:?})",
+            switched_init.is_init && switched_init.variant_id == VariantId(current_variant_id),
+            "first descriptor after switch should be init for variant {} (got {:?})",
+            current_variant_id,
             switched_init
         );
         assert_eq!(
             switched_seg.variant_id,
-            VariantId(1),
-            "media descriptor after switch should target variant 1"
+            VariantId(current_variant_id),
+            "media descriptor after switch should target variant {}",
+            current_variant_id
         );
 
         // Next segment index should be preserved across the switch: we consumed one media segment
@@ -605,6 +619,102 @@ fn hls_abr_upswitch_continues_from_current_segment_index() {
         assert_eq!(
             switched_seg.sequence, expected_sequence,
             "upswitch should continue from current segment index, not restart from the first segment"
+        );
+    });
+}
+
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_worker_auto_upswitches_mid_stream_without_restarting(#[case] variant_count: usize) {
+    setup::SERVER_RT.block_on(async {
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::from_millis(200))
+            .with_media_payload_bytes(800_000)
+            .with_abr_config(|cfg| {
+                cfg.abr_min_switch_interval = Duration::ZERO;
+                cfg.abr_min_buffer_for_up_switch = 0.0;
+                cfg.abr_up_hysteresis_ratio = 0.0;
+                cfg.abr_throughput_safety_factor = 1.0;
+            });
+
+        let storage_kind = build_fixture_storage_kind("hls-abr-upswitch-worker", variant_count, "memory");
+
+        let (variant_changes, segment_starts) = fixture
+            .run_worker_collecting(
+                8192,
+                storage_kind,
+                |mut data_rx, mut event_rx| {
+                    Box::pin(async move {
+                        let mut variant_changes: Vec<(VariantId, usize)> = Vec::new();
+                        let mut segment_starts: Vec<(VariantId, u64)> = Vec::new();
+                        let deadline = Instant::now() + Duration::from_secs(12);
+
+                        while Instant::now() < deadline {
+                            tokio::select! {
+                                biased;
+                                ev = event_rx.recv() => {
+                                    if let Ok(ev) = ev {
+                                        match ev {
+                                            StreamEvent::VariantChanged { variant_id, .. } => {
+                                                variant_changes.push((variant_id, segment_starts.len()));
+                                            }
+                                            StreamEvent::SegmentStart { variant_id, sequence, .. } => {
+                                                segment_starts.push((variant_id, sequence));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if variant_changes.iter().any(|(id, _)| *id == VariantId(1))
+                                        && segment_starts.iter().any(|(id, _)| *id == VariantId(1)) {
+                                        break;
+                                    }
+                                }
+                                msg = data_rx.recv() => {
+                                    if msg.is_none() {
+                                        break;
+                                    }
+                                    // Drain data to avoid backpressure; we only need events.
+                                }
+                            }
+                        }
+
+                        (variant_changes, segment_starts)
+                    })
+                },
+            )
+            .await;
+
+        let first_start = segment_starts
+            .first()
+            .expect("expected at least one segment start");
+        assert_eq!(
+            first_start.0,
+            VariantId(0),
+            "stream should start on variant 0 before any switch"
+        );
+
+        let (new_variant, change_at) = variant_changes
+            .iter()
+            .find(|(id, _)| *id != VariantId(0))
+            .copied()
+            .expect("expected a VariantChanged event to a higher variant");
+        assert!(
+            change_at >= 1,
+            "upswitch should happen after at least one segment start on variant 0"
+        );
+
+        let first_high_segment = segment_starts
+            .iter()
+            .find(|(id, _)| *id == new_variant)
+            .copied()
+            .expect("expected a SegmentStart for higher variant after switch");
+
+        assert!(
+            first_high_segment.1 == first_start.1 + 1,
+            "after switching, worker should continue from current segment index, not restart (got seq {}, expected {})",
+            first_high_segment.1,
+            first_start.1 + 1
         );
     });
 }
@@ -770,9 +880,7 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
     setup::SERVER_RT.block_on(async {
         let fixture =
             HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
-
         let storage_kind = build_fixture_storage_kind("hls-read-seek-e2e", variant_count, storage);
-
         let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Ensure the pipeline is started (worker emits ChunkStart before data).
@@ -810,13 +918,17 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
     });
 }
 
-#[test]
-fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes() {
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes(
+    #[case] variant_count: usize,
+) {
     setup::SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(2).with_segment_delay(Duration::ZERO);
-
-        let storage_kind = build_fixture_storage_kind("hls-read-seek-boundary", 2, "memory");
-
+        let fixture =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
+        let storage_kind =
+            build_fixture_storage_kind("hls-read-seek-boundary", variant_count, "memory");
         let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Warm up pipeline so seek won't race with first ChunkStart.
