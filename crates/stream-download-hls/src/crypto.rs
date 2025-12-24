@@ -71,7 +71,7 @@ impl StreamMiddleware for Aes128CbcMiddleware {
         // Buffer the entire segment and decrypt once at the end using PKCS#7.
         let stream = futures_util::stream::unfold(
             (input, BytesMut::new(), false),
-            move |(mut input, mut buf, mut finished)| async move {
+            move |(mut input, mut buf, finished)| async move {
                 loop {
                     match input.next().await {
                         Some(Ok(chunk)) => {
@@ -80,10 +80,7 @@ impl StreamMiddleware for Aes128CbcMiddleware {
                         }
                         Some(Err(e)) => {
                             return Some((
-                                Err(HlsError::Io(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))),
+                                Err(HlsError::io(e.to_string())),
                                 (input, BytesMut::new(), true),
                             ));
                         }
@@ -96,19 +93,20 @@ impl StreamMiddleware for Aes128CbcMiddleware {
                             let decryptor = Decryptor::<Aes128>::new((&key).into(), (&iv).into());
                             let result = decryptor
                                 .decrypt_padded_mut::<Pkcs7>(&mut data)
-                                .map(|plain| Bytes::copy_from_slice(plain))
-                                .map_err(|e| {
-                                    HlsError::Message(format!("AES-128-CBC decryption failed: {e}"))
-                                });
+                                .map_err(HlsError::aes128_cbc_decrypt_failed);
 
-                            finished = true;
-                            return Some((result, (input, BytesMut::new(), finished)));
+                            let out = match result {
+                                Ok(plain) => Bytes::copy_from_slice(plain),
+                                Err(e) => return Some((Err(e), (input, BytesMut::new(), true))),
+                            };
+
+                            return Some((Ok(out), (input, BytesMut::new(), true)));
                         }
                     }
                 }
             },
         );
 
-        return stream.boxed();
+        stream.boxed()
     }
 }

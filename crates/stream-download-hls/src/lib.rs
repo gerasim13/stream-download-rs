@@ -20,13 +20,11 @@
 //! - `stream`: HLS implementation of the `SourceStream` trait.
 //! - `storage`: Segmented storage provider for splitting HLS segments into separate files.
 //! - `error`: Unified error types.
+//! - `cache::keys`: Deterministic cache/layout helpers (including master hash).
 //!
 //! This file (`lib.rs`) acts as a facade: it re-exports the main
 //! types and functions from the internal modules to form the public API
 //! of the `stream-download-hls` crate.
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 mod abr;
 mod cache;
@@ -44,6 +42,9 @@ pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
 pub use crate::downloader::HlsByteStream;
 pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
 pub use crate::error::{HlsError, HlsResult};
+
+// Deterministic cache/layout helpers
+pub use crate::cache::keys::master_hash_from_url;
 pub use crate::manager::{
     HlsManager, NextSegmentDescResult, NextSegmentResult, SegmentData, SegmentDescriptor,
     SegmentType,
@@ -52,7 +53,6 @@ pub use crate::parser::{
     CodecInfo, ContainerFormat, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist,
     MediaPlaylist, MediaSegment, SegmentKey, VariantId, VariantStream,
 };
-pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
 pub use crate::storage::SegmentedStorageProvider;
 pub use crate::stream::StreamEvent;
@@ -75,7 +75,7 @@ pub use crate::storage::cache_layer::HlsCacheLayer;
 pub type HlsPersistentStorageProvider =
     SegmentedStorageProvider<HlsCacheLayer<HlsFileTreeSegmentFactory>>;
 
-pub use crate::manager::{MediaStream, StreamMiddleware, apply_middlewares};
+pub use crate::manager::{MediaStream, StreamMiddleware};
 pub use crate::stream::{HlsStream, HlsStreamParams};
 pub use crate::worker::HlsStreamWorker;
 
@@ -86,18 +86,3 @@ pub use crate::crypto::Aes128CbcMiddleware;
 
 pub use bytes::Bytes;
 pub use std::time::Duration;
-
-/// Compute a stable identifier for an HLS "stream" based on the master playlist URL.
-///
-/// This is used as the `<master_hash>` component in the persistent cache layout:
-/// `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`.
-///
-/// Notes:
-/// - This is stable within a given build/toolchain, but not guaranteed to be stable across
-///   Rust versions because it relies on the standard library hasher.
-/// - If you need cross-version stability, replace this with a fixed hash function (e.g. SHA-256).
-pub fn master_hash_from_url(url: &url::Url) -> String {
-    let mut hasher = DefaultHasher::new();
-    url.as_str().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}

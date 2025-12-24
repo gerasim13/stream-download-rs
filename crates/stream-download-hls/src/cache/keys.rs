@@ -38,12 +38,35 @@
 //! -------
 //! This module emits `trace` logs when it successfully derives basenames / keys (or fails to),
 //! to help debug cache key mapping issues.
+//!
+//! Deterministic master hash
+//! -------------------------
+//! The `master_hash_from_url` helper lives here because it is part of the deterministic
+//! on-disk layout and cache key strategy used throughout the crate.
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use stream_download::source::ResourceKey;
 
 use crate::parser::VariantId;
 
 use tracing::trace;
+
+/// Compute a stable identifier for an HLS "stream" based on the master playlist URL.
+///
+/// This is used as the `<master_hash>` component in the persistent cache layout:
+/// `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`.
+///
+/// Notes:
+/// - This is stable within a given build/toolchain, but not guaranteed to be stable across
+///   Rust versions because it relies on the standard library hasher.
+/// - If you need cross-version stability, replace this with a fixed hash function (e.g. SHA-256).
+pub fn master_hash_from_url(url: &url::Url) -> String {
+    let mut hasher = DefaultHasher::new();
+    url.as_str().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
 
 /// Best-effort basename extraction for a URI-like string.
 ///

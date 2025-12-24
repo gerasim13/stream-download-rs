@@ -20,7 +20,7 @@ use stream_download::storage::{
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
     AbrConfig, AbrController, HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream,
-    HlsStreamParams, HlsStreamWorker, ResourceDownloader, VariantId,
+    HlsStreamParams, HlsStreamWorker, ResourceDownloader, VariantId, master_hash_from_url,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -623,7 +623,7 @@ impl HlsFixture {
         segmented_length: Arc<std::sync::RwLock<stream_download::storage::SegmentedLength>>,
     ) -> (reqwest::Url, HlsStreamWorker) {
         let (base_url, manager) = self.manager(storage_handle.clone(), data_tx.clone()).await;
-        let master_hash = stream_download_hls::master_hash_from_url(&base_url);
+        let master_hash = master_hash_from_url(&base_url);
 
         let hls_settings = Arc::new(self.hls_settings.clone());
         let abr_cfg = AbrConfig {

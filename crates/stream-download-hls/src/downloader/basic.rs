@@ -171,12 +171,7 @@ impl ResourceDownloader {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            HlsError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "download failed with no error",
-            ))
-        }))
+        Err(last_error.unwrap_or_else(|| HlsError::io("download failed with no error")))
     }
 
     async fn try_download_once(
@@ -192,7 +187,7 @@ impl ResourceDownloader {
         let collect_future = Self::collect_stream_to_bytes(http, cancel);
         match timeout(self.request_timeout, collect_future).await {
             Ok(res) => res,
-            Err(_) => Err(HlsError::Timeout(url_str)),
+            Err(_) => Err(HlsError::timeout(url_str)),
         }
     }
 
@@ -209,12 +204,9 @@ impl ResourceDownloader {
             Ok(Err(e)) => {
                 // Decode the error text from the server if possible
                 let msg = e.decode_error().await;
-                Err(HlsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("HTTP stream creation failed: {msg}"),
-                )))
+                Err(HlsError::http_stream_create_failed(msg))
             }
-            Err(_) => Err(HlsError::Timeout(url.to_string())),
+            Err(_) => Err(HlsError::timeout(url.to_string())),
         }
     }
 
@@ -225,10 +217,7 @@ impl ResourceDownloader {
             match res {
                 Ok(StreamMsg::Data(bytes)) => Some(Ok(bytes)),
                 Ok(StreamMsg::Control(_)) => None,
-                Err(e) => Some(Err(HlsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))),
+                Err(e) => Some(Err(HlsError::io(e.to_string()))),
             }
         })
     }
@@ -264,10 +253,7 @@ impl ResourceDownloader {
                     continue;
                 }
                 Some(Err(e)) => {
-                    return Err(HlsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    )));
+                    return Err(HlsError::io(e.to_string()));
                 }
                 None => break,
             }
@@ -282,12 +268,7 @@ impl ResourceDownloader {
 // ----------------------------
 
 fn parse_url(url: &str) -> HlsResult<Url> {
-    Url::parse(url).map_err(|e| {
-        HlsError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("invalid URL: {e}"),
-        ))
-    })
+    Url::parse(url).map_err(HlsError::url_parse)
 }
 
 /// Parse the `Content-Range` header to extract the total length.
@@ -398,22 +379,16 @@ impl ResourceDownloader {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) => {
                         let msg = e.decode_error().await;
-                        return Err(HlsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("HTTP stream creation failed during probe: {msg}"),
-                        )));
+                        return Err(HlsError::http_stream_create_failed_during_probe(msg));
                     }
-                    Err(_) => return Err(HlsError::Timeout(url_str)),
+                    Err(_) => return Err(HlsError::timeout(url_str)),
                 };
 
                 let cl_opt: Option<u64> = http.content_length().into();
                 Ok(cl_opt)
             }
-            Ok(Err(e)) => Err(HlsError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))),
-            Err(_) => Err(HlsError::Timeout(url_str)),
+            Ok(Err(e)) => Err(HlsError::io(e.to_string())),
+            Err(_) => Err(HlsError::timeout(url_str)),
         }
     }
 }

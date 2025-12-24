@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
-use crate::cache::keys as cache_keys;
+use crate::cache::keys::{self as cache_keys, master_hash_from_url};
 use crate::downloader::HlsByteStream;
 use crate::downloader::ResourceDownloader;
 use crate::downloader::{CacheSource, CachedResourceDownloader};
@@ -297,22 +297,14 @@ impl HlsManager {
         let base = if let Some(ref base_url) = self.config.base_url {
             base_url.clone()
         } else if let Some(ref media_playlist_url) = self.media_playlist_url {
-            url::Url::parse(media_playlist_url).map_err(|e| {
-                HlsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Failed to parse base URL: {}", e),
-                ))
-            })?
+            url::Url::parse(media_playlist_url).map_err(HlsError::base_url_parse)?
         } else {
             self.master_url.clone()
         };
 
-        base.join(relative_url).map(|u| u.into()).map_err(|e| {
-            HlsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Failed to join URL: {}", e),
-            ))
-        })
+        base.join(relative_url)
+            .map(|u| u.into())
+            .map_err(HlsError::url_join)
     }
 
     fn current_variant(&self) -> HlsResult<&VariantStream> {
@@ -502,7 +494,7 @@ impl HlsManager {
     ///
     /// For now this is a stub that always returns an error.
     pub async fn load_master(&mut self) -> HlsResult<&MasterPlaylist> {
-        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let master_hash = master_hash_from_url(&self.master_url);
         let key = cache_keys::playlist_key_from_url(&master_hash, self.master_url.as_str())
             .ok_or_else(|| {
                 HlsError::Message("unable to derive master playlist basename".to_string())
@@ -548,7 +540,7 @@ impl HlsManager {
 
         let media_playlist_url = self.resolve_url(&variant.uri)?;
 
-        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let master_hash = master_hash_from_url(&self.master_url);
         let key = cache_keys::playlist_key_from_url(&master_hash, &media_playlist_url).ok_or_else(
             || HlsError::Message("unable to derive media playlist basename".to_string()),
         )?;
@@ -619,7 +611,7 @@ impl HlsManager {
             .ok_or_else(|| HlsError::Message("no variant selected".to_string()))?;
 
         // Download and parse the latest media playlist
-        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let master_hash = master_hash_from_url(&self.master_url);
         let key = cache_keys::playlist_key_from_url(&master_hash, &media_url).ok_or_else(|| {
             HlsError::Message("unable to derive media playlist basename".to_string())
         })?;
@@ -657,12 +649,8 @@ impl HlsManager {
     #[cfg(feature = "aes-decrypt")]
     fn finalize_key_url(&self, abs_key_url: &str) -> HlsResult<String> {
         if let Some(params) = &self.config.key_query_params {
-            let mut url = url::Url::parse(abs_key_url).map_err(|e| {
-                HlsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    e.to_string(),
-                ))
-            })?;
+            let mut url = url::Url::parse(abs_key_url)
+                .map_err(|e| HlsError::io_kind(std::io::ErrorKind::InvalidInput, e.to_string()))?;
             {
                 let mut qp = url.query_pairs_mut();
                 for (k, v) in params {
@@ -683,7 +671,7 @@ impl HlsManager {
 
         // Variant-scoped key caching:
         // key path: `<master_hash>/<variant_id>/<key_basename>`
-        let master_hash = crate::master_hash_from_url(&self.master_url);
+        let master_hash = master_hash_from_url(&self.master_url);
         let variant_id = self.current_variant()?.id;
 
         let key = cache_keys::key_key_from_url(&master_hash, variant_id, final_key_url)
@@ -704,10 +692,7 @@ impl HlsManager {
         }
 
         if kb.len() != 16 {
-            return Err(HlsError::Message(format!(
-                "invalid AES-128 key length: expected 16, got {}",
-                kb.len()
-            )));
+            return Err(HlsError::invalid_aes128_key_len(kb.len()));
         }
 
         self.key_cache.insert(final_key_url.to_string(), kb.clone());
@@ -749,10 +734,7 @@ impl HlsManager {
                         let final_key_url = self.finalize_key_url(&abs_key_url)?;
                         let key_bytes = self.fetch_key_bytes(&final_key_url).await?;
                         if key_bytes.len() != 16 {
-                            return Err(HlsError::Message(format!(
-                                "invalid AES-128 key length: expected 16, got {}",
-                                key_bytes.len()
-                            )));
+                            return Err(HlsError::invalid_aes128_key_len(key_bytes.len()));
                         }
                         let mut key_arr = [0u8; 16];
                         key_arr.copy_from_slice(&key_bytes);
@@ -975,10 +957,7 @@ impl HlsManager {
             let size = match self.get_or_probe_segment_size(*seq, &resolved_uri).await? {
                 Some(sz) => sz,
                 None => {
-                    return Err(HlsError::Message(format!(
-                        "unable to determine size for segment sequence {}",
-                        seq
-                    )));
+                    return Err(HlsError::segment_size_unknown(*seq));
                 }
             };
 
@@ -1028,12 +1007,7 @@ impl HlsManager {
             .segments
             .iter()
             .position(|s| s.sequence == desc.sequence)
-            .ok_or_else(|| {
-                HlsError::Message(format!(
-                    "segment sequence {} not found in current playlist",
-                    desc.sequence
-                ))
-            })?;
+            .ok_or_else(|| HlsError::segment_sequence_not_found(desc.sequence))?;
 
         // Next descriptor should be this media segment
         self.init_segment_sent = true; // do not emit init again

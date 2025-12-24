@@ -121,9 +121,9 @@ impl CachedResourceDownloader {
                     trace!("cache: treating read error as miss (best_effort_cache=true)");
                     Ok(None)
                 } else {
-                    Err(HlsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("cache read failed for key '{}': {e}", key.0),
+                    Err(HlsError::io(format!(
+                        "cache read failed for key '{}': {e}",
+                        key.0
                     )))
                 }
             }

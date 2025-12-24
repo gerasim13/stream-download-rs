@@ -28,7 +28,11 @@ use std::sync::Arc;
 use std::task::{self, Poll};
 
 use crate::HlsStreamWorker;
+use crate::cache::keys::master_hash_from_url;
 use crate::error::HlsError;
+use crate::parser::{CodecInfo, VariantId};
+use crate::settings::HlsSettings;
+
 use futures_util::Stream;
 use stream_download::source::{SourceStream, StreamControl, StreamMsg};
 use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
@@ -42,30 +46,28 @@ use url::Url;
 pub enum StreamEvent {
     /// ABR: a new variant (rendition) has been selected. Emitted before the init segment.
     VariantChanged {
-        variant_id: crate::parser::VariantId,
-        codec_info: Option<crate::parser::CodecInfo>,
+        variant_id: VariantId,
+        codec_info: Option<CodecInfo>,
     },
     /// Beginning of an init segment in the main byte stream.
     /// byte_len may be None when exact length is unknown (e.g., due to DRM/middleware).
     InitStart {
-        variant_id: crate::parser::VariantId,
-        codec_info: Option<crate::parser::CodecInfo>,
+        variant_id: VariantId,
+        codec_info: Option<CodecInfo>,
         byte_len: Option<u64>,
     },
     /// End of the init segment in the main byte stream.
-    InitEnd {
-        variant_id: crate::parser::VariantId,
-    },
+    InitEnd { variant_id: VariantId },
     /// Optional: media segment boundaries (useful for metrics).
     SegmentStart {
         sequence: u64,
-        variant_id: crate::parser::VariantId,
+        variant_id: VariantId,
         byte_len: Option<u64>,
         duration: std::time::Duration,
     },
     SegmentEnd {
         sequence: u64,
-        variant_id: crate::parser::VariantId,
+        variant_id: VariantId,
     },
 }
 
@@ -75,7 +77,7 @@ pub struct HlsStreamParams {
     /// The URL of the HLS master playlist.
     pub url: Url,
     /// Unified settings for HLS playback and downloader behavior.
-    pub settings: Arc<crate::HlsSettings>,
+    pub settings: Arc<HlsSettings>,
     /// Storage handle used for read-before-fetch caching of playlists/keys.
     ///
     /// This is mandatory to ensure caching is actually enabled (otherwise the cached downloader
@@ -87,7 +89,7 @@ impl HlsStreamParams {
     /// Create new HLS stream parameters.
     pub fn new(
         url: Url,
-        settings: impl Into<Arc<crate::HlsSettings>>,
+        settings: impl Into<Arc<HlsSettings>>,
         storage_handle: StorageHandle,
     ) -> Self {
         Self {
@@ -141,7 +143,7 @@ impl HlsStream {
     /// `HlsStreamWorker` using `HlsStreamWorker::new(...)`.
     pub async fn new_with_config(
         url: Url,
-        settings: Arc<crate::HlsSettings>,
+        settings: Arc<HlsSettings>,
         storage_handle: StorageHandle,
     ) -> Result<Self, HlsError> {
         // Create channels for data and commands
@@ -159,7 +161,7 @@ impl HlsStream {
 
         // Stable-ish identifier used for persistent cache layout:
         // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-        let master_hash = crate::master_hash_from_url(&url);
+        let master_hash = master_hash_from_url(&url);
 
         // Construct the default worker (previous behavior).
         let worker = HlsStreamWorker::new(
@@ -261,7 +263,7 @@ impl Drop for HlsStream {
 
 impl SourceStream for HlsStream {
     type Params = HlsStreamParams;
-    type StreamCreationError = crate::error::HlsError;
+    type StreamCreationError = HlsError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
         Self::new(params.url, params.settings, params.storage_handle).await

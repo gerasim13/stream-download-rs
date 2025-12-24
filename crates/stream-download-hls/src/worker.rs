@@ -7,10 +7,9 @@ use url::Url;
 
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
+use crate::manager::apply_middlewares;
 use crate::stream::StreamEvent;
-use crate::{
-    AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware, apply_middlewares,
-};
+use crate::{AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware};
 
 #[cfg(feature = "aes-decrypt")]
 use crate::Aes128CbcMiddleware;
@@ -913,7 +912,6 @@ impl HlsStreamWorker {
         }
 
         let settings = manager.settings().clone();
-
         let initial_variant_index = {
             // If selector returns Some(VariantId) => start in MANUAL mode at that variant.
             // If selector is absent or returns None => start in AUTO mode, using manager default.
@@ -932,7 +930,6 @@ impl HlsStreamWorker {
             .bandwidth
             .unwrap_or(0) as f64;
 
-        let abr_cfg = abr_config;
         let manual_variant_id = settings
             .variant_stream_selector
             .as_ref()
@@ -940,7 +937,7 @@ impl HlsStreamWorker {
 
         let mut controller = AbrController::new(
             manager,
-            abr_cfg,
+            abr_config,
             manual_variant_id,
             initial_variant_index,
             init_bw,
@@ -955,15 +952,13 @@ impl HlsStreamWorker {
             data_sender,
             seek_receiver,
             cancel_token,
-            event_sender: event_sender.clone(),
+            storage_handle,
+            segmented_length,
             controller,
             current_position: 0,
             bytes_to_skip: 0,
             retry_delay: Self::INITIAL_RETRY_DELAY,
-
-            storage_handle,
-            segmented_length,
-
+            event_sender: event_sender.clone(),
             master_hash: Arc::<str>::from(master_hash),
         })
     }

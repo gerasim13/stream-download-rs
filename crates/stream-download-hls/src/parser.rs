@@ -142,10 +142,9 @@ pub struct MediaSegment {
 
 /// Parse a master playlist (M3U8) into a [`MasterPlaylist`].
 pub fn parse_master_playlist(data: &[u8]) -> HlsResult<MasterPlaylist> {
-    let input = std::str::from_utf8(data)
-        .map_err(|e| HlsError::InvalidPlaylist(format!("invalid UTF-8: {}", e)))?;
+    let input = std::str::from_utf8(data).map_err(HlsError::playlist_utf8)?;
     let hls_master = HlsMasterPlaylist::try_from(input)
-        .map_err(|e| HlsError::InvalidPlaylist(format!("hls_m3u8 parse error: {}", e)))?
+        .map_err(HlsError::playlist_parse)?
         .into_owned();
 
     let variants = hls_master
@@ -189,10 +188,9 @@ pub fn parse_master_playlist(data: &[u8]) -> HlsResult<MasterPlaylist> {
 
 /// Parse a media playlist (M3U8) into a [`MediaPlaylist`].
 pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<MediaPlaylist> {
-    let input = std::str::from_utf8(data)
-        .map_err(|e| HlsError::InvalidPlaylist(format!("invalid UTF-8: {}", e)))?;
+    let input = std::str::from_utf8(data).map_err(HlsError::playlist_utf8)?;
     let hls_media = HlsMediaPlaylist::try_from(input)
-        .map_err(|e| HlsError::InvalidPlaylist(format!("hls_m3u8 parse error: {}", e)))?
+        .map_err(HlsError::playlist_parse)?
         .into_owned();
 
     let target_duration = Some(hls_media.target_duration);
