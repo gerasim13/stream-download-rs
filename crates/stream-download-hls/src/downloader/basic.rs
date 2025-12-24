@@ -12,25 +12,16 @@ use tracing::debug;
 
 use crate::error::{HlsError, HlsResult};
 
-// Reuse the `stream-download` HTTP layer and its shared reqwest client.
-// We intentionally avoid using reqwest directly in this module so behavior stays
-// consistent across the workspace and we benefit from centralized pooling/DNS cache.
+// Reuse the `stream-download` HTTP layer and its shared reqwest client so behavior stays
+// consistent across the workspace (pooling, DNS cache, retries, etc.).
 use stream_download::http::HttpStream;
 use stream_download::http::reqwest::Client as ReqwestClient;
 use stream_download::http::reqwest::Url;
 use stream_download::source::{DecodeError, SourceStream, StreamMsg};
 
-/// Async HTTP resource downloader optimized for HLS use-cases.
+/// HTTP resource downloader for HLS downloads and segment streaming.
 ///
-/// Design goals:
-/// - Use `HttpStream` from `stream-download` for a shared client and streaming reads.
-/// - Support both "download fully" (playlists/keys) and streaming (media segments).
-/// - Provide cancellation via a `CancellationToken`.
-/// - Add bounded retries with exponential backoff for transient failures.
-///
-/// Notes:
-/// - `request_timeout` is treated as an *idle/progress* timeout for streaming reads.
-/// - A separate overall timeout bounds each single download attempt.
+/// Supports cancellation and bounded retries/backoff. `request_timeout` acts like a progress/idle timeout for streaming reads.
 #[derive(Debug, Clone)]
 pub struct ResourceDownloader {
     // Request / retry configuration.
@@ -47,13 +38,9 @@ pub struct ResourceDownloader {
 }
 
 impl ResourceDownloader {
-    // ----------------------------
     // Construction / configuration
-    // ----------------------------
 
-    /// Create a new downloader with the given configuration values.
-    ///
-    /// `cancel` is used by all network operations performed by this downloader.
+    /// Creates a new downloader.
     pub fn new(
         request_timeout: Duration,
         max_retries: u32,
@@ -71,7 +58,7 @@ impl ResourceDownloader {
         }
     }
 
-    /// Set optional headers to be sent with AES key fetch requests.
+    /// Sets optional headers used for AES key fetch requests.
     pub fn with_key_request_headers(
         mut self,
         headers: Option<std::collections::HashMap<String, String>>,
@@ -80,42 +67,31 @@ impl ResourceDownloader {
         self
     }
 
-    /// Access the cancellation token used by this downloader.
+    /// Returns the cancellation token used by this downloader.
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel
     }
 
-    // ----------------------------
     // Public API: full downloads
-    // ----------------------------
 
-    /// Download bytes from a URL into memory.
-    ///
-    /// Includes automatic retry with exponential backoff.
-    /// Always cancellable via the downloader's token.
+    /// Downloads a URL into memory (with retries and cancellation).
     pub async fn download_bytes(&self, url: &str) -> HlsResult<Bytes> {
         self.download_bytes_inner(url).await
     }
 
-    /// Download a playlist file fully into memory.
+    /// Downloads a playlist into memory.
     pub async fn download_playlist(&self, url: &str) -> HlsResult<Bytes> {
         self.download_bytes(url).await
     }
 
-    /// Download an encryption key fully into memory.
-    ///
-    /// If `key_request_headers` is set, those headers are attached to the request.
+    /// Downloads an encryption key into memory.
     pub async fn download_key(&self, url: &str) -> HlsResult<Bytes> {
         self.download_key_inner(url).await
     }
 
-    // ----------------------------
     // Public API: streaming segments
-    // ----------------------------
 
-    /// Open a streaming HTTP connection for a media segment.
-    ///
-    /// The returned stream yields `Bytes` chunks as they arrive.
+    /// Streams a media segment.
     pub async fn stream_segment(
         &self,
         url: &str,
@@ -126,9 +102,9 @@ impl ResourceDownloader {
         Ok(Self::map_stream_errors(url_str, http).boxed())
     }
 
-    /// Open a streaming HTTP connection for a media segment with a byte range.
+    /// Streams a media segment over a byte range (`start..end`, where `end` is exclusive).
     ///
-    /// `end` is exclusive (`start..end`). Pass `None` for an open-ended range.
+    /// Pass `None` for an open-ended range.
     pub async fn stream_segment_range(
         &self,
         url: &str,
@@ -426,24 +402,16 @@ impl ResourceDownloader {
     // Public API: metadata probes
     // ----------------------------
 
-    /// Probe the content length using a minimal range GET.
+    /// Best-effort content length probe.
     ///
-    /// Strategy:
-    /// 1) Attempt `Range: bytes=0-0` and parse `Content-Range` (`*/total` or `0-0/total`).
-    /// 2) If that fails, fall back to creating an `HttpStream` and reading `content_length()`
-    ///    from response metadata (without consuming the body).
-    ///
-    /// Notes:
-    /// - Not all servers support range requests.
-    /// - `Content-Length` in a `206` response typically reflects the *partial body size* (often `1`),
-    ///   so `Content-Range` is preferred when available.
+    /// Uses a minimal `Range: bytes=0-0` request when possible; otherwise falls back to response metadata.
     pub async fn probe_content_length(&self, url: &str) -> HlsResult<Option<u64>> {
         self.probe_content_length_inner(url, None).await
     }
 
     /// Cancellable variant of [`probe_content_length`].
     ///
-    /// The probe is cancelled if either the downloader token or `cancel` is cancelled.
+    /// Cancelled when either the downloader token or `cancel` is cancelled.
     pub async fn probe_content_length_cancellable(
         &self,
         url: &str,

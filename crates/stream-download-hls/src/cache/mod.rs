@@ -1,12 +1,7 @@
-//! Cache-related helpers for `stream-download-hls`.
+//! Cache helpers.
 //!
-//! This module contains filesystem-level primitives used to implement persistent caching policies
-//! (like LRU eviction) safely.
-//!
-//! In particular, we use a simple **lease file** mechanism to mark caches that are actively in use
-//! so that eviction does not delete directories for currently playing streams.
-//!
-//! It also centralizes HLS-specific cache key formatting for playlists and keys.
+//! This module contains cache-related primitives (e.g. leases) and key/layout helpers.
+//! High-level caching behavior is documented in `crates/stream-download-hls/README.md`.
 
 pub mod keys;
 pub mod lease;

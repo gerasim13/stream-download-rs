@@ -1,18 +1,9 @@
-//! Unified configuration for the `stream-download-hls` crate.
+//! Settings for `stream-download-hls`.
 //!
-//! This structure flattens all previously separate configuration structs
-//! into a single type, eliminating the need for `DownloaderConfig`,
-//! `HlsConfig`, `AbrConfig`, and `SelectionMode` across the crate.
+//! This crate uses a single settings struct (`HlsSettings`) that covers:
+//! URL resolution, variant selection, HTTP/retry behavior, live refresh, and ABR tuning.
 //!
-//! Included configuration domains:
-//! - HTTP downloader behavior (timeouts, retries, backoff)
-//! - Core HLS behavior (live refresh, retry timeout, key handling)
-//! - Adaptive Bitrate (ABR) behavior (hysteresis, safety, buffer thresholds)
-//! - Variant selection mode (manual vs. auto)
-//!
-//! Notes:
-//! - Manual selection is represented by `variant_stream_selector` callback returning `Some(id)`.
-//!   When it returns `None`, selection is AUTO (ABR-controlled).
+//! Field-level docs describe behavior and defaults.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,13 +16,7 @@ use url::Url;
 use crate::crypto::KeyProcessorCallback;
 use crate::parser::{MasterPlaylist, VariantId};
 
-/// Type alias for variant stream selector callback.
-///
-/// - Return `Some(VariantId)` to force MANUAL selection for that variant.
-/// - Return `None` to allow AUTO selection (ABR-controlled).
-///
-/// The callback receives the parsed master playlist so you can make an
-/// informed choice (bandwidth, codecs, resolution, etc.).
+/// Variant selection callback (return `Some(id)` for manual selection, or `None` for ABR).
 pub type VariantStreamSelector = dyn Fn(&MasterPlaylist) -> Option<VariantId> + Send + Sync;
 
 /// Unified settings for HLS streaming.
@@ -60,7 +45,7 @@ pub struct HlsSettings {
     pub variant_stream_selector: Option<Arc<Box<VariantStreamSelector>>>,
 
     // ----------------------------
-    // HTTP downloader (flattened from `DownloaderConfig`)
+    // HTTP downloader
     // ----------------------------
     /// Timeout for a single HTTP operation (e.g., creating the stream or collecting bytes).
     /// Default: 30 seconds.
@@ -79,7 +64,7 @@ pub struct HlsSettings {
     pub max_retry_delay: Duration,
 
     // ----------------------------
-    // Core HLS behavior (flattened from `HlsConfig`)
+    // Core HLS behavior
     // ----------------------------
     /// Optional override for how often live playlists should be refreshed.
     /// If not set, `#EXT-X-TARGETDURATION` should be used.
@@ -110,7 +95,7 @@ pub struct HlsSettings {
     pub key_request_headers: Option<HashMap<String, String>>,
 
     // ----------------------------
-    // ABR behavior (flattened from `AbrConfig`)
+    // ABR behavior
     // ----------------------------
     /// Minimum buffer (in seconds) above which the controller allows up-switching.
     /// Default: 0.0 (disabled gating).
@@ -147,13 +132,13 @@ impl Default for HlsSettings {
             // Variant selection defaults
             variant_stream_selector: None,
 
-            // Downloader defaults (from previous `DownloaderConfig::default`)
+            // Downloader defaults
             request_timeout: Duration::from_secs(30),
             max_retries: 3,
             retry_base_delay: Duration::from_millis(100),
             max_retry_delay: Duration::from_secs(5),
 
-            // HLS defaults (from previous `HlsConfig::default`)
+            // HLS defaults
             live_refresh_interval: None,
             retry_timeout: Duration::from_secs(5),
             #[cfg(feature = "aes-decrypt")]
@@ -164,7 +149,7 @@ impl Default for HlsSettings {
             key_request_headers: None,
             prefetch_buffer_size: 2,
 
-            // ABR defaults (from previous `AbrConfig::default`)
+            // ABR defaults
             abr_min_buffer_for_up_switch: 0.0,
             abr_down_switch_buffer: 3.0,
             abr_throughput_safety_factor: 0.8,
@@ -246,10 +231,7 @@ impl HlsSettings {
         self
     }
 
-    /// Set a variant selector callback.
-    ///
-    /// - Return `None` to allow AUTO selection (ABR-controlled).
-    /// - Return `Some(VariantId)` to force MANUAL selection for that variant.
+    /// Sets a variant selector callback (return `None` for AUTO, or `Some(id)` for MANUAL).
     pub fn variant_stream_selector(
         mut self,
         cb: impl Fn(&MasterPlaylist) -> Option<VariantId> + Send + Sync + 'static,

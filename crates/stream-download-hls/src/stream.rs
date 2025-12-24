@@ -1,26 +1,9 @@
-//! HLS implementation of the [`SourceStream`] trait.
+//! HLS [`SourceStream`] implementation.
 //!
-//! This module provides `HlsStream`, a `SourceStream` implementation for HLS streams.
-//! It handles playlist parsing, segment downloading, and adaptive bitrate switching.
+//! [`HlsStream`] spawns a background [`HlsStreamWorker`] and exposes ordered [`StreamMsg`] items
+//! (data + control). Chunk boundaries are emitted as `StreamControl` messages.
 //!
-//! The stream produces ordered [`StreamMsg`] items:
-//! - `StreamMsg::Data(Bytes)` for payload data
-//! - `StreamMsg::Control(StreamControl::...)` for ordered chunk boundaries and resources
-//!
-//! This ordering is the foundation for segmented storage (init/media segments in separate files)
-//! while still exposing a single contiguous `Read + Seek` view via a stitched reader.
-//!
-//! In addition, this stream reports a **best-effort segmented content length** via
-//! [`SourceStream::content_length`]. The segmented length snapshot is updated by the background
-//! worker as it emits `ChunkStart/ChunkEnd` boundaries.
-//!
-//! # Performance Considerations for Mobile Devices
-//!
-//! - Uses `Arc` for shared configuration to avoid deep cloning
-//! - Minimizes string allocations in hot paths
-//! - Uses bounded channels for backpressure control
-//! - Implements proper cancellation with `CancellationToken`
-//! - Avoids mutex in poll_next for better async performance
+//! Detailed architecture notes live in `crates/stream-download-hls/README.md`.
 
 use std::io;
 use std::pin::Pin;
@@ -41,37 +24,38 @@ use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 use url::Url;
 
-/// Events emitted by the HLS streaming pipeline (out-of-band metadata).
+/// Out-of-band events emitted by the HLS streaming pipeline.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
-    /// ABR: a new variant (rendition) has been selected. Emitted before the init segment.
+    /// Variant changed (emitted before init/media boundaries for the new variant).
     VariantChanged {
         variant_id: VariantId,
         codec_info: Option<CodecInfo>,
     },
-    /// Beginning of an init segment in the main byte stream.
-    /// byte_len may be None when exact length is unknown (e.g., due to DRM/middleware).
+    /// Init segment start.
+    /// `byte_len` may be `None` when the size is unknown.
     InitStart {
         variant_id: VariantId,
         codec_info: Option<CodecInfo>,
         byte_len: Option<u64>,
     },
-    /// End of the init segment in the main byte stream.
+    /// Init segment end.
     InitEnd { variant_id: VariantId },
-    /// Optional: media segment boundaries (useful for metrics).
+    /// Media segment start.
     SegmentStart {
         sequence: u64,
         variant_id: VariantId,
         byte_len: Option<u64>,
         duration: std::time::Duration,
     },
+    /// Media segment end.
     SegmentEnd {
         sequence: u64,
         variant_id: VariantId,
     },
 }
 
-/// Parameters for creating an HLS stream.
+/// Parameters for creating an [`HlsStream`].
 #[derive(Debug, Clone)]
 pub struct HlsStreamParams {
     /// The URL of the HLS master playlist.
@@ -79,14 +63,11 @@ pub struct HlsStreamParams {
     /// Unified settings for HLS playback and downloader behavior.
     pub settings: Arc<HlsSettings>,
     /// Storage handle used for read-before-fetch caching of playlists/keys.
-    ///
-    /// This is mandatory to ensure caching is actually enabled (otherwise the cached downloader
-    /// would be forced into "cache disabled" mode).
     pub storage_handle: StorageHandle,
 }
 
 impl HlsStreamParams {
-    /// Create new HLS stream parameters.
+    /// Creates stream parameters.
     pub fn new(
         url: Url,
         settings: impl Into<Arc<HlsSettings>>,
@@ -101,32 +82,23 @@ impl HlsStreamParams {
 }
 
 pub struct HlsStream {
-    /// Channel receiver for ordered stream messages (data + control).
+    /// Receiver for ordered stream messages (data + control).
     data_receiver: mpsc::Receiver<StreamMsg>,
-    /// Channel sender for seek commands to the streaming loop.
+    /// Sender for seek commands to the worker loop.
     seek_sender: mpsc::Sender<u64>,
-    /// Cancellation token for graceful shutdown.
+    /// Cancellation token for shutdown.
     cancel_token: CancellationToken,
-    /// Task handle for background streaming.
+    /// Background worker task handle.
     streaming_task: tokio::task::JoinHandle<()>,
-    /// Event broadcaster for out-of-band stream events.
+    /// Broadcaster for out-of-band stream events.
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
 
-    /// Best-effort snapshot of segmented content length, updated by the background worker.
-    ///
-    /// This allows `content_length()` to return `ContentLength::Segmented(...)` instead of
-    /// `Unknown`, improving progress reporting and seek planning.
+    /// Best-effort segmented length snapshot used by `content_length()`.
     segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
 }
 
 impl HlsStream {
-    /// Create a new HLS stream.
-    ///
-    /// # Arguments
-    /// * `url` - URL of the HLS master playlist
-    /// * `config` - HLS configuration
-    /// * `abr_config` - ABR configuration
-    /// * `selection_mode` - Selection mode for variants
+    /// Creates a new HLS stream (convenience wrapper around [`Self::new_with_config`]).
     pub async fn new(
         url: Url,
         settings: Arc<crate::HlsSettings>,
@@ -135,31 +107,27 @@ impl HlsStream {
         Self::new_with_config(url, settings, storage_handle).await
     }
 
-    /// Create a new HLS stream with custom downloader configuration.
+    /// Creates a new HLS stream and spawns a default [`HlsStreamWorker`].
     ///
-    /// This is the primary constructor used by `SourceStream::create`.
-    ///
-    /// Internally, it now delegates to `new_with_worker(...)` by constructing a default
-    /// `HlsStreamWorker` using `HlsStreamWorker::new(...)`.
+    /// This is the constructor used by `SourceStream::create`.
     pub async fn new_with_config(
         url: Url,
         settings: Arc<HlsSettings>,
         storage_handle: StorageHandle,
     ) -> Result<Self, HlsError> {
-        // Create channels for data and commands
-        // Use bounded channel for data to control backpressure with configurable buffer size
+        // Create channels for data and commands (bounded data channel provides backpressure).
         let buffer_size = settings.prefetch_buffer_size;
         let (data_sender, data_receiver) = mpsc::channel::<StreamMsg>(buffer_size);
         let (seek_sender, seek_receiver) = mpsc::channel(1);
         let cancel_token = CancellationToken::new();
 
-        // Create event broadcast channel (out-of-band metadata)
+        // Event broadcast channel (out-of-band metadata).
         let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(64);
 
         // Best-effort segmented length snapshot shared with `content_length()`.
         let segmented_length = Arc::new(std::sync::RwLock::new(SegmentedLength::default()));
 
-        // Stable-ish identifier used for persistent cache layout:
+        // Identifier used for persistent cache layout:
         // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
         let master_hash = master_hash_from_url(&url);
 
@@ -187,15 +155,9 @@ impl HlsStream {
         )
     }
 
-    /// Create an HLS stream by supplying a fully constructed worker.
+    /// Creates an HLS stream by supplying a fully constructed worker.
     ///
-    /// This is useful for tests/fixtures where you want to:
-    /// - provide a pre-built `HlsManager` / customized downloader,
-    /// - inject a pre-configured `HlsStreamWorker`,
-    /// - control initialization order deterministically.
-    ///
-    /// Important: the provided `worker` must be wired to the same `data_receiver`/`seek_sender`
-    /// channels and cancellation token passed here.
+    /// The provided `worker` must be wired to the channels and cancellation token passed here.
     pub fn new_with_worker(
         data_receiver: mpsc::Receiver<StreamMsg>,
         seek_sender: mpsc::Sender<u64>,
@@ -229,16 +191,12 @@ impl HlsStream {
         })
     }
 
-    /// Subscribe to out-of-band stream events (variant changes, init boundaries, etc).
+    /// Subscribes to out-of-band stream events.
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<StreamEvent> {
         self.event_sender.subscribe()
     }
 
-    /// Seek to a specific position in the stream.
-    ///
-    /// Position is an absolute byte offset from the beginning of the concatenated stream.
-    /// Supports forward and backward seeks. Backward seek will reset the internal controller
-    /// state and replay from the start using byte-range where possible.
+    /// Seeks to an absolute byte offset in the concatenated stream.
     #[inline(always)]
     async fn seek_internal(&self, position: u64) -> Result<(), HlsError> {
         self.seek_sender
@@ -251,10 +209,10 @@ impl HlsStream {
 
 impl Drop for HlsStream {
     fn drop(&mut self) {
-        // Cancel the streaming task
+        // Cancel the streaming task.
         self.cancel_token.cancel();
 
-        // Abort the task if it's still running
+        // Abort the task if it's still running.
         if !self.streaming_task.is_finished() {
             self.streaming_task.abort();
         }
@@ -270,8 +228,7 @@ impl SourceStream for HlsStream {
     }
 
     fn content_length(&self) -> ContentLength {
-        // Best-effort: if we have no segment boundaries yet, report Unknown to avoid a zero clamp
-        // before the worker has a chance to populate lengths.
+        // Best-effort: report `Unknown` until the worker observes at least one segment boundary.
         match self.segmented_length.read() {
             Ok(guard) => {
                 let has_lengths = guard

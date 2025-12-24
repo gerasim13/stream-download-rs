@@ -1,28 +1,10 @@
 #![allow(clippy::type_complexity)]
 //! Segmented storage provider for HLS.
 //!
-//! This module implements a `stream_download::storage::StorageProvider` wrapper that understands
-//! ordered [`StreamControl`](stream_download::source::StreamControl) messages emitted by an HLS
-//! [`SourceStream`](stream_download::source::SourceStream).
+//! Splits an ordered `StreamMsg` stream into per-chunk files using `StreamControl` boundaries and
+//! exposes a stitched `Read + Seek` view over the logical stream.
 //!
-//! The goal is to split the logical byte stream into **per-chunk** files (typically one init
-//! segment + many media segments), while still exposing a single contiguous `Read + Seek` view to
-//! decoders (e.g. Symphonia) via a virtual stitched reader.
-//!
-//! Design notes:
-//! - All segmentation is driven by **ordered** `StreamMsg::Control(StreamControl::...)` messages.
-//!   There is no separate channel for control vs data, so ordering is deterministic.
-//! - Each chunk is backed by a per-segment `StorageProvider` created by a factory.
-//! - Multiple logical streams are supported by `stream_key` (e.g. different variants/codecs).
-//! - Auxiliary resources (playlists, keys, etc.) can be stored via `StoreResource` and retrieved
-//!   via a tree-layout `StorageHandle` under `storage_root`.
-//!
-//! Important:
-//! - This is intentionally scoped to HLS for now. If later you want a generic segmented stream
-//!   facility, we can extract it into `stream-download`.
-//! - The writer is intentionally strict: **bytes must only be written after `ChunkStart`**.
-//!   If HLS emits data without an active chunk, we return an error to avoid corrupt outputs.
-
+//! Protocol constraint: bytes must only be written after `StreamControl::ChunkStart`.
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -41,18 +23,11 @@ use stream_download::storage::{
 };
 use tracing::trace;
 
-/// Factory for creating a fresh per-segment [`StorageProvider`] instance.
-///
-/// This is required for persistent caching with deterministic file layouts:
-/// a plain `P: StorageProvider` instance represents one backing resource, so we must be able to
-/// create a *new* provider for each segment based on (`stream_key`, `chunk_id`, `kind`, `filename_hint`).
+/// Factory for creating one [`StorageProvider`] per chunk.
 pub trait SegmentStorageFactory: Clone + Send + Sync + 'static {
     type Provider: StorageProvider + Send + 'static;
 
-    /// Create a storage provider for a specific segment.
-    ///
-    /// `chunk_id` is a monotonically increasing index within a `stream_key`.
-    /// `filename_hint` is an optional playlist-derived basename to use "as is".
+    /// Creates a storage provider for a specific chunk within `stream_key`.
     fn provider_for_segment(
         &self,
         stream_key: &ResourceKey,
@@ -62,14 +37,7 @@ pub trait SegmentStorageFactory: Clone + Send + Sync + 'static {
     ) -> io::Result<Self::Provider>;
 }
 
-/// A segmented storage provider.
-///
-/// Wraps a [`SegmentStorageFactory`] and orchestrates per-chunk inner providers based on
-/// `StreamControl`.
-///
-/// - A fresh `F::Provider` is created per chunk via the factory.
-/// - Each chunk gets its own `(Reader, Writer)` pair.
-/// - A `SegmentedReader` stitches chunks for a chosen `stream_key`.
+/// Segmented storage provider driven by `StreamControl` boundaries.
 #[derive(Clone)]
 pub struct SegmentedStorageProvider<F>
 where
@@ -86,13 +54,9 @@ impl<F> SegmentedStorageProvider<F>
 where
     F: SegmentStorageFactory,
 {
-    /// Create a new segmented storage provider that uses `factory` to create a fresh inner provider
-    /// for each chunk.
+    /// Creates a segmented storage provider that uses `factory` to create one inner provider per chunk.
     ///
-    /// `storage_root` is mandatory to prevent silent cache root mismatches between:
-    /// - segment files (file-tree layout),
-    /// - eviction/lease state,
-    /// - `StoreResource` persisted blobs and `StorageHandle` reads.
+    /// `storage_root` is used for `StoreResource` blobs and the tree-layout `StorageHandle`.
     pub fn new(factory: F, storage_root: impl Into<PathBuf>) -> Self {
         Self {
             factory,
@@ -101,12 +65,7 @@ where
         }
     }
 
-    /// One-shot constructor for persistent HLS caching that wires **one** `storage_root` across:
-    /// - the file-tree segment layout factory,
-    /// - the HLS cache policy layer (leases + eviction),
-    /// - the segmented storage provider (resources + `StorageHandle`).
-    ///
-    /// This avoids accidental root mismatches between the three components.
+    /// Convenience constructor for persistent HLS caching under a single `storage_root`.
     pub fn new_hls_file_tree(
         storage_root: impl Into<PathBuf>,
         prefetch_bytes: NonZeroUsize,
@@ -115,7 +74,7 @@ where
     {
         let storage_root: PathBuf = storage_root.into();
 
-        // Best-effort ensure the root exists up front so later storage ops don't fail on missing dirs.
+        // Best-effort ensure the root exists up front.
         let _ = fs::create_dir_all(&storage_root);
 
         let file_tree =
@@ -481,9 +440,7 @@ where
 }
 
 /// Writer that orchestrates per-chunk writers via ordered `StreamControl` messages.
-/// Actual bytes are written to the current chunk's inner writer.
-///
-/// This implements `StorageWriter::control` to receive chunk boundaries and resources.
+/// Implements `StorageWriter::control` to receive chunk boundaries and resources.
 pub struct SegmentedWriter<F>
 where
     F: SegmentStorageFactory,

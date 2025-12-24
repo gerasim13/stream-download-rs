@@ -1,48 +1,16 @@
-//! HLS cache key utilities.
+//! HLS cache key helpers.
 //!
-//! This module centralizes the construction of [`ResourceKey`](stream_download::source::ResourceKey)
-//! values used for caching **small resources** (playlists and encryption keys) in the persistent
-//! on-disk storage.
+//! This module constructs [`ResourceKey`](stream_download::source::ResourceKey) values for caching
+//! small resources (playlists and encryption keys).
 //!
-//! Why this exists
-//! ---------------
-//! You want **minimal changes** in `HlsManager`: it should not be littered with string formatting
-//! details and on-disk layout rules.
+//! It does not perform I/O; it only derives deterministic keys from:
+//! - a master identifier (`master_hash_from_url`),
+//! - a `VariantId` (for variant-scoped keys),
+//! - and a URL/basename (query string is ignored when extracting basenames).
 //!
-//! Instead, all HLS-specific cache key formatting lives here (or in the cached downloader layer),
-//! and the manager only passes in the inputs it naturally has:
-//! - `master_hash`
-//! - `variant_id`
-//! - resource URL (or sometimes just the basename if already extracted)
-//!
-//! Agreed on-disk layout
-//! ---------------------
-//! - Playlists (master + variant): stored at
-//!   `storage_root/<master_hash>/<playlist_basename>`
-//!   and addressed by `ResourceKey("<master_hash>/<playlist_basename>")`.
-//!
-//! - Keys (variant-scoped): stored at
-//!   `storage_root/<master_hash>/<variant_id>/<key_basename>`
-//!   and addressed by `ResourceKey("<master_hash>/<variant_id>/<key_basename>")`.
-//!
-//! Notes
-//! -----
-//! - The basename is taken from the resource URI, with the query (`?`) stripped.
-//! - We do **not** synthesize extensions. If the URI has no extension, we keep it that way.
-//! - These keys are later mapped to disk paths by a tree-layout storage handle, which sanitizes
-//!   components to prevent traversal.
-//!
-//! This module does **not** perform any IO.
-//!
-//! Logging
-//! -------
-//! This module emits `trace` logs when it successfully derives basenames / keys (or fails to),
-//! to help debug cache key mapping issues.
-//!
-//! Deterministic master hash
-//! -------------------------
-//! The `master_hash_from_url` helper lives here because it is part of the deterministic
-//! on-disk layout and cache key strategy used throughout the crate.
+//! Key formats used by this module:
+//! - playlists: `"<master_hash>/<playlist_basename>"`
+//! - keys:      `"<master_hash>/<variant_id>/<key_basename>"`
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -53,32 +21,18 @@ use crate::parser::VariantId;
 
 use tracing::trace;
 
-/// Compute a stable identifier for an HLS "stream" based on the master playlist URL.
+/// Computes a deterministic identifier for a stream from the master playlist URL.
 ///
-/// This is used as the `<master_hash>` component in the persistent cache layout:
-/// `<cache_root>/<master_hash>/<variant_id>/<segment_basename>`.
-///
-/// Notes:
-/// - This is stable within a given build/toolchain, but not guaranteed to be stable across
-///   Rust versions because it relies on the standard library hasher.
-/// - If you need cross-version stability, replace this with a fixed hash function (e.g. SHA-256).
+/// Note: uses the standard library hasher, so the result is not guaranteed to be stable across Rust versions.
 pub fn master_hash_from_url(url: &url::Url) -> String {
     let mut hasher = DefaultHasher::new();
     url.as_str().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
-/// Best-effort basename extraction for a URI-like string.
+/// Extracts the basename from a URI-like string, ignoring the query string.
 ///
-/// Behavior:
-/// - strips query part (anything after `?`)
-/// - takes substring after the last `/`
-/// - returns `None` if result is empty
-///
-/// Examples:
-/// - `"https://a/b/master.m3u8?token=1"` -> `Some("master.m3u8")`
-/// - `"seg-001.ts"` -> `Some("seg-001.ts")`
-/// - `"https://a/b/"` -> `None`
+/// Returns `None` if no basename can be derived.
 pub fn uri_basename_no_query(uri: &str) -> Option<&str> {
     let no_query = uri.split('?').next().unwrap_or(uri);
     let base = no_query.rsplit('/').next().unwrap_or(no_query);
@@ -92,12 +46,9 @@ pub fn uri_basename_no_query(uri: &str) -> Option<&str> {
     out
 }
 
-/// Construct a playlist cache key (master or variant) given a URL string.
+/// Constructs a playlist cache key from a URL: `"<master_hash>/<playlist_basename>"`.
 ///
-/// Key format:
-/// - `"<master_hash>/<playlist_basename>"`
-///
-/// Returns `None` if the URL does not have a usable basename.
+/// Returns `None` if no basename can be derived.
 pub fn playlist_key_from_url(master_hash: &str, playlist_url: &str) -> Option<ResourceKey> {
     let basename = uri_basename_no_query(playlist_url)?;
     let key = playlist_key_from_basename(master_hash, basename);
@@ -108,10 +59,7 @@ pub fn playlist_key_from_url(master_hash: &str, playlist_url: &str) -> Option<Re
     Some(key)
 }
 
-/// Construct a playlist cache key (master or variant) given a basename.
-///
-/// Key format:
-/// - `"<master_hash>/<playlist_basename>"`
+/// Constructs a playlist cache key from a basename: `"<master_hash>/<playlist_basename>"`.
 #[inline]
 pub fn playlist_key_from_basename(master_hash: &str, playlist_basename: &str) -> ResourceKey {
     // Keep it allocation-friendly: allocate one String once.
@@ -123,12 +71,9 @@ pub fn playlist_key_from_basename(master_hash: &str, playlist_basename: &str) ->
     key
 }
 
-/// Construct a variant-scoped key cache key given a URL string.
+/// Constructs a variant-scoped key cache key from a URL: `"<master_hash>/<variant_id>/<key_basename>"`.
 ///
-/// Key format:
-/// - `"<master_hash>/<variant_id>/<key_basename>"`
-///
-/// Returns `None` if the URL does not have a usable basename.
+/// Returns `None` if no basename can be derived.
 pub fn key_key_from_url(
     master_hash: &str,
     variant_id: VariantId,
@@ -143,10 +88,7 @@ pub fn key_key_from_url(
     Some(key)
 }
 
-/// Construct a variant-scoped key cache key given a basename.
-///
-/// Key format:
-/// - `"<master_hash>/<variant_id>/<key_basename>"`
+/// Constructs a variant-scoped key cache key from a basename: `"<master_hash>/<variant_id>/<key_basename>"`.
 #[inline]
 pub fn key_key_from_basename(
     master_hash: &str,

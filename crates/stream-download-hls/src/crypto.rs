@@ -1,27 +1,13 @@
-//! Streaming middleware abstractions for transforming segment byte streams.
+//! Encryption/decryption helpers (feature-gated).
 //!
-//! This module introduces a simple `StreamMiddleware` trait that can wrap a
-//! stream of `Bytes` and produce a transformed stream. Typical use-cases:
-//! - DRM/decryption (e.g., AES-128-CBC) applied transparently to segment data
-//! - Re-chunking or alignment fixes
-//! - Tag parsing/stripping
-//!
-//! Design goals:
-//! - Minimal API surface: a single trait operating on a boxed stream type.
-//! - Composability: a helper to apply a chain of middlewares.
-//! - Zero-copy-friendly: keep `bytes::Bytes` as the unit of data.
-//!
-//! Notes:
-//! - The middleware trait intentionally works with a boxed stream to keep the
-//!   object-safe trait simple and ergonomic to use from `HlsStream`.
-//! - All errors are mapped to `HlsError` to keep error handling consistent.
+//! Provides AES-128-CBC decryption middleware and related types behind the `aes-decrypt` feature.
+//! High-level usage notes live in `crates/stream-download-hls/README.md`.
 
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
 use bytes::Bytes;
 
-/// Callback type used to transform raw key bytes fetched from a key server
-/// before they are used for decryption. This allows custom key wrapping/DRM flows.
+/// Transforms raw key bytes fetched from a key server before they are used for decryption.
 pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
 
 use aes::Aes128;
@@ -35,10 +21,9 @@ use tracing::trace;
 
 use crate::manager::StreamMiddleware;
 
-/// AES-128-CBC middleware with streaming decryption.
+/// AES-128-CBC decrypt middleware.
 ///
-/// Performs block-wise decryption and holds back the last block of the stream
-/// to properly remove PKCS#7 padding at the end.
+/// Note: buffers the whole segment and decrypts once at the end to remove PKCS#7 padding.
 #[derive(Clone)]
 pub struct Aes128CbcMiddleware {
     key: [u8; 16],

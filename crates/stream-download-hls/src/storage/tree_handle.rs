@@ -1,26 +1,8 @@
-//! Tree-layout storage handle for persisted HLS resources.
+//! Tree-layout reader for small persisted resources.
 //!
-//! This implements a `stream_download::storage::StorageResourceReader` that maps `ResourceKey`
-//! directly to a file path under a configured `storage_root`.
-//!
-//! Mapping rules
-//! ------------
-//! - `ResourceKey` is treated as a relative path (slash-separated components).
-//! - Each component is sanitized to prevent path traversal and weird filesystem edge cases.
-//! - The final path is `storage_root / sanitized_components...`.
-//!
-//! This is intentionally simple and index-free: existence of the file on disk is the cache.
-//!
-//! Intended usage
-//! --------------
-//! - HLS manager/downloader cache layer calls `handle.read(&key)` before going to the network.
-//! - On cache hit, it can use the returned bytes (e.g. for playlists/keys).
-//!
-//! Notes
-//! -----
-//! - This is designed for small resources (playlists/keys). It reads the entire file into memory.
-//! - For segments (large), the segmented storage reader path is preferred (streamed `Read+Seek`).
-//! - This is best-effort: missing/empty files are treated as cache miss (`Ok(None)`).
+//! Maps a [`ResourceKey`] to a sanitized relative path under `storage_root`.
+//! Intended for small blobs (e.g. playlists/keys): reads the whole file into memory.
+//! Missing/empty files are treated as cache misses (`Ok(None)`).
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -31,31 +13,26 @@ use bytes::Bytes;
 use stream_download::source::ResourceKey;
 use stream_download::storage::{StorageHandle, StorageResourceReader};
 
-/// A tree-layout resource reader rooted at `storage_root`.
+/// Tree-layout resource reader rooted at `storage_root`.
 #[derive(Clone, Debug)]
 pub struct TreeStorageResourceReader {
     storage_root: PathBuf,
 }
 
 impl TreeStorageResourceReader {
-    /// Create a new tree-layout reader rooted at `storage_root`.
+    /// Creates a new tree-layout reader rooted at `storage_root`.
     pub fn new(storage_root: impl Into<PathBuf>) -> Self {
         Self {
             storage_root: storage_root.into(),
         }
     }
 
-    /// Create a `StorageHandle` for this reader.
+    /// Creates a `StorageHandle` for this reader.
     pub fn into_handle(self) -> StorageHandle {
         StorageHandle::new(Arc::new(self))
     }
 
-    /// Convert a `ResourceKey` into an on-disk path under `storage_root`.
-    ///
-    /// This function:
-    /// - splits key by `/`
-    /// - sanitizes each component
-    /// - joins them under `storage_root`
+    /// Converts a [`ResourceKey`] into an on-disk path under `storage_root`.
     pub fn path_for_key(&self, key: &ResourceKey) -> PathBuf {
         let mut out = self.storage_root.clone();
 

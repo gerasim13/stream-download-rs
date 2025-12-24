@@ -1,29 +1,7 @@
-//! Built-in HLS storage layout helpers.
+//! HLS file-tree segment storage factory.
 //!
-//! This module provides a production-oriented segment storage factory that implements a
-//! per-segment **file tree layout** rooted at a single `storage_root` directory.
-//!
-//! Target layout (segments):
-//! `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-//!
-//! Important note about `stream_key`:
-//! - The segmented orchestrator only knows about `stream_key` and `chunk_id`.
-//! - “Master playlist hash” and variant id are HLS-level concepts.
-//! - To keep the storage orchestrator protocol-agnostic, this factory expects that the HLS layer
-//!   encodes `stream_key` as `"<master_hash>/<variant_id>"`.
-//!
-//! Important note about filenames/extensions:
-//! - Segment filenames (and their extensions) must come from the playlist URIs.
-//! - Do NOT synthesize extensions based on `ChunkKind`.
-//! - If the playlist URI has no extension, the cached file should also have no extension.
-//!
-//! This factory supports an optional `filename_hint` (playlist-derived basename, query ignored).
-//! If present, it is used "as is" as the segment filename (no extension inference).
-//! If absent (or empty), we return an error to surface the bug immediately.
-//!
-//! NOTE:
-//! - Eviction / leases / LRU policy are implemented in the cache layer wrapper (`HlsCacheLayer`).
-//!   This file-tree factory is intentionally "dumb": it only maps a segment to a deterministic path.
+//! Maps each segment to a deterministic path under `storage_root` and requires `stream_key` to be
+//! `"<master_hash>/<variant_id>"`.
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -35,13 +13,9 @@ use stream_download::storage::file::FileStorageProvider;
 
 use crate::storage::SegmentStorageFactory;
 
-/// Built-in HLS segment storage factory that writes each segment to its own file.
+/// Writes each segment to its own file under `storage_root`.
 ///
-/// Expected `stream_key` convention:
-/// - `"<master_hash>/<variant_id>"`
-///
-/// Where `master_hash` is a stable identifier derived from the *master playlist URL*
-/// (not from each individual segment URL).
+/// Requires `stream_key` to be `"<master_hash>/<variant_id>"`.
 #[derive(Clone, Debug)]
 pub struct HlsFileTreeSegmentFactory {
     storage_root: PathBuf,

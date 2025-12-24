@@ -1,7 +1,6 @@
-//! Playlist parser module.
+//! Playlist parsing.
 //!
-//! Adapter around the `hls_m3u8` crate that converts parsed playlists
-//! into crate-level types.
+//! Thin adapter over `hls_m3u8` that converts parsed playlists into crate-level types.
 
 use std::time::Duration;
 
@@ -13,11 +12,11 @@ use hls_m3u8::types::DecryptionKey as HlsDecryptionKey;
 
 use crate::error::{HlsError, HlsResult};
 
-/// Uniquely identifies a variant within a master playlist.
+/// Identifies a variant within a parsed master playlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VariantId(pub usize);
 
-/// Supported container formats for a variant or segment.
+/// Container format information (best-effort).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerFormat {
     /// MPEG-2 Transport Stream.
@@ -28,7 +27,7 @@ pub enum ContainerFormat {
     Other,
 }
 
-/// Basic codec and format information extracted from playlist attributes.
+/// Codec/container information extracted from playlist attributes (best-effort).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodecInfo {
     /// The raw `CODECS="..."` string from the playlist.
@@ -40,10 +39,13 @@ pub struct CodecInfo {
     pub container: Option<ContainerFormat>,
 }
 
-/// Supported HLS encryption methods.
+/// Supported HLS encryption methods (as parsed from playlists).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncryptionMethod {
-    /// No encryption (`METHOD=NONE`).
+    /// No encryption.
+    ///
+    /// Note: some parsers represent "no encryption" by the absence of `#EXT-X-KEY` rather than an
+    /// explicit `METHOD=NONE` value.
     None,
     /// AES-128 CBC encryption of the whole segment.
     Aes128,
@@ -53,7 +55,7 @@ pub enum EncryptionMethod {
     Other(String),
 }
 
-/// Represents a single `#EXT-X-KEY` entry from a media playlist.
+/// A parsed `#EXT-X-KEY` (playlist-level metadata).
 #[derive(Debug, Clone)]
 pub struct KeyInfo {
     /// The encryption method to be used.
@@ -68,27 +70,26 @@ pub struct KeyInfo {
     pub key_format_versions: Option<String>,
 }
 
-/// The effective encryption key applicable to a specific segment.
+/// The effective encryption key for a specific segment.
 #[derive(Debug, Clone)]
 pub struct SegmentKey {
     /// The encryption method that applies to this segment.
     pub method: EncryptionMethod,
-    /// A reference to the full key information. This allows the player to
-    /// fetch the key from the URI if needed.
+    /// Full key information (if available).
     pub key_info: Option<KeyInfo>,
 }
 
-/// Basic representation of a master playlist.
+/// Parsed master playlist.
 #[derive(Debug, Clone)]
 pub struct MasterPlaylist {
     /// List of available variants (renditions).
     pub variants: Vec<VariantStream>,
 }
 
-/// One `#EXT-X-STREAM-INF` entry in the master playlist.
+/// One variant stream entry from a master playlist.
 #[derive(Debug, Clone)]
 pub struct VariantStream {
-    /// A unique identifier for this variant within the context of its master playlist.
+    /// Variant identifier (stable for this parsed master playlist).
     pub id: VariantId,
     /// Absolute or relative URL of the media playlist for this variant.
     pub uri: String,
@@ -100,7 +101,7 @@ pub struct VariantStream {
     pub codec: Option<CodecInfo>,
 }
 
-/// Basic representation of a media playlist (VOD or live).
+/// Parsed init segment information (for fMP4 streams).
 #[derive(Debug, Clone)]
 pub struct InitSegment {
     /// URL of the initialization segment (absolute or relative to playlist URI).
@@ -121,12 +122,13 @@ pub struct MediaPlaylist {
     pub media_sequence: u64,
     /// Whether the playlist is finished (VOD or live that ended).
     pub end_list: bool,
-    /// The last seen `#EXT-X-KEY` for this playlist. This applies to all
-    /// subsequent segments until a new key tag is encountered.
+    /// Informational: the first key found in the playlist (if any).
+    ///
+    /// Per-segment effective keys are stored on each [`MediaSegment`] via [`MediaSegment::key`].
     pub current_key: Option<KeyInfo>,
 }
 
-/// One `#EXTINF` (media segment) entry.
+/// One media segment entry.
 #[derive(Debug, Clone)]
 pub struct MediaSegment {
     /// Sequence number of the segment (media-sequence + index in playlist).
@@ -141,7 +143,7 @@ pub struct MediaSegment {
     pub key: Option<SegmentKey>,
 }
 
-/// Parse a master playlist (M3U8) into a [`MasterPlaylist`].
+/// Parses a master playlist (M3U8) into [`MasterPlaylist`].
 pub fn parse_master_playlist(data: &[u8]) -> HlsResult<MasterPlaylist> {
     let input = std::str::from_utf8(data).map_err(HlsError::playlist_utf8)?;
     let hls_master = HlsMasterPlaylist::try_from(input)
@@ -187,7 +189,7 @@ pub fn parse_master_playlist(data: &[u8]) -> HlsResult<MasterPlaylist> {
     Ok(MasterPlaylist { variants })
 }
 
-/// Parse a media playlist (M3U8) into a [`MediaPlaylist`].
+/// Parses a media playlist (M3U8) into [`MediaPlaylist`].
 pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<MediaPlaylist> {
     let input = std::str::from_utf8(data).map_err(HlsError::playlist_utf8)?;
     let hls_media = HlsMediaPlaylist::try_from(input)
@@ -196,14 +198,14 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
 
     let target_duration = Some(hls_media.target_duration);
     let media_sequence = hls_media.media_sequence as u64;
-    // Derive end-of-stream strictly from presence of the EXT-X-ENDLIST tag.
+    // Treat `#EXT-X-ENDLIST` as the only reliable end-of-stream marker.
     // Some servers set Playlist-Type=VOD or EVENT without a terminal ENDLIST.
     let end_list = input.contains("#EXT-X-ENDLIST");
 
     // Map hls_m3u8 encryption method -> crate method.
     //
-    // Note: in hls_m3u8 v0.4.x there is no explicit `EncryptionMethod::None` variant.
-    // Absence of `#EXT-X-KEY` is represented by having no key at all, not by a "NONE" method.
+    // Important: absence of `#EXT-X-KEY` is represented by having no key at all, not by a "NONE"
+    // method in the parsed segment metadata.
     fn map_encryption_method(m: &hls_m3u8::types::EncryptionMethod) -> EncryptionMethod {
         match m {
             hls_m3u8::types::EncryptionMethod::Aes128 => EncryptionMethod::Aes128,
@@ -239,9 +241,7 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
 
     // Build segments and attach the effective key for each segment.
     //
-    // Crucial detail (matches your working implementation):
-    // `Decryptable::keys()` returns the *effective* key for a segment after applying EXT-X-KEY
-    // propagation logic.
+    // `Decryptable::keys()` returns the effective key after applying `#EXT-X-KEY` propagation.
     let segments = hls_media
         .segments
         .iter()

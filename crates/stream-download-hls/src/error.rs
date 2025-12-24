@@ -1,20 +1,9 @@
-//! Unified crate-level error types.
+//! Crate error type.
 //!
-//! This module provides a single [`HlsError`] type used across the crate and a
-//! convenient [`HlsResult`] alias.
+//! This module defines [`HlsError`] and the [`HlsResult`] alias used across the crate.
 //!
-//! Rationale
-//! ---------
-//! Historically this crate had two error layers:
-//! - `HlsError` (playlist/parser/downloader level)
-//! - `HlsStreamError` (stream/worker level, implementing `DecodeError`)
-//!
-//! These overlapped (`Cancelled`, IO-ish failures) and required wrapper enums.
-//! The crate now uses a single error type that can be returned from both the
-//! playlist/manager layers and the `SourceStream` implementation.
-//!
-//! Note: this error type intentionally remains small and string-based in some
-//! variants to avoid pulling concrete HTTP client error types into the public API.
+//! Implementation note: some variants are string-based to avoid exposing a specific HTTP client
+//! error type in the public API.
 
 use std::io;
 
@@ -152,16 +141,11 @@ impl HlsError {
     }
 
     /// Convenience helper to create `HlsError::Io` with kind `Other`.
-    ///
-    /// Use this when you only have a displayable message and no real `io::Error`.
     pub fn io(msg: impl Into<String>) -> Self {
         HlsError::io_kind(io::ErrorKind::Other, msg)
     }
 
     /// HTTP stream creation failed (mapped as an `Other` IO error).
-    ///
-    /// Intended for call-sites that decode an upstream error into a string:
-    /// `Err(HlsError::http_stream_create_failed(msg))`
     pub fn http_stream_create_failed(msg: impl Into<String>) -> Self {
         HlsError::io(format!("HTTP stream creation failed: {}", msg.into()))
     }
@@ -174,9 +158,7 @@ impl HlsError {
         ))
     }
 
-    /// Parse a URL-like string failed (mapped as an `InvalidInput` IO error).
-    ///
-    /// Intended for call-sites like: `Url::parse(...).map_err(HlsError::url_parse)?;`
+    /// URL parse error (mapped as an `InvalidInput` I/O error).
     pub fn url_parse(e: url::ParseError) -> Self {
         HlsError::io_kind(
             std::io::ErrorKind::InvalidInput,
@@ -184,9 +166,7 @@ impl HlsError {
         )
     }
 
-    /// Parsing a base URL failed (mapped as an `InvalidInput` IO error).
-    ///
-    /// Intended for call-sites like: `Url::parse(base).map_err(HlsError::base_url_parse)?;`
+    /// Base URL parse error (mapped as an `InvalidInput` I/O error).
     pub fn base_url_parse(e: url::ParseError) -> Self {
         HlsError::io_kind(
             std::io::ErrorKind::InvalidInput,
@@ -194,9 +174,7 @@ impl HlsError {
         )
     }
 
-    /// Joining a relative URL against a base failed (mapped as an `InvalidInput` IO error).
-    ///
-    /// Intended for call-sites like: `base.join(rel).map_err(HlsError::url_join)?;`
+    /// URL join error (mapped as an `InvalidInput` I/O error).
     pub fn url_join(e: url::ParseError) -> Self {
         HlsError::io_kind(
             std::io::ErrorKind::InvalidInput,
@@ -205,16 +183,11 @@ impl HlsError {
     }
 
     /// Invalid UTF-8 inside a playlist body.
-    ///
-    /// Intended for call-sites like: `from_utf8(...).map_err(HlsError::playlist_utf8)?;`
     pub fn playlist_utf8(e: std::str::Utf8Error) -> Self {
         HlsError::invalid_playlist(format!("invalid UTF-8: {e}"))
     }
 
     /// Playlist parse error coming from `hls_m3u8`.
-    ///
-    /// Intended for call-sites like:
-    /// `HlsMasterPlaylist::try_from(...).map_err(HlsError::playlist_parse)?;`
     pub fn playlist_parse<E>(e: E) -> Self
     where
         E: std::fmt::Display,

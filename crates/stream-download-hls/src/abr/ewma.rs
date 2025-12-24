@@ -1,8 +1,8 @@
-/// Exponentially-weighted moving average.
+/// Exponentially-weighted moving average (EWMA).
 ///
-/// Average considering a "weight" for each estimates and prioritizing the last samples added.
-/// This is useful in media streaming where you want to calculate a continuous bandwidth
-/// average, while putting more importance to the last loaded data.
+/// Maintains a weighted moving average that emphasizes recent samples.
+/// Useful for estimating bandwidth in streaming scenarios, where newer measurements should have
+/// more influence than older ones.
 #[derive(Debug)]
 pub(crate) struct Ewma {
     alpha: f64,
@@ -11,7 +11,7 @@ pub(crate) struct Ewma {
 }
 
 impl Ewma {
-    /// Creates a new Ewma with the given "half life", in seconds.
+    /// Creates a new EWMA with the given half-life (in seconds).
     pub(crate) fn new(half_life: u32) -> Self {
         Self {
             alpha: f64::exp(0.5f64.ln() / f64::from(half_life)),
@@ -20,8 +20,10 @@ impl Ewma {
         }
     }
 
-    /// Adds new sample to the `Ewma` where `val` is the value to add and `weight` is its...
-    /// weight.
+    /// Adds a new sample.
+    ///
+    /// `val` is the observed value and `weight` controls how much time/importance this sample
+    /// represents (for example, duration in seconds).
     pub(crate) fn add_sample(&mut self, weight: f64, val: f64) {
         let adj_alpha = self.alpha.powf(weight);
         let new_estimate = val * (1. - adj_alpha) + adj_alpha * self.last_estimate;
@@ -29,7 +31,7 @@ impl Ewma {
         self.total_weight += weight;
     }
 
-    /// Get the current estimate produced by the `Ewma`.
+    /// Returns the current estimate produced by the `Ewma`.
     ///
     /// Returns `0.` if it cannot produce an estimate yet.
     pub(crate) fn get_estimate(&self) -> f64 {

@@ -1,10 +1,7 @@
-//! Storage utilities for HLS segmented downloads.
+//! Segmented storage helpers.
 //!
-//! This module groups:
-//! - the segmented storage provider (`segmented`),
-//! - filesystem-backed HLS factories (`hls_factory`),
-//! - cache policy layer for segment eviction/leases (`cache_layer`),
-//! - read-only tree handle for small resources (`tree_handle`).
+//! This module provides the segmented storage provider plus the HLS-specific factories/layers.
+//! High-level storage/caching notes live in `crates/stream-download-hls/README.md`.
 
 mod segmented;
 

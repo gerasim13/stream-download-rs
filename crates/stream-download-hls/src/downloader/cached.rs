@@ -1,32 +1,7 @@
-//! Cached downloader wrapper for HLS playlists and keys.
+//! Cached downloader for small HLS resources.
 //!
-//! This module provides a thin wrapper around [`crate::downloader::ResourceDownloader`] that
-//! performs **read-before-fetch** caching using a [`stream_download::storage::StorageHandle`].
-//!
-//! Scope
-//! -----
-//! - Playlists (`.m3u8`) are cached as full blobs.
-//! - Encryption keys are cached as full blobs.
-//! - Segments are **not** cached via this layer (they are handled by segmented storage).
-//!
-//! Storage mapping
-//! ---------------
-//! The cache is addressed by [`stream_download::source::ResourceKey`]. This wrapper is intentionally
-//! dumb: it treats the key as an opaque identifier and delegates lookup to `StorageHandle`.
-//!
-//! The HLS crate should construct keys according to its agreed tree layout, for example:
-//! - playlists: `"<master_hash>/<playlist_basename>"`
-//! - keys:      `"<master_hash>/<variant_id>/<key_basename>"`
-//!
-//! Notes
-//! -----
-//! - Cache behavior is "simplest possible": if present, use it; otherwise download and return.
-//! - This wrapper does **not** write to cache. Persisting downloaded bytes is done by higher layers
-//!   (e.g. via `StreamControl::StoreResource` handled by the storage provider).
-//! - Cache read errors are treated as cache misses by default (best-effort).
-//! - Cached methods return [`CachedBytes`] so callers can decide whether to persist via `StoreResource`
-//!   only on network misses.
-//! - This module emits `trace` logs for cache hits/misses and cache read errors.
+//! Provides optional read-before-fetch behavior via a `StorageHandle` and returns [`CachedBytes`]
+//! tagged with [`CacheSource`].
 
 use bytes::Bytes;
 use stream_download::source::ResourceKey;
@@ -36,34 +11,35 @@ use crate::downloader::ResourceDownloader;
 use crate::error::{HlsError, HlsResult};
 use tracing::trace;
 
-/// Where the returned bytes came from.
+/// Where returned bytes came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheSource {
-    /// The bytes were read from the storage handle (cache hit).
+    /// Read from `StorageHandle` (cache hit).
     Cache,
-    /// The bytes were downloaded from the network (cache miss).
+    /// Downloaded from the network (cache miss).
     Network,
 }
 
-/// Bytes returned by a cached downloader method, with metadata describing the source.
+/// Bytes returned by a cached method.
 #[derive(Clone, Debug)]
 pub struct CachedBytes {
     pub bytes: Bytes,
     pub source: CacheSource,
 }
 
-/// A downloader wrapper that can read playlists and keys from a `StorageHandle` before hitting the network.
+/// Cached wrapper for [`ResourceDownloader`].
+///
+/// If a `StorageHandle` is configured, reads from cache first; otherwise downloads from the network.
 #[derive(Clone, Debug)]
 pub struct CachedResourceDownloader {
     inner: ResourceDownloader,
     handle: Option<StorageHandle>,
-    /// If true, any cache read IO error is treated as a cache miss.
-    /// If false, cache read errors are returned to the caller.
+    /// If true, cache read errors are treated as misses; otherwise they are returned.
     best_effort_cache: bool,
 }
 
 impl CachedResourceDownloader {
-    /// Create a new cached downloader wrapper.
+    /// Creates a cached downloader wrapper.
     pub fn new(inner: ResourceDownloader, handle: Option<StorageHandle>) -> Self {
         Self {
             inner,
@@ -72,34 +48,34 @@ impl CachedResourceDownloader {
         }
     }
 
-    /// Convenience: create a cached downloader with cache disabled.
+    /// Creates a wrapper with caching disabled.
     pub fn new_uncached(inner: ResourceDownloader) -> Self {
         Self::new(inner, None)
     }
 
-    /// Set whether cache read errors should be ignored (treated as miss) or surfaced.
+    /// Controls whether cache read errors are treated as misses.
     pub fn with_best_effort_cache(mut self, enabled: bool) -> Self {
         self.best_effort_cache = enabled;
         self
     }
 
-    /// Access the wrapped downloader.
+    /// Returns the wrapped downloader.
     pub fn inner(&self) -> &ResourceDownloader {
         &self.inner
     }
 
-    /// Mutable access to the wrapped downloader.
+    /// Returns mutable access to the wrapped downloader.
     pub fn inner_mut(&mut self) -> &mut ResourceDownloader {
         &mut self.inner
     }
 
-    /// Replace the storage handle (enable/disable caching).
+    /// Replaces the storage handle (enables/disables caching).
     pub fn with_storage_handle(mut self, handle: Option<StorageHandle>) -> Self {
         self.handle = handle;
         self
     }
 
-    /// Try to read from cache. Returns `Ok(Some(bytes))` for a hit, `Ok(None)` for miss.
+    /// Reads from cache (hit => `Some`, miss => `None`).
     fn read_cache(&self, key: &ResourceKey) -> HlsResult<Option<Bytes>> {
         let Some(handle) = &self.handle else {
             trace!("cache: disabled; key='{}'", key.0);
@@ -130,10 +106,7 @@ impl CachedResourceDownloader {
         }
     }
 
-    /// Download a playlist file fully into memory, using cache if available.
-    ///
-    /// On cache hit, returns `CacheSource::Cache` and does not hit the network.
-    /// On cache miss, downloads via the inner downloader and returns `CacheSource::Network`.
+    /// Downloads a playlist, using cache if available.
     pub async fn download_playlist_cached(
         &self,
         url: &str,
@@ -165,10 +138,7 @@ impl CachedResourceDownloader {
         })
     }
 
-    /// Download an encryption key fully into memory, using cache if available.
-    ///
-    /// On cache hit, returns `CacheSource::Cache` and does not hit the network.
-    /// On cache miss, downloads via the inner downloader and returns `CacheSource::Network`.
+    /// Downloads an encryption key, using cache if available.
     pub async fn download_key_cached(
         &self,
         url: &str,
@@ -200,9 +170,7 @@ impl CachedResourceDownloader {
         })
     }
 
-    // -------------------------------------------------------------------------
-    // Optional pass-through API: expose uncached behavior for existing call sites
-    // -------------------------------------------------------------------------
+    // Optional pass-through API for uncached behavior.
 
     /// Download bytes from a URL fully into memory (no cache).
     pub async fn download_bytes(&self, url: &str) -> HlsResult<Bytes> {

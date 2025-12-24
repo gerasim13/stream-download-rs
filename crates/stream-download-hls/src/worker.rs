@@ -1,3 +1,15 @@
+//! Background worker that drives HLS playback.
+//!
+//! [`HlsStreamWorker`] is spawned by [`crate::stream::HlsStream`] and is responsible for:
+//! - pulling segment descriptors from the underlying manager/controller,
+//! - emitting ordered [`stream_download::source::StreamMsg`] items:
+//!   - payload bytes (`StreamMsg::Data`)
+//!   - segment boundaries / resource persistence (`StreamControl`),
+//! - handling seeks/cancellation and best-effort retry/backoff,
+//! - updating the shared segmented-length snapshot used by `content_length()`.
+//!
+//! Implementation details may change; treat this module as internal plumbing.
+
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -878,10 +890,9 @@ impl HlsStreamWorker {
         }
     }
 
-    /// Construct a worker by building an `HlsManager` internally (production/default path).
+    /// Creates a worker by constructing an [`HlsManager`] internally.
     ///
-    /// This is kept for backwards compatibility. Internally it now delegates to
-    /// `new_with_manager(...)`, allowing tests/fixtures to inject a pre-built manager.
+    /// Use [`Self::new_with_manager`] if you want to inject a pre-built manager (tests/fixtures).
     pub async fn new(
         url: Url,
         settings: Arc<crate::HlsSettings>,
@@ -949,16 +960,9 @@ impl HlsStreamWorker {
         .await
     }
 
-    /// Construct a worker from a pre-built `HlsManager`.
+    /// Creates a worker from a pre-built [`HlsManager`].
     ///
-    /// This enables a "matryoshka" style fixture composition:
-    /// fixture server -> manager -> worker -> stream -> StreamDownload reader.
-    ///
-    /// Expectations:
-    /// - `manager` must be configured to point at the desired master playlist URL.
-    /// - `manager` should be wired to the same `data_sender` if it emits ordered persistence
-    ///   controls (e.g. `StreamControl::StoreResource`).
-    /// - This method will call `manager.load_master()` as part of initialization (same as `new`).
+    /// Calls `manager.load_master()` and initializes the ABR controller.
     pub async fn new_with_manager(
         mut manager: HlsManager,
         storage_handle: StorageHandle,
@@ -1036,15 +1040,13 @@ impl HlsStreamWorker {
         })
     }
 
+    /// Runs the worker loop until end-of-stream, cancellation, or a fatal error.
     #[instrument(skip(self))]
     pub async fn run(mut self) -> Result<(), HlsError> {
         let mut last_variant_id: Option<crate::parser::VariantId> = None;
         loop {
-            // Fetch next segment descriptor using non-blocking method with unified race.
-            //
-            // Important: we must avoid overlapping mutable borrows of `self.controller`.
-            // We do this by letting the controller run ABR logic first, and only then
-            // calling into the inner stream to obtain the next descriptor.
+            // Get the next descriptor (ABR decision happens inside the controller).
+            // Keep this as a single call to avoid overlapping mutable borrows of `self.controller`.
             let next_desc = match Self::race_with_seek(
                 &self.cancel_token,
                 &mut self.seek_receiver,

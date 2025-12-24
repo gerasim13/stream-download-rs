@@ -1,19 +1,7 @@
 //! Adaptive Bitrate (ABR) controller.
 //!
-//! This module provides a simple abstraction around variant selection for HLS
-//! streams. The goal for the PoC is to keep the logic intentionally minimal
-//! while still making the design extensible for more advanced strategies
-//! in the future.
-//!
-//! Design goals:
-//! - Keep `AbrController` independent from the actual networking layer.
-//! - Let higher layers provide playback/network metrics.
-//! - Delegate the actual switching work to `HlsManager`.
-//!
-//! At this stage, the implementation is a stub: we define public types and
-//! a minimal API, but the internal logic is intentionally left unimplemented.
-//! This allows consumers to start integrating the API while the internals
-//! are iterated on.
+//! Adds ABR-oriented variant selection on top of a [`MediaStream`] and delegates switching to the
+//! wrapped stream (typically [`crate::HlsManager`]).
 
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::HlsManager;
@@ -28,12 +16,7 @@ mod ewma;
 
 // Selection mode is now modeled as `manual_variant_id: Option<VariantId>` in AbrController.
 
-/// Basic playback / network metrics used for ABR decisions.
-///
-/// In a real implementation these values would be derived from:
-/// - segment download times (for throughput estimation),
-/// - buffer occupancy in seconds,
-/// - decoder/presentation stats (dropped frames, stalls, etc.).
+/// Playback/network metrics used for ABR decisions.
 #[derive(Debug, Clone)]
 pub struct PlaybackMetrics {
     /// Estimated available throughput in bits per second.
@@ -44,10 +27,7 @@ pub struct PlaybackMetrics {
     pub dropped_frames: u32,
 }
 
-/// Configuration for a basic ABR strategy.
-///
-/// This is intentionally small. The idea is to expose just enough knobs
-/// for experimentation in the PoC without committing to a complex API.
+/// Configuration for ABR decisions.
 #[derive(Debug, Clone)]
 pub struct AbrConfig {
     /// Minimum buffer (in seconds) above which the controller allows up-switching.
@@ -79,16 +59,9 @@ impl Default for AbrConfig {
     }
 }
 
-/// Simple ABR controller that works together with `HlsManager`.
+/// ABR controller that selects variants on top of a [`MediaStream`].
 ///
-/// Responsibilities:
-/// - Initialize from a master playlist and initial variant index.
-/// - Keep track of the current variant index.
-/// - Expose a `maybe_switch` method that decides whether to change
-///   the variant based on incoming metrics.
-///
-/// This type does not perform any network I/O by itself: it calls into
-/// `HlsManager` for actual variant switching.
+/// This type does not perform network I/O; switching is delegated to the wrapped stream.
 #[derive(Debug)]
 pub struct AbrController<S: MediaStream> {
     stream: S,
@@ -108,16 +81,7 @@ pub struct AbrController<S: MediaStream> {
 }
 
 impl<S: MediaStream> AbrController<S> {
-    /// Create a new ABR controller that wraps a `MediaStream` implementation.
-    ///
-    /// The controller will use the provided `stream` to fetch segments and will
-    /// add adaptive bitrate logic on top of it.
-    ///
-    /// # Arguments
-    /// * `stream`: The underlying `MediaStream` (e.g., an `HlsManager`).
-    /// * `config`: Configuration for the ABR algorithm.
-    /// * `initial_variant_index`: The index of the variant to start with.
-    /// * `initial_bandwidth`: The initial bandwidth estimate to use.
+    /// Creates a new ABR controller.
     pub fn new(
         stream: S,
         config: AbrConfig,
@@ -158,21 +122,17 @@ impl<S: MediaStream> AbrController<S> {
         self.current_variant_id
     }
 
-    /// Resets the bandwidth estimator, clearing all historical data.
-    ///
-    /// This is useful after a network change or a long pause.
+    /// Resets the bandwidth estimator state.
     pub fn reset(&mut self) {
         self.bandwidth_estimator.reset();
     }
 
-    /// Get the manual selection target if set (manual mode).
+    /// Returns the manual selection target (if set).
     pub fn manual_selection(&self) -> Option<VariantId> {
         self.manual_variant_id
     }
 
-    /// Initialize the controller by initializing the underlying stream and selecting the initial variant.
-    ///
-    /// This replaces the previous `MediaStream for AbrController`-based init path.
+    /// Initializes the underlying stream and selects the initial variant.
     pub async fn init(&mut self) -> HlsResult<()> {
         self.stream.init().await?;
 
@@ -191,24 +151,7 @@ impl<S: MediaStream> AbrController<S> {
         Ok(())
     }
 
-    /// NOTE: Descriptor-based ABR iteration is implemented specifically for `HlsManager`
-    /// in a dedicated impl block below (`impl AbrController<HlsManager>`).
-    ///
-    /// Rationale:
-    /// - The worker currently owns the descriptor streaming pipeline (network streaming,
-    ///   cache probes, DRM middlewares).
-    /// - A generic "pass a closure/future" API tends to run into borrow-checker issues
-    ///   when the caller needs to mutably borrow both the controller and the inner stream.
-
-    /// Report a successfully downloaded *media* segment to the ABR controller.
-    ///
-    /// This updates:
-    /// - throughput estimator (EWMA) based on (elapsed, byte_len)
-    /// - buffer estimate by adding the segment duration
-    ///
-    /// If `from_cache` is true, the update is skipped entirely to avoid:
-    /// - inflating throughput due to near-zero "download time"
-    /// - triggering ABR up-switch to a non-cached variant, which would break offline playback
+    /// Reports a downloaded media segment for throughput/buffer estimation.
     pub fn on_media_segment_downloaded(
         &mut self,
         duration: Duration,
@@ -226,30 +169,19 @@ impl<S: MediaStream> AbrController<S> {
         self.last_buffer_update = Instant::now();
     }
 
-    /// Switch to AUTO mode (ABR).
+    /// Switches to AUTO mode (ABR-controlled).
     pub fn set_auto(&mut self) {
         self.manual_variant_id = None;
     }
 
-    /// Switch to MANUAL mode and lock to the given variant.
+    /// Switches to MANUAL mode and locks to the given variant.
     pub async fn set_manual(&mut self, variant_id: VariantId) -> HlsResult<()> {
         self.manual_variant_id = Some(variant_id);
         self.current_variant_id = Some(variant_id);
         self.stream.select_variant(variant_id).await
     }
 
-    /// Potentially switch to a different variant based on the provided
-    /// `metrics`.
-    ///
-    /// The logic is intentionally left as a stub for now. The method
-    /// returns `Ok(())` without changing anything, so callers can already
-    /// wire up the control flow while the real ABR algorithm is still
-    /// under development.
-    ///
-    /// Expected future behavior:
-    /// - Inspect `self.stream.variants()` and `metrics`.
-    /// - Choose a new variant ID.
-    /// - If different, call `self.stream.select_variant()` and update `self.current_variant_id`.
+    /// Potentially switches variants based on `metrics` (no-op in manual mode).
     pub async fn maybe_switch(&mut self, metrics: &PlaybackMetrics) -> HlsResult<()> {
         // If manual mode is active, ensure we are locked to the manual target and skip ABR.
         if let Some(target) = self.manual_variant_id {
@@ -388,11 +320,7 @@ impl<S: MediaStream> AbrController<S> {
 }
 
 impl AbrController<HlsManager> {
-    /// Descriptor-based next-segment API with ABR switching, specialized for `HlsManager`.
-    ///
-    /// This avoids borrow-checker issues in the worker by keeping:
-    /// - ABR decision (`maybe_switch`) inside the controller
-    /// - descriptor selection inside the wrapped `HlsManager`
+    /// Returns the next segment descriptor with ABR switching (specialized for `HlsManager`).
     pub async fn next_segment_descriptor_nonblocking(
         &mut self,
     ) -> HlsResult<NextSegmentDescResult> {

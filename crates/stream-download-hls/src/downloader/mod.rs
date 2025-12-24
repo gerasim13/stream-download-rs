@@ -1,7 +1,7 @@
-//! Downloader utilities for HLS HTTP fetching.
+//! HLS downloaders.
 //!
-//! This module groups the network downloader and its cached wrapper under a
-//! single namespace while keeping the cache helpers in `crate::cache`.
+//! This module exposes the network downloader and its cached wrapper.
+//! Cache key/layout helpers live in `crate::cache`.
 
 use bytes::Bytes;
 use futures_util::stream::BoxStream;

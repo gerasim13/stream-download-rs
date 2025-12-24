@@ -1,31 +1,7 @@
-//! Cache coordination layer for HLS persistent storage.
+//! Cache policy wrapper for persistent HLS storage.
 //!
-//! This module provides a wrapper around an inner [`SegmentStorageFactory`] that adds:
-//! - A filesystem "lease" marker to prevent eviction of currently active streams.
-//! - LRU-style eviction by `<storage_root>/<master_hash>` directory count.
-//!
-//! Additionally, it can vend a read-only [`StorageHandle`] for persisted small resources
-//! (e.g. playlists/keys) stored under `storage_root` by treating `ResourceKey` as a relative path.
-//!
-//! Design goals:
-//! - Keep all caching policy out of `HlsStream` / playback logic.
-//! - Avoid global locks and avoid hot-path overhead:
-//!   eviction is triggered only when a *new* `<master_hash>` is first encountered.
-//! - Best-effort: cache policy must not break playback.
-//!
-//! Storage layout assumptions (aligned with `HlsFileTreeSegmentFactory`):
-//! - `stream_key` is `"<master_hash>/<variant_id>"`
-//! - segment path: `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-//!
-//! Marker:
-//! - lease: `<storage_root>/<master_hash>/.lease`
-//!
-//! The lease file serves two roles:
-//! - **Active-use protection**: eviction must not delete dirs with a fresh lease (mtime < TTL).
-//! - **LRU ordering**: eviction sorts master dirs by lease mtime (oldest evicted first).
-//!
-//! There is intentionally no separate ".access" marker and no in-memory lease guard.
-//! The lease file is not removed on shutdown; TTL-based eviction handles cleanup.
+//! Adds `.lease`-based TTL/LRU protection and optional eviction for per-master cache directories.
+//! Best-effort: policy failures should not break playback.
 
 use std::collections::HashSet;
 use std::fs;
@@ -45,13 +21,9 @@ use super::SegmentStorageFactory;
 
 use tracing::trace;
 
-/// A cache-policy wrapper for an HLS segment storage factory.
+/// Cache policy wrapper for an HLS segment storage factory.
 ///
-/// This wrapper:
-/// - Parses `master_hash` out of the HLS `stream_key` (`"<master_hash>/<variant_id>"`).
-/// - Acquires a lease for each encountered `master_hash` to prevent eviction while active.
-/// - Updates an access marker file for LRU ordering.
-/// - Evicts older stream directories when the count exceeds `max_cached_streams`.
+/// Uses `.lease` mtime for TTL freshness checks and LRU ordering, and can evict older master directories.
 #[derive(Clone)]
 pub struct HlsCacheLayer<F>
 where
@@ -77,10 +49,7 @@ impl<F> HlsCacheLayer<F>
 where
     F: SegmentStorageFactory,
 {
-    /// Create a new cache layer around `inner`.
-    ///
-    /// `storage_root` must match the root used by the inner factory layout, e.g.
-    /// `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`.
+    /// Creates a new cache layer around `inner`.
     pub fn new(inner: F, storage_root: impl Into<PathBuf>) -> Self {
         Self {
             inner,
@@ -91,7 +60,7 @@ where
         }
     }
 
-    /// Return the root directory where stream caches are stored.
+    /// Returns the root directory where stream caches are stored.
     pub fn storage_root(&self) -> &Path {
         &self.storage_root
     }
@@ -100,13 +69,13 @@ where
         TreeStorageResourceReader::new(self.storage_root.clone()).into_handle()
     }
 
-    /// Enable LRU eviction by master playlist (by `<storage_root>/<master_hash>` directory count).
+    /// Enables eviction when the number of `<storage_root>/<master_hash>` directories exceeds `max`.
     pub fn with_max_cached_streams(mut self, max: NonZeroUsize) -> Self {
         self.max_cached_streams = Some(max);
         self
     }
 
-    /// Override the lease TTL used to treat stale `.lease` files as inactive.
+    /// Overrides the lease TTL used to treat stale `.lease` files as inactive.
     pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
         self.lease_ttl = ttl;
         self

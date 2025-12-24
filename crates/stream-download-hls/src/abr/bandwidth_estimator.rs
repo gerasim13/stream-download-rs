@@ -1,11 +1,9 @@
 use super::ewma::Ewma;
 
-/// Produce bandwidth estimates based on two EWMA (exponentially-weighted moving average), one
-/// evolving slow and the other evolving fast.
+/// Bandwidth estimator based on two EWMAs (fast + slow).
 ///
-/// The minimum between both is then taken into consideration to ensure a sudden fall in bandwidth
-/// has a lasting impact on estimates and that we only raise that estimate once it raised for
-/// enough time.
+/// The estimator tracks a fast-moving and a slow-moving average and uses the minimum of the two,
+/// so bandwidth drops affect decisions quickly while increases require sustained evidence.
 #[derive(Debug)]
 pub(crate) struct BandwidthEstimator {
     fast_ewma: Ewma,
@@ -20,7 +18,7 @@ impl BandwidthEstimator {
     const MINIMUM_CHUNK_SIZE: u32 = 16_000;
     const MINIMUM_TOTAL_BYTES: u64 = 150_000;
 
-    /// Creates a new `BandwidthEstimator`
+    /// Creates a new `BandwidthEstimator`.
     pub(crate) fn new(initial_bandwidth: f64) -> Self {
         Self {
             fast_ewma: Ewma::new(Self::FAST_EWMA_HALF_LIFE),
@@ -30,11 +28,10 @@ impl BandwidthEstimator {
         }
     }
 
-    /// Feed the BandwidthEstimator a new bandwidth data sample.
+    /// Adds a download observation.
     ///
-    /// You may want to call this method after a new resource was loaded, in the
-    /// case where you want to consider this request in the whole bandwidth
-    /// estimation logic.
+    /// `duration_ms` is the download duration (milliseconds) and `size_bytes` is the payload size.
+    /// Very small samples are ignored to reduce noise.
     pub(crate) fn add_sample(&mut self, duration_ms: f64, size_bytes: u32) {
         if size_bytes < Self::MINIMUM_CHUNK_SIZE {
             return;
@@ -46,9 +43,9 @@ impl BandwidthEstimator {
         self.slow_ewma.add_sample(weight, bandwidth);
     }
 
-    /// Get the current estimate made by the `BandwidthEstimator`.
+    /// Returns the current bandwidth estimate (bits per second).
     ///
-    /// Returns `None` if it does not have enough data to produce a estimate yet.
+    /// Until enough data is collected, this returns `initial_bandwidth`.
     pub(crate) fn get_estimate(&self) -> f64 {
         if self.bytes_sampled < Self::MINIMUM_TOTAL_BYTES {
             self.initial_bandwidth
