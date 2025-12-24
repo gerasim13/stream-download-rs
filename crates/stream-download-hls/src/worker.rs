@@ -21,6 +21,29 @@ enum RaceOutcome<T> {
     ChannelClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentPlan {
+    Skipped,
+    CachedHit,
+    Network,
+}
+
+struct SegmentRouting {
+    stream_key: ResourceKey,
+    kind: ChunkKind,
+    filename_hint: Option<Arc<str>>,
+}
+
+struct SegmentContext {
+    plan: SegmentPlan,
+    desc: crate::manager::SegmentDescriptor,
+    seg_size: Option<u64>,
+    drm_params_opt: Option<([u8; 16], [u8; 16])>,
+    init_len_opt: Option<u64>,
+    routing: Option<SegmentRouting>,
+    cached_len: Option<u64>,
+}
+
 pub struct HlsStreamWorker {
     data_sender: mpsc::Sender<StreamMsg>,
     seek_receiver: mpsc::Receiver<u64>,
@@ -53,6 +76,25 @@ impl HlsStreamWorker {
                 }
             }
         }
+    }
+
+    async fn resolve_segment_processing_params(
+        &mut self,
+        desc: &crate::manager::SegmentDescriptor,
+        seg_size: Option<u64>,
+    ) -> (Option<([u8; 16], [u8; 16])>, Option<u64>) {
+        // Resolve per-segment DRM params (if any) before building middlewares.
+        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
+            self.resolve_drm_params_for_desc(desc).await;
+
+        // Init length is only meaningful when we stream it "as-is" (no DRM middleware).
+        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
+            None
+        } else {
+            seg_size
+        };
+
+        (drm_params_opt, init_len_opt)
     }
 
     /// Build per-segment middlewares (no self borrow to avoid conflicts).
@@ -475,22 +517,28 @@ impl HlsStreamWorker {
         cached_len: u64,
         last_variant_id: &mut Option<crate::model::VariantId>,
     ) -> Result<(), HlsStreamError> {
-        // Handle full-segment skip for cached data (media only).
-        if self.bytes_to_skip > 0 && !desc.is_init {
+        // Cached media skip:
+        // - full: consume without ChunkStart/End
+        // - partial: expose suffix via `start_offset`
+        let start_offset = if self.bytes_to_skip > 0 && !desc.is_init {
             if self.bytes_to_skip >= cached_len {
                 self.bytes_to_skip -= cached_len;
                 self.current_position += cached_len;
                 self.emit_post_segment_events(desc);
                 return Ok(());
             }
-            // Partial skip within cached segment is not supported yet; fall through and consume it.
+
+            // Partial skip: do not deliver skipped bytes to the decoder.
+            let off = self.bytes_to_skip;
             self.bytes_to_skip = 0;
-        }
+            off
+        } else {
+            0
+        };
 
         self.emit_pre_segment_events(last_variant_id, desc, seg_size, Some(cached_len));
 
-        // Update segmented length snapshot for a cached HIT: we "materialize" the
-        // segment boundary without downloading bytes.
+        // Cache HIT: materialize the boundary without network I/O.
         {
             let mut guard = self
                 .segmented_length
@@ -508,6 +556,7 @@ impl HlsStreamWorker {
                 kind,
                 reported_len: seg_size.or(Some(cached_len)),
                 filename_hint: filename_hint.clone(),
+                start_offset,
             }))
             .await
             .map_err(|_| HlsStreamError::Cancelled)?;
@@ -521,7 +570,7 @@ impl HlsStreamWorker {
             .await
             .map_err(|_| HlsStreamError::Cancelled)?;
 
-        // Do NOT update ABR on cache HIT: offline-safe behavior.
+        // ABR: ignore cache HIT (offline-safe).
         self.emit_post_segment_events(desc);
 
         Ok(())
@@ -531,7 +580,7 @@ impl HlsStreamWorker {
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
     ) -> Result<Option<crate::model::HlsByteStream>, HlsStreamError> {
-        // Build a stream according to skip and init rules
+        // Build the HTTP stream (range when skipping media).
         let stream_res = if self.bytes_to_skip > 0 && !desc.is_init {
             let start = self.bytes_to_skip;
             self.bytes_to_skip = 0;
@@ -541,7 +590,7 @@ impl HlsStreamWorker {
                 .stream_segment_range(&desc.uri, start, None)
                 .await
         } else {
-            // For init segments, we always send the full segment even if skip is inside it
+            // Init is always streamed fully.
             self.controller
                 .inner_stream()
                 .downloader()
@@ -562,6 +611,91 @@ impl HlsStreamWorker {
                 Ok(None)
             }
         }
+    }
+
+    async fn process_network_segment(
+        &mut self,
+        ctx: SegmentContext,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) -> Result<(), HlsStreamError> {
+        // Network path.
+        self.emit_pre_segment_events(last_variant_id, &ctx.desc, ctx.seg_size, ctx.init_len_opt);
+
+        let Some(stream) = self.open_segment_stream(&ctx.desc).await? else {
+            // `open_segment_stream` already backed off.
+            return Ok(());
+        };
+
+        // Segmented length: start boundary.
+        self.push_segment_length_on_start(ctx.seg_size)?;
+
+        let routing = ctx
+            .routing
+            .expect("invariant: Network plan requires routing");
+
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkStart {
+                stream_key: routing.stream_key.clone(),
+                kind: routing.kind,
+                reported_len: ctx.seg_size,
+                filename_hint: routing.filename_hint.clone(),
+                start_offset: 0,
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
+
+        // Apply middlewares and pump bytes.
+        let start_time = std::time::Instant::now();
+        let middlewares = HlsStreamWorker::build_middlewares(ctx.drm_params_opt);
+        let stream = apply_middlewares(stream, &middlewares);
+        let gathered_len = self.pump_stream_chunks(stream).await?;
+        let elapsed = start_time.elapsed();
+
+        // ABR: report network downloads only.
+        self.controller
+            .on_media_segment_downloaded(ctx.desc.duration, gathered_len, elapsed);
+
+        // Segmented length: end boundary.
+        self.update_segment_length_on_end(gathered_len)?;
+
+        // Finalize the chunk.
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkEnd {
+                stream_key: routing.stream_key,
+                kind: routing.kind,
+                gathered_len,
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
+
+        // Post-boundary events.
+        self.emit_post_segment_events(&ctx.desc);
+
+        Ok(())
+    }
+
+    async fn process_cached_segment(
+        &mut self,
+        ctx: SegmentContext,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) -> Result<(), HlsStreamError> {
+        let cached_len = ctx
+            .cached_len
+            .expect("invariant: CachedHit plan requires cached_len");
+        let routing = ctx
+            .routing
+            .expect("invariant: CachedHit plan requires routing");
+
+        self.emit_cached_segment_as_chunk(
+            &ctx.desc,
+            routing.stream_key,
+            routing.kind,
+            ctx.seg_size,
+            routing.filename_hint,
+            cached_len,
+            last_variant_id,
+        )
+        .await
     }
 
     fn push_segment_length_on_start(&self, seg_size: Option<u64>) -> Result<(), HlsStreamError> {
@@ -601,6 +735,70 @@ impl HlsStreamWorker {
         Ok(())
     }
 
+    fn build_segment_routing(&self, desc: &crate::manager::SegmentDescriptor) -> SegmentRouting {
+        SegmentRouting {
+            stream_key: self.stream_key_for_desc(desc),
+            kind: self.chunk_kind_for_desc(desc),
+            filename_hint: self.filename_hint_for_desc(desc),
+        }
+    }
+
+    fn probe_segment_cache_len(&self, routing: &SegmentRouting) -> Option<u64> {
+        let cached_key = self.cached_segment_key(&routing.stream_key, &routing.filename_hint);
+        self.probe_cached_segment_len(&cached_key)
+    }
+
+    /// Build a `SegmentContext` and decide the high-level segment plan (skip/cache/network).
+    async fn prepare_segment_context(
+        &mut self,
+        desc: crate::manager::SegmentDescriptor,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) -> Result<SegmentContext, HlsStreamError> {
+        // Determine segment size if needed for skip math.
+        let seg_size = self.compute_segment_size(&desc).await;
+
+        // Best-effort full skip if we know the whole segment size.
+        if self.try_skip_full_segment_by_size(seg_size) {
+            return Ok(SegmentContext {
+                plan: SegmentPlan::Skipped,
+                desc,
+                seg_size,
+                drm_params_opt: None,
+                init_len_opt: None,
+                routing: None,
+                cached_len: None,
+            });
+        }
+
+        let (drm_params_opt, init_len_opt) = self
+            .resolve_segment_processing_params(&desc, seg_size)
+            .await;
+
+        // Side-effect: keep stitched reader following the active variant.
+        self.maybe_update_default_stream_key(&desc, last_variant_id);
+
+        let routing = self.build_segment_routing(&desc);
+
+        // Cache probe (before network).
+        let cached_len = self.probe_segment_cache_len(&routing);
+
+        let plan = if cached_len.is_some() {
+            SegmentPlan::CachedHit
+        } else {
+            SegmentPlan::Network
+        };
+
+        Ok(SegmentContext {
+            plan,
+            desc,
+            seg_size,
+            drm_params_opt,
+            init_len_opt,
+            routing: Some(routing),
+            cached_len,
+        })
+    }
+
     /// Process a single segment descriptor: computes size, handles skip, DRM, events and streaming.
     #[instrument(skip(self, last_variant_id))]
     async fn process_descriptor(
@@ -608,92 +806,13 @@ impl HlsStreamWorker {
         desc: crate::manager::SegmentDescriptor,
         last_variant_id: &mut Option<crate::model::VariantId>,
     ) -> Result<(), HlsStreamError> {
-        // Determine segment size if needed for skip math
-        let seg_size = self.compute_segment_size(&desc).await;
+        let ctx = self.prepare_segment_context(desc, last_variant_id).await?;
 
-        // Handle full-segment skip if we have enough bytes_to_skip and know size
-        if self.try_skip_full_segment_by_size(seg_size) {
-            return Ok(());
+        match ctx.plan {
+            SegmentPlan::Skipped => Ok(()),
+            SegmentPlan::CachedHit => self.process_cached_segment(ctx, last_variant_id).await,
+            SegmentPlan::Network => self.process_network_segment(ctx, last_variant_id).await,
         }
-
-        // Resolve DRM (AES-128-CBC) parameters before emitting events or building middlewares
-        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
-            self.resolve_drm_params_for_desc(&desc).await;
-        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
-            None
-        } else {
-            seg_size
-        };
-
-        self.maybe_update_default_stream_key(&desc, last_variant_id);
-
-        let stream_key = self.stream_key_for_desc(&desc);
-        let kind = self.chunk_kind_for_desc(&desc);
-        let filename_hint = self.filename_hint_for_desc(&desc);
-
-        // Cache probe before network work.
-        let cached_key = self.cached_segment_key(&stream_key, &filename_hint);
-        if let Some(cached_len) = self.probe_cached_segment_len(&cached_key) {
-            return self
-                .emit_cached_segment_as_chunk(
-                    &desc,
-                    stream_key,
-                    kind,
-                    seg_size,
-                    filename_hint,
-                    cached_len,
-                    last_variant_id,
-                )
-                .await;
-        }
-
-        self.emit_pre_segment_events(last_variant_id, &desc, seg_size, init_len_opt);
-
-        let Some(stream) = self.open_segment_stream(&desc).await? else {
-            // `open_segment_stream` already performed backoff_sleep on failure.
-            return Ok(());
-        };
-
-        // Update segmented length snapshot (best-effort) on ChunkStart.
-        self.push_segment_length_on_start(seg_size)?;
-
-        self.data_sender
-            .send(StreamMsg::Control(StreamControl::ChunkStart {
-                stream_key: stream_key.clone(),
-                kind,
-                reported_len: seg_size,
-                filename_hint,
-            }))
-            .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
-
-        // Apply streaming middlewares (DRM, etc.) and pump data
-        let start_time = std::time::Instant::now();
-        let middlewares = HlsStreamWorker::build_middlewares(drm_params_opt);
-        let stream = apply_middlewares(stream, &middlewares);
-        let gathered_len = self.pump_stream_chunks(stream).await?;
-        let elapsed = start_time.elapsed();
-
-        // Report download to ABR (network only). Cache HIT is handled above and intentionally ignored.
-        self.controller
-            .on_media_segment_downloaded(desc.duration, gathered_len, elapsed);
-
-        self.update_segment_length_on_end(gathered_len)?;
-
-        // Emit ordered control message to finalize the chunk.
-        self.data_sender
-            .send(StreamMsg::Control(StreamControl::ChunkEnd {
-                stream_key,
-                kind,
-                gathered_len,
-            }))
-            .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
-
-        // Emit segment boundary events after finishing streaming
-        self.emit_post_segment_events(&desc);
-
-        Ok(())
     }
 
     /// Construct a worker by building an `HlsManager` internally (production/default path).

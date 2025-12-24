@@ -294,24 +294,35 @@ where
     gathered_len: Mutex<u64>,
     /// Segment finalization flag.
     finalized: Mutex<bool>,
+    /// Logical start offset within the underlying segment resource.
+    ///
+    /// When non-zero, the stitched reader will expose only the suffix of the segment starting at
+    /// `start_offset` (i.e. it will not return bytes in `[0..start_offset)` to the consumer).
+    ///
+    /// This is used to support seek/skip into the middle of a cached segment without re-downloading.
+    start_offset: u64,
 }
 
 impl<P> Segment<P>
 where
     P: StorageProvider + Send + 'static,
 {
-    fn new(reader: P::Reader, writer: P::Writer, reported: Option<u64>) -> Self {
+    fn new(reader: P::Reader, writer: P::Writer, reported: Option<u64>, start_offset: u64) -> Self {
         Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(Some(writer)),
             reported,
             gathered_len: Mutex::new(0),
             finalized: Mutex::new(false),
+            start_offset,
         }
     }
 
     fn available_len(&self) -> u64 {
-        *self.gathered_len.lock()
+        // Expose only the readable suffix. If the segment is shorter than the start offset,
+        // the visible length is 0.
+        let gathered = *self.gathered_len.lock();
+        gathered.saturating_sub(self.start_offset)
     }
 
     fn is_finalized(&self) -> bool {
@@ -421,7 +432,8 @@ where
             // Perform IO on the inner segment reader.
             {
                 let mut inner = seg.reader.lock();
-                inner.seek(SeekFrom::Start(offset_in_seg))?;
+                let physical_offset = seg.start_offset.saturating_add(offset_in_seg);
+                inner.seek(SeekFrom::Start(physical_offset))?;
                 let n = inner.read(&mut buf[read_total..read_total + to_read])?;
                 read_total += n;
                 local_pos = local_pos.saturating_add(n as u64);
@@ -502,6 +514,7 @@ where
         reported: Option<u64>,
         kind: ChunkKind,
         filename_hint: Option<Arc<str>>,
+        start_offset: u64,
     ) -> io::Result<()> {
         self.ensure_stream(&stream_key);
 
@@ -546,7 +559,12 @@ where
         );
 
         let (reader, writer) = provider.into_reader_writer(content_length)?;
-        let segment = Arc::new(Segment::<F::Provider>::new(reader, writer, reported));
+        let segment = Arc::new(Segment::<F::Provider>::new(
+            reader,
+            writer,
+            reported,
+            start_offset,
+        ));
 
         let mut guard = self.state.write();
         let stream = guard
@@ -837,7 +855,8 @@ where
                 kind,
                 reported_len,
                 filename_hint,
-            } => self.open_new_segment(stream_key, reported_len, kind, filename_hint),
+                start_offset,
+            } => self.open_new_segment(stream_key, reported_len, kind, filename_hint, start_offset),
 
             StreamControl::ChunkEnd {
                 stream_key: _,

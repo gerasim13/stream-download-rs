@@ -70,6 +70,13 @@ pub enum StreamControl {
         reported_len: Option<u64>,
         /// Optional filename hint (e.g. playlist basename) for deterministic caching.
         filename_hint: Option<Arc<str>>,
+        /// Per-chunk start offset in bytes for segmented range reads.
+        ///
+        /// This allows segmented storage readers to expose only a suffix of a cached chunk
+        /// (e.g. after a seek that lands in the middle of a segment) without re-downloading.
+        ///
+        /// Default is 0 (no offset).
+        start_offset: u64,
     },
 
     /// Finish the current chunk.
