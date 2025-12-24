@@ -41,7 +41,7 @@
 
 use stream_download::source::ResourceKey;
 
-use crate::model::VariantId;
+use crate::parser::VariantId;
 
 use tracing::trace;
 

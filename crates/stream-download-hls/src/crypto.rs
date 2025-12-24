@@ -16,16 +16,23 @@
 //!   object-safe trait simple and ergonomic to use from `HlsStream`.
 //! - All errors are mapped to `HlsError` to keep error handling consistent.
 
+use crate::downloader::HlsByteStream;
+use crate::error::HlsError;
+use bytes::Bytes;
+
+/// Callback type used to transform raw key bytes fetched from a key server
+/// before they are used for decryption. This allows custom key wrapping/DRM flows.
+pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
+
 use aes::Aes128;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use cbc::{
     Decryptor,
     cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7},
 };
 use futures_util::StreamExt;
 
-use crate::model::{HlsByteStream, HlsError};
-use crate::traits::StreamMiddleware;
+use crate::manager::StreamMiddleware;
 
 /// AES-128-CBC middleware with streaming decryption.
 ///
@@ -73,7 +80,10 @@ impl StreamMiddleware for Aes128CbcMiddleware {
                         }
                         Some(Err(e)) => {
                             return Some((
-                                Err(HlsError::Io(e.to_string())),
+                                Err(HlsError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    e.to_string(),
+                                ))),
                                 (input, BytesMut::new(), true),
                             ));
                         }

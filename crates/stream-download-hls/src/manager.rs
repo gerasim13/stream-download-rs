@@ -1,7 +1,9 @@
 //! HLS stream manager.
 //!
-//! This module provides [`HlsManager`], a high-level handle for working with a
-//! single HLS stream (identified by a master playlist URL).
+//! This module owns the public "player-facing" stream API:
+//! - segment iteration types: [`SegmentType`], [`NextSegmentResult`], [`SegmentData`]
+//! - the high-level [`MediaStream`] trait (implemented by [`HlsManager`])
+//! - middleware plumbing: [`StreamMiddleware`] + [`apply_middlewares`]
 //!
 //! Caching responsibilities:
 //! - **Read-before-fetch** for playlists/keys is performed by [`CachedResourceDownloader`] using
@@ -9,23 +11,6 @@
 //! - **Key formatting** for cached playlists/keys is centralized in `crate::cache::keys`.
 //! - After a **network miss**, the manager emits `StreamControl::StoreResource { key, data }` so the
 //!   storage layer can persist the resource under `storage_root/<key-as-path>`.
-//!
-//! At this stage it intentionally contains only a minimal, non-networked
-//! skeleton so that higher layers can start integrating against a stable API.
-//! Network I/O and real HLS behavior (parsing, live updates, segment fetching)
-//! will be wired in future iterations using the other modules in this crate.
-//!
-//! Responsibilities of `HlsManager` in the PoC design:
-//! - Own the master playlist URL and configuration.
-//! - Coordinate parsing and refreshing of master/media playlists (later).
-//! - Expose a small async API for upper layers (ABR controller, player) to:
-//!   - load the master playlist and list variants,
-//!   - select/switch the current variant,
-//!   - poll new segments and download their bytes.
-//!
-//! For now, all async methods are stubs that return `HlsError::Message`
-//! so that the interface compiles and can be used, while the internal
-//! implementation is developed incrementally.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,37 +18,137 @@ use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::instrument;
 
 use crate::cache::keys as cache_keys;
+use crate::downloader::HlsByteStream;
 use crate::downloader::ResourceDownloader;
 use crate::downloader::{CacheSource, CachedResourceDownloader};
-use crate::model::{
-    EncryptionMethod, HlsError, HlsResult, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
-    SegmentKey, VariantId, VariantStream,
+use crate::error::{HlsError, HlsResult};
+use crate::parser::{
+    CodecInfo, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
+    SegmentKey, VariantId, VariantStream, parse_master_playlist, parse_media_playlist,
 };
-use crate::parser::{parse_master_playlist, parse_media_playlist};
 use crate::settings::HlsSettings;
-use crate::traits::{MediaStream, NextSegmentResult, SegmentData};
 use stream_download::source::{StreamControl, StreamMsg};
 use stream_download::storage::StorageHandle;
 use tokio::sync::mpsc;
 use tracing::trace;
 
+/// A high-level asynchronous trait representing a consumable media stream.
+///
+/// This abstraction is designed to be implemented by a manager (like `HlsManager`)
+/// to provide a simplified, player-friendly interface for fetching media.
+///
+/// # Blocking vs Non-blocking
+///
+/// The trait provides two methods for fetching segments:
+/// - [`next_segment`](Self::next_segment): waits internally for live streams
+/// - [`next_segment_nonblocking`](Self::next_segment_nonblocking): returns immediately with
+///   [`NextSegmentResult::NeedsRefresh`] for live streams; the caller handles waiting/cancellation.
+#[async_trait]
+pub trait MediaStream {
+    /// Initializes the stream by fetching and parsing the master playlist.
+    async fn init(&mut self) -> HlsResult<()>;
+
+    /// Returns a slice of all available variants (renditions) in the stream.
+    fn variants(&self) -> &[VariantStream];
+
+    /// Selects the active variant for subsequent segment fetching.
+    async fn select_variant(&mut self, variant_id: VariantId) -> HlsResult<()>;
+
+    /// Fetches the next segment from the currently selected stream (blocking).
+    ///
+    /// For live streams, this method blocks (asynchronously) until a new segment becomes available.
+    /// For better cancellation support, use [`next_segment_nonblocking`](Self::next_segment_nonblocking).
+    async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>>;
+
+    /// Fetches the next segment without blocking for live streams.
+    async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult>;
+}
+
+/// Trait for transforming a stream of `Bytes` in a composable manner.
+///
+/// This trait is object-safe and can be used behind a `Box<dyn StreamMiddleware>`.
+/// It consumes an input `HlsByteStream` and returns a new transformed stream.
+pub trait StreamMiddleware: Send + Sync {
+    fn apply(&self, input: HlsByteStream) -> HlsByteStream;
+}
+
+/// Apply a list of middlewares to an input stream in order.
+///
+/// This function consumes the input stream and returns the transformed stream.
+/// If `middlewares` is empty, the input stream is returned unchanged.
+///
+/// Middlewares are applied left-to-right: `out = mN(...(m2(m1(input))))`
+pub fn apply_middlewares(
+    mut input: HlsByteStream,
+    middlewares: &[Arc<dyn StreamMiddleware>],
+) -> HlsByteStream {
+    for mw in middlewares {
+        input = mw.apply(input);
+    }
+    input
+}
+
+/// Type of segment returned by `next_segment`.
+#[derive(Debug, Clone)]
+pub enum SegmentType {
+    /// Initialization segment containing container headers and metadata.
+    /// Must be processed before any media segments from the same variant.
+    Init(SegmentData),
+    /// Media segment containing actual audio/video data.
+    Media(SegmentData),
+}
+
+/// Result of a non-blocking segment fetch attempt.
+///
+/// This enum allows the caller to handle waiting for live streams
+/// with proper cancellation support, rather than blocking inside
+/// the `next_segment` implementation.
+#[derive(Debug, Clone)]
+pub enum NextSegmentResult {
+    /// A segment is available and ready to be processed.
+    Segment(SegmentType),
+
+    /// The stream has ended (VOD finished or live stream with EXT-X-ENDLIST).
+    /// No more segments will be produced.
+    EndOfStream,
+
+    /// Live stream has no new segments yet.
+    NeedsRefresh {
+        /// Suggested wait duration before the next refresh attempt.
+        /// Typically based on the playlist's target duration.
+        wait: Duration,
+    },
+}
+
+/// A data package for a single media segment.
+///
+/// This struct bundles the raw segment bytes with the necessary metadata for a
+/// player to decode and schedule it correctly. It's the primary type returned
+/// by the `MediaStream` trait.
+#[derive(Debug, Clone)]
+pub struct SegmentData {
+    /// Raw bytes of the media segment (e.g., a TS or fMP4 file).
+    pub data: Bytes,
+    /// Uniquely identifies the variant (stream/rendition) this segment belongs to.
+    pub variant_id: VariantId,
+    /// Codec and container information for the associated variant.
+    pub codec_info: Option<CodecInfo>,
+    /// Encryption key information, if the segment is encrypted.
+    pub key: Option<SegmentKey>,
+    /// The segment's media sequence number.
+    pub sequence: u64,
+    /// The duration of the media segment.
+    pub duration: Duration,
+}
+
 /// High-level handle for working with a single HLS stream.
 ///
 /// The manager is created with a master playlist URL and configuration.
 /// It does not perform any network I/O until its async methods are called.
-///
-/// In its final form, `HlsManager` will:
-/// - use [`ResourceDownloader`] to fetch playlists and segments via
-///   `stream-download`,
-/// - maintain internal state for the selected variant and latest media
-///   playlist,
-/// - provide small, composable building blocks for an ABR controller
-///   and player-level buffering logic.
-///
-/// At the moment, most methods are stubs to allow early integration.
 #[derive(Debug)]
 pub struct HlsManager {
     /// URL of the master playlist.
@@ -212,15 +297,22 @@ impl HlsManager {
         let base = if let Some(ref base_url) = self.config.base_url {
             base_url.clone()
         } else if let Some(ref media_playlist_url) = self.media_playlist_url {
-            url::Url::parse(media_playlist_url)
-                .map_err(|e| HlsError::Io(format!("Failed to parse base URL: {}", e)))?
+            url::Url::parse(media_playlist_url).map_err(|e| {
+                HlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Failed to parse base URL: {}", e),
+                ))
+            })?
         } else {
             self.master_url.clone()
         };
 
-        base.join(relative_url)
-            .map(|u| u.into())
-            .map_err(|e| HlsError::Io(format!("Failed to join URL: {}", e)))
+        base.join(relative_url).map(|u| u.into()).map_err(|e| {
+            HlsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Failed to join URL: {}", e),
+            ))
+        })
     }
 
     fn current_variant(&self) -> HlsResult<&VariantStream> {
@@ -239,12 +331,12 @@ impl HlsManager {
             .ok_or_else(|| HlsError::Message("current variant index is out of bounds".to_string()))
     }
 
-    fn current_codec_info(&self) -> HlsResult<Option<crate::model::CodecInfo>> {
+    fn current_codec_info(&self) -> HlsResult<Option<crate::parser::CodecInfo>> {
         Ok(self.current_variant()?.codec.clone())
     }
 
     #[allow(dead_code)]
-    fn current_variant_info(&self) -> HlsResult<(VariantId, Option<crate::model::CodecInfo>)> {
+    fn current_variant_info(&self) -> HlsResult<(VariantId, Option<crate::parser::CodecInfo>)> {
         let variant = self.current_variant()?;
         Ok((variant.id, variant.codec.clone()))
     }
@@ -300,7 +392,7 @@ impl HlsManager {
     }
 
     /// Return the currently cached master playlist, if any.
-    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<crate::traits::SegmentType>> {
+    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<crate::manager::SegmentType>> {
         let init_opt = self
             .current_media_playlist
             .as_ref()
@@ -324,7 +416,7 @@ impl HlsManager {
                 downloaded
             };
 
-            return Ok(Some(crate::traits::SegmentType::Init(SegmentData {
+            return Ok(Some(crate::manager::SegmentType::Init(SegmentData {
                 data,
                 variant_id,
                 codec_info,
@@ -340,7 +432,7 @@ impl HlsManager {
     async fn emit_media_segment(
         &mut self,
         seg: MediaSegment,
-    ) -> HlsResult<crate::traits::SegmentType> {
+    ) -> HlsResult<crate::manager::SegmentType> {
         let codec_info = self.current_codec_info()?;
 
         let data = self
@@ -351,7 +443,7 @@ impl HlsManager {
 
         self.next_segment_index += 1;
 
-        Ok(crate::traits::SegmentType::Media(SegmentData {
+        Ok(crate::manager::SegmentType::Media(SegmentData {
             data,
             variant_id: seg.variant_id,
             codec_info,
@@ -565,7 +657,12 @@ impl HlsManager {
     #[cfg(feature = "aes-decrypt")]
     fn finalize_key_url(&self, abs_key_url: &str) -> HlsResult<String> {
         if let Some(params) = &self.config.key_query_params {
-            let mut url = url::Url::parse(abs_key_url).map_err(|e| HlsError::Io(e.to_string()))?;
+            let mut url = url::Url::parse(abs_key_url).map_err(|e| {
+                HlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    e.to_string(),
+                ))
+            })?;
             {
                 let mut qp = url.query_pairs_mut();
                 for (k, v) in params {
@@ -699,7 +796,7 @@ pub struct SegmentDescriptor {
     pub is_init: bool,
     pub duration: std::time::Duration,
     pub variant_id: VariantId,
-    pub codec_info: Option<crate::model::CodecInfo>,
+    pub codec_info: Option<crate::parser::CodecInfo>,
     pub key: Option<SegmentKey>,
 }
 
@@ -783,7 +880,7 @@ impl HlsManager {
 
     fn build_init_descriptor(
         &self,
-        init_segment: &crate::model::InitSegment,
+        init_segment: &crate::parser::InitSegment,
     ) -> HlsResult<SegmentDescriptor> {
         let (variant_id, codec_info) = self.current_variant_info()?;
         let resolved_uri = self.resolve_url(&init_segment.uri)?;
@@ -841,7 +938,7 @@ impl HlsManager {
         // Clone minimal playlist data to avoid holding an immutable borrow of `self`
         // while probing sizes (which requires `&mut self`).
         let (init_opt, media_entries): (
-            Option<crate::model::InitSegment>,
+            Option<InitSegment>,
             Vec<(u64, String, std::time::Duration, Option<SegmentKey>)>,
         ) = {
             let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
@@ -963,7 +1060,7 @@ impl MediaStream for HlsManager {
     }
 
     #[instrument(skip(self), fields(variant_index = ?self.current_variant_index, next_segment_index = self.next_segment_index))]
-    async fn next_segment(&mut self) -> HlsResult<Option<crate::traits::SegmentType>> {
+    async fn next_segment(&mut self) -> HlsResult<Option<crate::manager::SegmentType>> {
         // Blocking version: loop until we get a segment or end of stream
         loop {
             match self.next_segment_nonblocking().await? {

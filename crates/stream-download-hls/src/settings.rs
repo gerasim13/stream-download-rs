@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::model::{KeyProcessorCallback, VariantId};
+#[cfg(feature = "aes-decrypt")]
+use crate::crypto::KeyProcessorCallback;
+use crate::parser::{MasterPlaylist, VariantId};
 
 /// Type alias for variant stream selector callback.
 ///
@@ -30,8 +32,7 @@ use crate::model::{KeyProcessorCallback, VariantId};
 ///
 /// The callback receives the parsed master playlist so you can make an
 /// informed choice (bandwidth, codecs, resolution, etc.).
-pub type VariantStreamSelector =
-    dyn Fn(&crate::model::MasterPlaylist) -> Option<VariantId> + Send + Sync;
+pub type VariantStreamSelector = dyn Fn(&MasterPlaylist) -> Option<VariantId> + Send + Sync;
 
 /// Unified settings for HLS streaming.
 #[derive(Clone)]
@@ -251,7 +252,7 @@ impl HlsSettings {
     /// - Return `Some(VariantId)` to force MANUAL selection for that variant.
     pub fn variant_stream_selector(
         mut self,
-        cb: impl Fn(&crate::model::MasterPlaylist) -> Option<VariantId> + Send + Sync + 'static,
+        cb: impl Fn(&MasterPlaylist) -> Option<VariantId> + Send + Sync + 'static,
     ) -> Self {
         self.variant_stream_selector = Some(Arc::new(Box::new(cb)));
         self

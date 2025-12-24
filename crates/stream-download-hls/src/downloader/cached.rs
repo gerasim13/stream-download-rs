@@ -33,7 +33,7 @@ use stream_download::source::ResourceKey;
 use stream_download::storage::StorageHandle;
 
 use crate::downloader::ResourceDownloader;
-use crate::model::{HlsError, HlsResult};
+use crate::error::{HlsError, HlsResult};
 use tracing::trace;
 
 /// Where the returned bytes came from.
@@ -121,9 +121,9 @@ impl CachedResourceDownloader {
                     trace!("cache: treating read error as miss (best_effort_cache=true)");
                     Ok(None)
                 } else {
-                    Err(HlsError::Io(format!(
-                        "cache read failed for key '{}': {e}",
-                        key.0
+                    Err(HlsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("cache read failed for key '{}': {e}", key.0),
                     )))
                 }
             }

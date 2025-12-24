@@ -7,7 +7,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::model::{HlsError, HlsResult};
+use crate::error::{HlsError, HlsResult};
 
 // Reuse the StreamDownload HTTP layer and its single, shared client.
 // We intentionally avoid using reqwest directly here.
@@ -113,7 +113,9 @@ impl ResourceDownloader {
         let url = parse_url(url)?;
         let mut http = self.create_stream(url).await?;
         // `HttpStream` expects an exclusive end value; this matches our API.
-        http.seek_range(start, end).await.map_err(io_to_hls_error)?;
+        http.seek_range(start, end)
+            .await
+            .map_err(|e| HlsError::Io(e))?;
         Ok(Self::map_stream_errors(http).boxed())
     }
 
@@ -169,7 +171,12 @@ impl ResourceDownloader {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| HlsError::Io("download failed with no error".into())))
+        Err(last_error.unwrap_or_else(|| {
+            HlsError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "download failed with no error",
+            ))
+        }))
     }
 
     async fn try_download_once(
@@ -202,7 +209,10 @@ impl ResourceDownloader {
             Ok(Err(e)) => {
                 // Decode the error text from the server if possible
                 let msg = e.decode_error().await;
-                Err(HlsError::Io(format!("HTTP stream creation failed: {msg}")))
+                Err(HlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("HTTP stream creation failed: {msg}"),
+                )))
             }
             Err(_) => Err(HlsError::Timeout(url.to_string())),
         }
@@ -215,7 +225,10 @@ impl ResourceDownloader {
             match res {
                 Ok(StreamMsg::Data(bytes)) => Some(Ok(bytes)),
                 Ok(StreamMsg::Control(_)) => None,
-                Err(e) => Some(Err(HlsError::Io(e.to_string()))),
+                Err(e) => Some(Err(HlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                )))),
             }
         })
     }
@@ -250,7 +263,12 @@ impl ResourceDownloader {
                     // Ignore ordered control messages; this helper is used only to collect payload bytes.
                     continue;
                 }
-                Some(Err(e)) => return Err(HlsError::Io(e.to_string())),
+                Some(Err(e)) => {
+                    return Err(HlsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    )));
+                }
                 None => break,
             }
         }
@@ -264,7 +282,12 @@ impl ResourceDownloader {
 // ----------------------------
 
 fn parse_url(url: &str) -> HlsResult<Url> {
-    Url::parse(url).map_err(|e| HlsError::Io(format!("invalid URL: {e}")))
+    Url::parse(url).map_err(|e| {
+        HlsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid URL: {e}"),
+        ))
+    })
 }
 
 /// Parse the `Content-Range` header to extract the total length.
@@ -375,8 +398,9 @@ impl ResourceDownloader {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(e)) => {
                         let msg = e.decode_error().await;
-                        return Err(HlsError::Io(format!(
-                            "HTTP stream creation failed during probe: {msg}"
+                        return Err(HlsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("HTTP stream creation failed during probe: {msg}"),
                         )));
                     }
                     Err(_) => return Err(HlsError::Timeout(url_str)),
@@ -385,12 +409,11 @@ impl ResourceDownloader {
                 let cl_opt: Option<u64> = http.content_length().into();
                 Ok(cl_opt)
             }
-            Ok(Err(e)) => Err(HlsError::Io(e.to_string())),
+            Ok(Err(e)) => Err(HlsError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))),
             Err(_) => Err(HlsError::Timeout(url_str)),
         }
     }
-}
-
-fn io_to_hls_error(e: std::io::Error) -> HlsError {
-    HlsError::Io(e.to_string())
 }

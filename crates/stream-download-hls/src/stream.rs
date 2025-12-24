@@ -27,15 +27,47 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{self, Poll};
 
+use crate::HlsStreamWorker;
+use crate::error::HlsError;
 use futures_util::Stream;
+use stream_download::source::{SourceStream, StreamControl, StreamMsg};
+use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 use url::Url;
 
-use crate::{HlsStreamError, HlsStreamWorker, StreamEvent};
-use stream_download::source::{SourceStream, StreamControl, StreamMsg};
-use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
+/// Events emitted by the HLS streaming pipeline (out-of-band metadata).
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+    /// ABR: a new variant (rendition) has been selected. Emitted before the init segment.
+    VariantChanged {
+        variant_id: crate::parser::VariantId,
+        codec_info: Option<crate::parser::CodecInfo>,
+    },
+    /// Beginning of an init segment in the main byte stream.
+    /// byte_len may be None when exact length is unknown (e.g., due to DRM/middleware).
+    InitStart {
+        variant_id: crate::parser::VariantId,
+        codec_info: Option<crate::parser::CodecInfo>,
+        byte_len: Option<u64>,
+    },
+    /// End of the init segment in the main byte stream.
+    InitEnd {
+        variant_id: crate::parser::VariantId,
+    },
+    /// Optional: media segment boundaries (useful for metrics).
+    SegmentStart {
+        sequence: u64,
+        variant_id: crate::parser::VariantId,
+        byte_len: Option<u64>,
+        duration: std::time::Duration,
+    },
+    SegmentEnd {
+        sequence: u64,
+        variant_id: crate::parser::VariantId,
+    },
+}
 
 /// Parameters for creating an HLS stream.
 #[derive(Debug, Clone)]
@@ -97,7 +129,7 @@ impl HlsStream {
         url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
-    ) -> Result<Self, HlsStreamError> {
+    ) -> Result<Self, HlsError> {
         Self::new_with_config(url, settings, storage_handle).await
     }
 
@@ -111,7 +143,7 @@ impl HlsStream {
         url: Url,
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
-    ) -> Result<Self, HlsStreamError> {
+    ) -> Result<Self, HlsError> {
         // Create channels for data and commands
         // Use bounded channel for data to control backpressure with configurable buffer size
         let buffer_size = settings.prefetch_buffer_size;
@@ -169,14 +201,14 @@ impl HlsStream {
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
         worker: HlsStreamWorker,
-    ) -> Result<Self, HlsStreamError> {
+    ) -> Result<Self, HlsError> {
         let streaming_task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
             let result = worker.run().await;
 
             if let Err(e) = result {
                 match e {
-                    HlsStreamError::Cancelled => {
+                    HlsError::Cancelled => {
                         tracing::trace!("HLS streaming task cancelled")
                     }
                     _ => tracing::error!("HLS streaming loop error: {}", e),
@@ -206,8 +238,11 @@ impl HlsStream {
     /// Supports forward and backward seeks. Backward seek will reset the internal controller
     /// state and replay from the start using byte-range where possible.
     #[inline(always)]
-    async fn seek_internal(&self, position: u64) -> Result<(), HlsStreamError> {
-        self.seek_sender.send(position).await?;
+    async fn seek_internal(&self, position: u64) -> Result<(), HlsError> {
+        self.seek_sender
+            .send(position)
+            .await
+            .map_err(|_| HlsError::SeekFailed)?;
         Ok(())
     }
 }
@@ -226,7 +261,7 @@ impl Drop for HlsStream {
 
 impl SourceStream for HlsStream {
     type Params = HlsStreamParams;
-    type StreamCreationError = HlsStreamError;
+    type StreamCreationError = crate::error::HlsError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
         Self::new(params.url, params.settings, params.storage_handle).await

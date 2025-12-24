@@ -625,9 +625,20 @@ impl HlsFixture {
         let (base_url, manager) = self.manager(storage_handle.clone(), data_tx.clone()).await;
         let master_hash = stream_download_hls::master_hash_from_url(&base_url);
 
+        let hls_settings = Arc::new(self.hls_settings.clone());
+        let abr_cfg = AbrConfig {
+            min_buffer_for_up_switch: hls_settings.abr_min_buffer_for_up_switch,
+            down_switch_buffer: hls_settings.abr_down_switch_buffer,
+            throughput_safety_factor: hls_settings.abr_throughput_safety_factor,
+            up_hysteresis_ratio: hls_settings.abr_up_hysteresis_ratio,
+            down_hysteresis_ratio: hls_settings.abr_down_hysteresis_ratio,
+            min_switch_interval: hls_settings.abr_min_switch_interval,
+        };
+
         let worker = HlsStreamWorker::new_with_manager(
             manager,
             storage_handle,
+            abr_cfg,
             data_tx,
             seek_rx,
             cancel,
@@ -686,7 +697,7 @@ impl HlsFixture {
         let worker_result = join.expect("worker task panicked");
         match worker_result {
             Ok(()) => {}
-            Err(stream_download_hls::HlsStreamError::Cancelled) => {
+            Err(stream_download_hls::HlsError::Cancelled) => {
                 // Expected when we stop the worker after collecting data.
             }
             Err(e) => panic!("worker exited with error: {:?}", e),

@@ -5,9 +5,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use url::Url;
 
+use crate::downloader::HlsByteStream;
+use crate::error::HlsError;
+use crate::stream::StreamEvent;
 use crate::{
-    AbrConfig, AbrController, HlsErrorKind, HlsManager, HlsStreamError, ResourceDownloader,
-    StreamEvent, StreamMiddleware, apply_middlewares,
+    AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware, apply_middlewares,
 };
 
 #[cfg(feature = "aes-decrypt")]
@@ -119,7 +121,7 @@ impl HlsStreamWorker {
     #[inline]
     fn emit_pre_segment_events(
         &self,
-        last_variant_id: &mut Option<crate::model::VariantId>,
+        last_variant_id: &mut Option<crate::parser::VariantId>,
         desc: &crate::manager::SegmentDescriptor,
         seg_size: Option<u64>,
         init_len_opt: Option<u64>,
@@ -164,7 +166,7 @@ impl HlsStreamWorker {
 
     /// Apply a seek position updating internal byte counters and manager state.
     #[instrument(skip(self), fields(position))]
-    async fn apply_seek_position(&mut self, position: u64) -> Result<(), HlsStreamError> {
+    async fn apply_seek_position(&mut self, position: u64) -> Result<(), HlsError> {
         if position >= self.current_position {
             self.bytes_to_skip = position - self.current_position;
         } else {
@@ -173,11 +175,11 @@ impl HlsStreamWorker {
                 .inner_stream_mut()
                 .resolve_position(position)
                 .await
-                .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                .map_err(|_| HlsError::SeekFailed)?;
             self.controller
                 .inner_stream_mut()
                 .seek_to_descriptor(&desc)
-                .map_err(|_| HlsStreamError::Hls(HlsErrorKind::SeekFailed))?;
+                .map_err(|_| HlsError::SeekFailed)?;
             self.bytes_to_skip = intra;
             self.current_position = position.saturating_sub(intra);
         }
@@ -269,10 +271,7 @@ impl HlsStreamWorker {
 
     /// Handle live refresh wait with cancellation and seek support.
     #[instrument(skip(self), fields(wait = ?wait))]
-    async fn handle_needs_refresh(
-        &mut self,
-        wait: std::time::Duration,
-    ) -> Result<(), HlsStreamError> {
+    async fn handle_needs_refresh(&mut self, wait: std::time::Duration) -> Result<(), HlsError> {
         match Self::race_with_seek(
             &self.cancel_token,
             &mut self.seek_receiver,
@@ -296,14 +295,16 @@ impl HlsStreamWorker {
 
     /// Sleep with backoff and cancellation; update retry delay.
     #[instrument(skip(self))]
-    async fn backoff_sleep(&mut self) -> Result<(), HlsStreamError> {
+    async fn backoff_sleep(&mut self) -> Result<(), HlsError> {
         tokio::select! {
             biased;
             _ = self.cancel_token.cancelled() => {
-                return Err(HlsStreamError::Cancelled);
+                return Err(HlsError::Cancelled);
             }
             _ = tokio::time::sleep(self.retry_delay) => {}
         }
+
+        // Exponential backoff with cap.
         self.retry_delay = (self.retry_delay * 2).min(Self::MAX_RETRY_DELAY);
         Ok(())
     }
@@ -313,7 +314,7 @@ impl HlsStreamWorker {
         cancel: &CancellationToken,
         seeks: &mut mpsc::Receiver<u64>,
         fut: F,
-    ) -> Result<RaceOutcome<T>, HlsStreamError>
+    ) -> Result<RaceOutcome<T>, HlsError>
     where
         F: std::future::Future<Output = T>,
     {
@@ -321,7 +322,7 @@ impl HlsStreamWorker {
         let res = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return Err(HlsStreamError::Cancelled);
+                return Err(HlsError::Cancelled);
             }
             seek = seeks.recv() => {
                 if let Some(mut position) = seek {
@@ -343,10 +344,7 @@ impl HlsStreamWorker {
 
     /// Pump bytes from a segment stream to downstream with backpressure, cancellation and seek handling.
     #[instrument(skip(self, stream))]
-    async fn pump_stream_chunks(
-        &mut self,
-        mut stream: crate::HlsByteStream,
-    ) -> Result<u64, HlsStreamError> {
+    async fn pump_stream_chunks(&mut self, mut stream: HlsByteStream) -> Result<u64, HlsError> {
         let mut gathered_len: u64 = 0;
 
         loop {
@@ -420,7 +418,7 @@ impl HlsStreamWorker {
     fn maybe_update_default_stream_key(
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
-        last_variant_id: &mut Option<crate::model::VariantId>,
+        last_variant_id: &mut Option<crate::parser::VariantId>,
     ) {
         if *last_variant_id != Some(desc.variant_id) {
             // IMPORTANT: for persistent caching with deterministic file-tree layout, the stream key MUST be:
@@ -515,8 +513,8 @@ impl HlsStreamWorker {
         seg_size: Option<u64>,
         filename_hint: Option<Arc<str>>,
         cached_len: u64,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<(), HlsStreamError> {
+        last_variant_id: &mut Option<crate::parser::VariantId>,
+    ) -> Result<(), HlsError> {
         // Cached media skip:
         // - full: consume without ChunkStart/End
         // - partial: expose suffix via `start_offset`
@@ -543,7 +541,7 @@ impl HlsStreamWorker {
             let mut guard = self
                 .segmented_length
                 .write()
-                .map_err(|_| HlsStreamError::Cancelled)?;
+                .map_err(|_| HlsError::Cancelled)?;
             guard.segments.push(DynamicLength {
                 reported: cached_len,
                 gathered: Some(cached_len),
@@ -559,7 +557,7 @@ impl HlsStreamWorker {
                 start_offset,
             }))
             .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
 
         self.data_sender
             .send(StreamMsg::Control(StreamControl::ChunkEnd {
@@ -568,7 +566,7 @@ impl HlsStreamWorker {
                 gathered_len: cached_len,
             }))
             .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
 
         // ABR: ignore cache HIT (offline-safe).
         self.emit_post_segment_events(desc);
@@ -579,7 +577,7 @@ impl HlsStreamWorker {
     async fn open_segment_stream(
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
-    ) -> Result<Option<crate::model::HlsByteStream>, HlsStreamError> {
+    ) -> Result<Option<crate::downloader::HlsByteStream>, HlsError> {
         // Build the HTTP stream (range when skipping media).
         let stream_res = if self.bytes_to_skip > 0 && !desc.is_init {
             let start = self.bytes_to_skip;
@@ -616,8 +614,8 @@ impl HlsStreamWorker {
     async fn process_network_segment(
         &mut self,
         ctx: SegmentContext,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<(), HlsStreamError> {
+        last_variant_id: &mut Option<crate::parser::VariantId>,
+    ) -> Result<(), HlsError> {
         // Network path.
         self.emit_pre_segment_events(last_variant_id, &ctx.desc, ctx.seg_size, ctx.init_len_opt);
 
@@ -642,7 +640,7 @@ impl HlsStreamWorker {
                 start_offset: 0,
             }))
             .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
 
         // Apply middlewares and pump bytes.
         let start_time = std::time::Instant::now();
@@ -666,7 +664,7 @@ impl HlsStreamWorker {
                 gathered_len,
             }))
             .await
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
 
         // Post-boundary events.
         self.emit_post_segment_events(&ctx.desc);
@@ -677,8 +675,8 @@ impl HlsStreamWorker {
     async fn process_cached_segment(
         &mut self,
         ctx: SegmentContext,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<(), HlsStreamError> {
+        last_variant_id: &mut Option<crate::parser::VariantId>,
+    ) -> Result<(), HlsError> {
         let cached_len = ctx
             .cached_len
             .expect("invariant: CachedHit plan requires cached_len");
@@ -698,14 +696,14 @@ impl HlsStreamWorker {
         .await
     }
 
-    fn push_segment_length_on_start(&self, seg_size: Option<u64>) -> Result<(), HlsStreamError> {
+    fn push_segment_length_on_start(&self, seg_size: Option<u64>) -> Result<(), HlsError> {
         // Update segmented length snapshot (best-effort) on ChunkStart.
         // We append a new segment entry in the same order we emit ChunkStart boundaries.
         let reported = seg_size.unwrap_or(0);
         let mut guard = self
             .segmented_length
             .write()
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
         guard.segments.push(DynamicLength {
             reported,
             gathered: None,
@@ -713,12 +711,12 @@ impl HlsStreamWorker {
         Ok(())
     }
 
-    fn update_segment_length_on_end(&self, gathered_len: u64) -> Result<(), HlsStreamError> {
+    fn update_segment_length_on_end(&self, gathered_len: u64) -> Result<(), HlsError> {
         // Update segmented length snapshot (best-effort) on ChunkEnd.
         let mut guard = self
             .segmented_length
             .write()
-            .map_err(|_| HlsStreamError::Cancelled)?;
+            .map_err(|_| HlsError::Cancelled)?;
         if let Some(last) = guard.segments.last_mut() {
             last.gathered = Some(gathered_len);
             // If reported was unknown (0), keep reported in sync to avoid 0-length sums.
@@ -752,8 +750,8 @@ impl HlsStreamWorker {
     async fn prepare_segment_context(
         &mut self,
         desc: crate::manager::SegmentDescriptor,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<SegmentContext, HlsStreamError> {
+        last_variant_id: &mut Option<crate::parser::VariantId>,
+    ) -> Result<SegmentContext, HlsError> {
         // Determine segment size if needed for skip math.
         let seg_size = self.compute_segment_size(&desc).await;
 
@@ -804,8 +802,8 @@ impl HlsStreamWorker {
     async fn process_descriptor(
         &mut self,
         desc: crate::manager::SegmentDescriptor,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<(), HlsStreamError> {
+        last_variant_id: &mut Option<crate::parser::VariantId>,
+    ) -> Result<(), HlsError> {
         let ctx = self.prepare_segment_context(desc, last_variant_id).await?;
 
         match ctx.plan {
@@ -829,7 +827,7 @@ impl HlsStreamWorker {
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         master_hash: String,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
-    ) -> Result<Self, HlsStreamError> {
+    ) -> Result<Self, HlsError> {
         // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
             settings.request_timeout,
@@ -855,9 +853,20 @@ impl HlsStreamWorker {
             data_sender.clone(),
         );
 
+        // ABR configuration for the worker/controller.
+        let abr_config = AbrConfig {
+            min_buffer_for_up_switch: settings.abr_min_buffer_for_up_switch,
+            down_switch_buffer: settings.abr_down_switch_buffer,
+            throughput_safety_factor: settings.abr_throughput_safety_factor,
+            up_hysteresis_ratio: settings.abr_up_hysteresis_ratio,
+            down_hysteresis_ratio: settings.abr_down_hysteresis_ratio,
+            min_switch_interval: settings.abr_min_switch_interval,
+        };
+
         Self::new_with_manager(
             manager,
             storage_handle,
+            abr_config,
             data_sender,
             seek_receiver,
             cancel_token,
@@ -881,30 +890,31 @@ impl HlsStreamWorker {
     pub async fn new_with_manager(
         mut manager: HlsManager,
         storage_handle: StorageHandle,
+        abr_config: AbrConfig,
         data_sender: mpsc::Sender<StreamMsg>,
         seek_receiver: mpsc::Receiver<u64>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         master_hash: String,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
-    ) -> Result<Self, HlsStreamError> {
+    ) -> Result<Self, HlsError> {
         // Initialize manager and ABR controller
         manager
             .load_master()
             .await
-            .map_err(|e| HlsStreamError::Hls(HlsErrorKind::MasterPlaylistLoad(e)))?;
+            .map_err(|e| e.with_context("failed to load master playlist"))?;
 
         let master = manager
             .master()
-            .ok_or_else(|| HlsStreamError::Hls(HlsErrorKind::StreamingLoopNotInitialized))?;
+            .ok_or_else(|| HlsError::StreamingLoopNotInitialized)?;
+
+        if master.variants.is_empty() {
+            return Err(HlsError::NoVariants);
+        }
 
         let settings = manager.settings().clone();
 
         let initial_variant_index = {
-            if master.variants.is_empty() {
-                return Err(HlsStreamError::Hls(HlsErrorKind::NoVariants));
-            }
-
             // If selector returns Some(VariantId) => start in MANUAL mode at that variant.
             // If selector is absent or returns None => start in AUTO mode, using manager default.
             let selected = settings
@@ -922,14 +932,7 @@ impl HlsStreamWorker {
             .bandwidth
             .unwrap_or(0) as f64;
 
-        let abr_cfg = AbrConfig {
-            min_buffer_for_up_switch: settings.abr_min_buffer_for_up_switch,
-            down_switch_buffer: settings.abr_down_switch_buffer,
-            throughput_safety_factor: settings.abr_throughput_safety_factor,
-            up_hysteresis_ratio: settings.abr_up_hysteresis_ratio,
-            down_hysteresis_ratio: settings.abr_down_hysteresis_ratio,
-            min_switch_interval: settings.abr_min_switch_interval,
-        };
+        let abr_cfg = abr_config;
         let manual_variant_id = settings
             .variant_stream_selector
             .as_ref()
@@ -946,7 +949,7 @@ impl HlsStreamWorker {
         controller
             .init()
             .await
-            .map_err(|e| HlsStreamError::Hls(HlsErrorKind::ControllerInit(e)))?;
+            .map_err(|e| e.with_context("failed to initialize ABR controller"))?;
 
         Ok(Self {
             data_sender,
@@ -966,8 +969,8 @@ impl HlsStreamWorker {
     }
 
     #[instrument(skip(self))]
-    pub async fn run(mut self) -> Result<(), HlsStreamError> {
-        let mut last_variant_id: Option<crate::model::VariantId> = None;
+    pub async fn run(mut self) -> Result<(), HlsError> {
+        let mut last_variant_id: Option<crate::parser::VariantId> = None;
         loop {
             // Fetch next segment descriptor using non-blocking method with unified race.
             //

@@ -18,7 +18,7 @@
 use self::bandwidth_estimator::BandwidthEstimator;
 use crate::HlsManager;
 use crate::manager::NextSegmentDescResult;
-use crate::model::{VariantId, VariantStream};
+use crate::parser::{VariantId, VariantStream};
 use crate::{HlsResult, MediaStream};
 use std::time::{Duration, Instant};
 use tracing::debug;

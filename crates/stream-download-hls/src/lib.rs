@@ -13,14 +13,13 @@
 //! - Start simple: single rendition, basic live support, no DRM/keys.
 //!
 //! This crate is composed of several modules:
-//! - `model`: Core data structures (playlists, segments, errors).
-//! - `parser`: Parsing of master/media M3U8 playlists.
+//! - `parser`: Parsing of master/media M3U8 playlists and associated types.
 //! - `manager`: `HlsManager` and the logic for handling a single HLS stream.
 //! - `abr`: A basic adaptive bitrate (ABR) controller.
 //! - `downloader`: Network downloader plus cached wrapper for playlists/keys.
-//! - `traits`: High-level traits for abstracting media stream sources.
 //! - `stream`: HLS implementation of the `SourceStream` trait.
 //! - `storage`: Segmented storage provider for splitting HLS segments into separate files.
+//! - `error`: Unified error types.
 //!
 //! This file (`lib.rs`) acts as a facade: it re-exports the main
 //! types and functions from the internal modules to form the public API
@@ -32,25 +31,31 @@ use std::hash::{Hash, Hasher};
 mod abr;
 mod cache;
 mod downloader;
+mod error;
 mod manager;
-mod model;
+
 mod parser;
 mod settings;
 mod storage;
 mod stream;
-mod traits;
 mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
+pub use crate::downloader::HlsByteStream;
 pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
-pub use crate::manager::{HlsManager, NextSegmentDescResult, SegmentDescriptor};
-pub use crate::model::{
-    HlsByteStream, HlsError, HlsErrorKind, HlsResult, HlsStreamError, MasterPlaylist,
-    MediaPlaylist, MediaSegment, StreamEvent, VariantId, VariantStream,
+pub use crate::error::{HlsError, HlsResult};
+pub use crate::manager::{
+    HlsManager, NextSegmentDescResult, NextSegmentResult, SegmentData, SegmentDescriptor,
+    SegmentType,
+};
+pub use crate::parser::{
+    CodecInfo, ContainerFormat, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist,
+    MediaPlaylist, MediaSegment, SegmentKey, VariantId, VariantStream,
 };
 pub use crate::parser::{parse_master_playlist, parse_media_playlist};
 pub use crate::settings::HlsSettings;
 pub use crate::storage::SegmentedStorageProvider;
+pub use crate::stream::StreamEvent;
 
 // File-tree (persistent) segment storage helpers (deterministic naming/layout).
 pub use crate::storage::hls_factory::HlsFileTreeSegmentFactory;
@@ -70,10 +75,8 @@ pub use crate::storage::cache_layer::HlsCacheLayer;
 pub type HlsPersistentStorageProvider =
     SegmentedStorageProvider<HlsCacheLayer<HlsFileTreeSegmentFactory>>;
 
+pub use crate::manager::{MediaStream, StreamMiddleware, apply_middlewares};
 pub use crate::stream::{HlsStream, HlsStreamParams};
-pub use crate::traits::{
-    MediaStream, NextSegmentResult, SegmentData, SegmentType, StreamMiddleware, apply_middlewares,
-};
 pub use crate::worker::HlsStreamWorker;
 
 #[cfg(feature = "aes-decrypt")]
