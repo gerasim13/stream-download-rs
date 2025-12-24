@@ -230,7 +230,8 @@ fn hls_aes128_drm_fixed_zero_iv_decrypts_media_segments_for_all_storage_backends
         let variant_count = 2usize;
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
-            .with_aes128_drm_fixed_zero_iv();
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true);
 
         let storage_kind =
             build_fixture_storage_kind("hls-aes128-drm-fixed-zero-iv", variant_count, storage);
@@ -278,9 +279,6 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
         // 1) key_query_params: client must append these to the key URL, otherwise the fixture returns 400.
         // 2) key_processor_cb: fixture serves a *wrapped* key; callback must unwrap it, otherwise decryption fails.
         //
-        // Note: `key_request_headers` is currently not applied by the key fetch path in the downloader,
-        // so we intentionally do not assert it here.
-        //
         // We keep fixed-zero-IV to avoid sequence/IV mismatches and focus this test on key fetch customization.
 
         let mut qp = HashMap::new();
@@ -302,9 +300,11 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
 
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
-            .with_aes128_drm_fixed_zero_iv()
-            .with_aes128_drm_wrapped_keys(cb)
-            .with_aes128_drm_key_required_query_params(Some(qp));
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true)
+            .with_wrapped_keys(true)
+            .with_key_processor_cb(Some(cb))
+            .with_key_required_query_params(Some(qp));
 
         let storage_kind = build_fixture_storage_kind(
             "hls-aes128-drm-key-params-headers-cb",
@@ -333,6 +333,415 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
         assert!(
             got_str.contains("V0-SEG-0"),
             "expected decrypted media bytes to contain 'V0-SEG-0', got: {got_str:?}"
+        );
+
+        assert!(
+            fixture.request_count_for("/key0.bin").unwrap_or(0) >= 1,
+            "expected /key0.bin to be fetched at least once"
+        );
+    })
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        // Plain AES-128 (no key processor callback). We read enough bytes to span multiple segments,
+        // then assert the key endpoint was not hit once-per-segment.
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true);
+
+        let storage_kind =
+            build_fixture_storage_kind("hls-aes128-drm-key-cache", variant_count, storage);
+
+        // Start from clean roots so we don't accidentally read cached data.
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        // Read more than the small 64 bytes used elsewhere to increase likelihood of fetching >1 segment.
+        // (Fixture segment payloads contain textual prefixes like "V0-SEG-0".)
+        let n = 4096usize;
+        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected decrypted media bytes to contain 'V0-SEG-0', got: {got_str:?}"
+        );
+
+        let key_hits = fixture.request_count_for("/key0.bin").unwrap_or(0);
+        assert!(
+            key_hits >= 1,
+            "expected /key0.bin to be fetched at least once"
+        );
+
+        // Key should be cached and reused for multiple segments; it should not be fetched for every segment.
+        // We keep this assertion loose (<= 2) to avoid flakiness from playlist refresh / retries.
+        assert!(
+            key_hits <= 2,
+            "expected key to be cached (not fetched per segment); got /key0.bin hits={key_hits}"
+        );
+    })
+}
+
+#[test]
+#[should_panic(
+    expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
+)]
+fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_persistent() {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        let mut required = HashMap::new();
+        required.insert("x-drm-token".to_string(), "abc123".to_string());
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true)
+            .with_key_required_request_headers(Some(required))
+            // Intentionally remove client config so headers are NOT sent.
+            .with_hls_config(HlsSettings::default());
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-aes128-drm-missing-key-headers",
+            variant_count,
+            "persistent",
+        );
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 256usize;
+        let _ = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+    })
+}
+
+#[test]
+#[should_panic(
+    expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
+)]
+fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_temp() {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        let mut required = HashMap::new();
+        required.insert("x-drm-token".to_string(), "abc123".to_string());
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true)
+            .with_key_required_request_headers(Some(required))
+            // Intentionally remove client config so headers are NOT sent.
+            .with_hls_config(HlsSettings::default());
+
+        let storage_kind =
+            build_fixture_storage_kind("hls-aes128-drm-missing-key-headers", variant_count, "temp");
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 256usize;
+        let _ = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+    })
+}
+
+#[test]
+#[should_panic(
+    expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
+)]
+fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_memory() {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        let mut required = HashMap::new();
+        required.insert("x-drm-token".to_string(), "abc123".to_string());
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true)
+            .with_key_required_request_headers(Some(required))
+            // Intentionally remove client config so headers are NOT sent.
+            .with_hls_config(HlsSettings::default());
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-aes128-drm-missing-key-headers",
+            variant_count,
+            "memory",
+        );
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 256usize;
+        let _ = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+    })
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+#[should_panic(expected = "HTTP status client error (404 Not Found)")]
+fn hls_base_url_default_segment_urls_404_when_segments_are_remapped(#[case] storage: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        // When the fixture serves variant playlists / init / keys / segments ONLY under a derived prefix,
+        // the code under test must use `HlsSettings::base_url` for URL resolution.
+        //
+        // IMPORTANT:
+        // - We want the fixture routing override (prefix) to be enabled,
+        // - but we must NOT configure the client `base_url` to an external host (that would cause a network error
+        //   instead of an in-fixture 404 and make this test flaky / environment-dependent).
+        //
+        // So: derive prefix from a URL on the *same* host as the fixture server, then clear client base_url again.
+        let fixture_base =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
+
+        // Bootstrap: start server to learn its base URL.
+        let storage_kind_bootstrap = build_fixture_storage_kind(
+            "hls-base-url-derived-prefix-default-404-bootstrap",
+            variant_count,
+            storage,
+        );
+
+        match &storage_kind_bootstrap {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let (server_base_url, _reader) = fixture_base
+            .stream_download_boxed(storage_kind_bootstrap)
+            .await;
+
+        // Enable prefixed-only serving in the fixture, but do NOT configure client base_url.
+        // Prefix is intentionally "deep" (multiple path components) to ensure there is no hardcoding.
+        let derived_base_url = server_base_url
+            .join("a/b/")
+            .expect("failed to build derived base_url");
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_base_url_override(Some(derived_base_url))
+            // Clear client base_url so requests go to default (non-prefixed) URLs and hit 404 in the fixture.
+            .with_hls_config(HlsSettings::default());
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-base-url-derived-prefix-default-404",
+            variant_count,
+            storage,
+        );
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 256usize;
+        let _ = read_first_n_bytes_via_worker(fixture, storage_kind, n).await;
+    })
+}
+
+#[rstest]
+#[case("persistent", "a")]
+#[case("persistent", "a/b")]
+#[case("persistent", "a/b/c")]
+#[case("temp", "a")]
+#[case("temp", "a/b")]
+#[case("temp", "a/b/c")]
+#[case("memory", "a")]
+#[case("memory", "a/b")]
+#[case("memory", "a/b/c")]
+fn hls_base_url_override_makes_segment_remap_work(#[case] storage: &str, #[case] prefix: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        // We want to validate that:
+        // - the fixture derives a prefix from `base_url` path (everything after host)
+        // - the code under test uses `HlsSettings::base_url` during URL resolution
+        //
+        // We parameterize the prefix string (depth 1..=3) to ensure there is no hardcoding for specific paths.
+        let depth = prefix.split('/').filter(|s| !s.is_empty()).count();
+
+        // Start the prefixed-only fixture server first, then take its *actual* server base URL and
+        // build a derived `base_url` from it.
+        //
+        // This avoids a second "bootstrap" fixture run that can interleave logs and obscure failures.
+        let fixture_server = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            // any URL with a deep path will do here; only the path part matters for prefix derivation
+            .with_base_url_override(Some(
+                reqwest::Url::parse("http://fixture.invalid/a/b/c/").expect("valid test base_url"),
+            ));
+
+        let storage_kind_server = build_fixture_storage_kind(
+            &format!("hls-base-url-derived-prefix-{}-server", prefix.replace('/', "_")),
+            variant_count,
+            storage,
+        );
+
+        match &storage_kind_server {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        // Start server and get real host/port.
+        let server_base_url = fixture_server.start().await;
+
+        // Now configure the client to use `base_url` on the actual server host.
+        let base_url = server_base_url
+            .join(&format!("{}/", prefix))
+            .expect("failed to build derived base_url");
+
+        let fixture = fixture_server.with_hls_config(HlsSettings::default().base_url(base_url));
+
+        let storage_kind = build_fixture_storage_kind(
+            &format!("hls-base-url-derived-prefix-{}-override-ok", prefix.replace('/', "_")),
+            variant_count,
+            storage,
+        );
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 256usize;
+        let got = read_first_n_bytes_via_worker(fixture, storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected base_url override to make derived-prefix URLs work (prefix={prefix}, depth={depth}), got: {got_str:?}"
+        );
+    })
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+fn hls_aes128_drm_succeeds_when_key_headers_not_required_and_not_sent(#[case] storage: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        // Server does NOT require headers (None), and client does NOT send any.
+        // Stream should still decrypt and produce expected plaintext.
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm()
+            .with_aes128_fixed_zero_iv(true)
+            .with_key_required_request_headers(None)
+            // Ensure client also has no headers configured.
+            .with_hls_config(HlsSettings::default());
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-aes128-drm-no-key-headers-required",
+            variant_count,
+            storage,
+        );
+
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 128usize;
+        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected DRM to succeed without key headers when not required; got: {got_str:?}"
         );
 
         assert!(

@@ -171,7 +171,7 @@ impl StorageProvider for BoxedStorageProvider {
 /// - `/master.m3u8`
 /// - `/v{idx}.m3u8` for each variant (e.g. `/v0.m3u8`, `/v1.m3u8`, ...)
 /// - `/init{idx}.bin` for each variant
-/// - `/seg/{name}` maps to the internal blob key `seg/{name}`
+/// - `/seg/{name}` maps to the internal blob key `seg/{name}` (unless remapped; see `base_url_prefix`)
 /// - `/{path}` catch-all maps to blob key `{path}`
 ///
 /// Notes:
@@ -188,6 +188,26 @@ pub struct HlsFixture {
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
     media_payload_bytes: Option<usize>,
+
+    /// Optional base URL override (full URL, not just a prefix string).
+    ///
+    /// When set, the fixture will derive a *path prefix* from this URL and serve most resources
+    /// ONLY under that prefix, to validate that the code under test resolves URLs via `base_url`.
+    ///
+    /// Example:
+    /// - base_url = `http://127.0.0.1:1234/a/b/`
+    /// - derived prefix = `a/b` (everything after host)
+    ///
+    /// Serving policy when enabled:
+    /// - `/master.m3u8` is always served at root (bootstrap never changes)
+    /// - `/<prefix>/v0.m3u8`, `/<prefix>/v1.m3u8`, ...
+    /// - `/<prefix>/init0.bin`, ...
+    /// - `/<prefix>/key0.bin`, ...
+    /// - `/<prefix>/<segment_name>` (where `<segment_name>` is what the playlist lists, e.g. `v0_0.bin`)
+    /// - default non-prefixed paths (except `/master.m3u8`) intentionally return 404
+    ///
+    /// This is parameterizable: you can pass different base_url paths to ensure there is no hardcoding.
+    base_url_override: Option<reqwest::Url>,
 
     // Optional AES-128 CBC segment encryption ("DRM") for fixture-generated media segments.
     //
@@ -279,6 +299,18 @@ struct HlsFixtureAes128Config {
     wrap_key_bytes: bool,
 }
 
+impl HlsFixtureAes128Config {
+    fn new_default(variant_count: usize) -> Self {
+        Self {
+            keys_by_variant: HlsFixture::default_variant_keys(variant_count),
+            fixed_zero_iv: false,
+            required_key_query_params: None,
+            required_key_request_headers: None,
+            wrap_key_bytes: false,
+        }
+    }
+}
+
 impl Default for HlsFixture {
     fn default() -> Self {
         Self::new_default()
@@ -302,6 +334,7 @@ impl HlsFixture {
             request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hls_settings: HlsSettings::default(),
             media_payload_bytes: None,
+            base_url_override: None,
             aes128: None,
         }
     }
@@ -342,6 +375,36 @@ impl HlsFixture {
         self
     }
 
+    /// Configure a full `base_url` override that affects ONLY the fixture server routing policy.
+    ///
+    /// The fixture derives a *path prefix* from this URL (everything after host) and serves most
+    /// resources only under that prefix, to validate that the code under test resolves URLs via `base_url`.
+    ///
+    /// Example:
+    /// - base_url = `http://127.0.0.1:1234/a/b/`
+    /// - derived prefix = `a/b`
+    ///
+    /// IMPORTANT:
+    /// This does NOT modify the client's `HlsSettings`. Tests should set client `base_url`
+    /// explicitly via `with_hls_config(...)` (or a dedicated helper) when needed.
+    ///
+    /// Pass `None` to disable the routing override (serve resources under default paths).
+    pub fn with_base_url_override(mut self, base_url: Option<reqwest::Url>) -> Self {
+        self.base_url_override = base_url;
+        self
+    }
+
+    fn derived_base_prefix(&self) -> Option<String> {
+        let url = self.base_url_override.as_ref()?;
+        let p = url.path().trim_matches('/');
+
+        if p.is_empty() {
+            None
+        } else {
+            Some(p.to_string())
+        }
+    }
+
     /// Override media payload size for generated segments. When set, payloads are padded/truncated
     /// to this size (while keeping the variant/segment prefix intact) to drive ABR heuristics.
     pub fn with_media_payload_bytes(mut self, bytes: usize) -> Self {
@@ -356,139 +419,81 @@ impl HlsFixture {
         self
     }
 
-    /// Enable AES-128 (CBC) encryption for all media segments in the fixture.
-    ///
-    /// This modifies playlists to include `#EXT-X-KEY` and encrypts the bytes served for
-    /// `seg/v{v}_*.bin`. The key is served at `key{v}.bin`.
-    ///
-    /// Notes:
-    /// - By default we omit IV in the playlist (so the client must derive IV from media sequence).
+    fn refresh_blobs_from_config(mut self) -> Self {
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+            self.aes128.as_ref(),
+        );
+        self.blobs = Arc::new(blobs);
+        self
+    }
+
+    fn aes128_mut_or_insert_default(&mut self) -> &mut HlsFixtureAes128Config {
+        if self.aes128.is_none() {
+            self.aes128 = Some(HlsFixtureAes128Config::new_default(self.variant_count));
+        }
+        self.aes128.as_mut().expect("just inserted")
+    }
+
+    /// Enable AES-128 DRM with default settings (no wrapping, no requirements, IV derived from sequence).
     pub fn with_aes128_drm(mut self) -> Self {
-        let keys_by_variant = Self::default_variant_keys(self.variant_count);
-        self.aes128 = Some(HlsFixtureAes128Config {
-            keys_by_variant,
-            fixed_zero_iv: false,
-            required_key_query_params: None,
-            required_key_request_headers: None,
-            wrap_key_bytes: false,
-        });
-
-        let blobs = Self::build_blobs_with_variants(
-            self.variant_count,
-            self.segments_per_variant,
-            self.media_payload_bytes,
-            self.aes128.as_ref(),
-        );
-        self.blobs = Arc::new(blobs);
-        self
+        self.aes128 = Some(HlsFixtureAes128Config::new_default(self.variant_count));
+        self.refresh_blobs_from_config()
     }
 
-    /// Same as `with_aes128_drm`, but forces `IV=0x000..0` in the playlist.
-    /// This is useful for debugging when you want deterministic IV without sequence math.
-    pub fn with_aes128_drm_fixed_zero_iv(mut self) -> Self {
-        let keys_by_variant = Self::default_variant_keys(self.variant_count);
-        self.aes128 = Some(HlsFixtureAes128Config {
-            keys_by_variant,
-            fixed_zero_iv: true,
-            required_key_query_params: None,
-            required_key_request_headers: None,
-            wrap_key_bytes: false,
-        });
-
-        let blobs = Self::build_blobs_with_variants(
-            self.variant_count,
-            self.segments_per_variant,
-            self.media_payload_bytes,
-            self.aes128.as_ref(),
-        );
-        self.blobs = Arc::new(blobs);
-        self
+    /// Small setter: pin IV to 0..0 (useful for deterministic tests).
+    pub fn with_aes128_fixed_zero_iv(mut self, fixed_zero_iv: bool) -> Self {
+        self.aes128_mut_or_insert_default().fixed_zero_iv = fixed_zero_iv;
+        self.refresh_blobs_from_config()
     }
 
-    /// Enable AES-128 DRM and require that key fetches include the provided query params and headers.
-    /// Require specific query params on AES-128 key requests and configure the client to append them.
-    ///
-    /// This is useful for tests that verify the downloader appends `key_query_params` to key URLs.
-    ///
-    /// IMPORTANT:
-    /// - If AES-128 is not enabled yet, this method will enable it with defaults.
-    /// - If AES-128 is already enabled, this method preserves the existing AES config.
-    pub fn with_aes128_drm_key_required_query_params(
+    /// Small setter: server requires query params for key fetch; also configures client to send them.
+    pub fn with_key_required_query_params(
         mut self,
         query_params: Option<HashMap<String, String>>,
     ) -> Self {
-        // Preserve existing AES config if already enabled; otherwise enable with defaults.
-        let mut cfg = if let Some(existing) = self.aes128.as_ref().cloned() {
-            existing
-        } else {
-            HlsFixtureAes128Config {
-                keys_by_variant: Self::default_variant_keys(self.variant_count),
-                fixed_zero_iv: false,
-                required_key_query_params: None,
-                required_key_request_headers: None,
-                wrap_key_bytes: false,
-            }
-        };
-
-        cfg.required_key_query_params = query_params.clone();
-        self.aes128 = Some(cfg);
-
-        // Configure client-side behavior.
+        self.aes128_mut_or_insert_default()
+            .required_key_query_params = query_params.clone();
         self.hls_settings = self.hls_settings.clone().key_query_params(query_params);
-
-        let blobs = Self::build_blobs_with_variants(
-            self.variant_count,
-            self.segments_per_variant,
-            self.media_payload_bytes,
-            self.aes128.as_ref(),
-        );
-        self.blobs = Arc::new(blobs);
-        self
+        self.refresh_blobs_from_config()
     }
 
-    /// Enable AES-128 DRM in "wrapped key" mode:
-    /// - fixture encrypts segments with raw keys
-    /// - fixture serves wrapped keys at `/key{v}.bin` where wrapped = raw ^ 0xFF
-    /// - caller must provide a `key_processor_cb` that unwraps (raw = wrapped ^ 0xFF)
-    pub fn with_aes128_drm_wrapped_keys(
+    /// Small setter: server requires headers for key fetch; also configures client to send them.
+    ///
+    /// Pass `None` to indicate "no requirements"; in that mode the server will not validate headers,
+    /// and the client will also be configured to send none.
+    pub fn with_key_required_request_headers(
         mut self,
-        key_processor_cb: Arc<Box<KeyProcessorCallback>>,
+        headers: Option<HashMap<String, String>>,
     ) -> Self {
-        // Enable AES if not enabled yet.
-        let mut cfg = if let Some(existing) = self.aes128.as_ref().cloned() {
-            existing
-        } else {
-            HlsFixtureAes128Config {
-                keys_by_variant: Self::default_variant_keys(self.variant_count),
-                fixed_zero_iv: false,
-                required_key_query_params: None,
-                required_key_request_headers: None,
-                wrap_key_bytes: false,
-            }
-        };
+        self.aes128_mut_or_insert_default()
+            .required_key_request_headers = headers.clone();
+        self.hls_settings = self.hls_settings.clone().key_request_headers(headers);
+        self.refresh_blobs_from_config()
+    }
 
-        // In wrapped-key mode we want a deterministic IV policy to avoid depending on
-        // media-sequence/descriptor alignment in tests that focus on key fetch/processing.
+    /// Small setter: enable/disable wrapped key serving.
+    ///
+    /// When enabled, you typically also want `with_key_processor_cb(Some(cb))` on the client.
+    pub fn with_wrapped_keys(mut self, wrap_key_bytes: bool) -> Self {
+        // Keep deterministic IV to avoid sequence alignment issues in tests focusing on key processing.
+        let cfg = self.aes128_mut_or_insert_default();
         cfg.fixed_zero_iv = true;
+        cfg.wrap_key_bytes = wrap_key_bytes;
+        self.refresh_blobs_from_config()
+    }
 
-        cfg.wrap_key_bytes = true;
-        self.aes128 = Some(cfg);
-
-        // Configure client-side unwrapping.
-        self.hls_settings = self
-            .hls_settings
-            .clone()
-            .key_processor_cb(Some(key_processor_cb));
-
-        let blobs = Self::build_blobs_with_variants(
-            self.variant_count,
-            self.segments_per_variant,
-            self.media_payload_bytes,
-            self.aes128.as_ref(),
-        );
-        self.blobs = Arc::new(blobs);
+    /// Small setter: configure the client-side key processor callback.
+    pub fn with_key_processor_cb(mut self, cb: Option<Arc<Box<KeyProcessorCallback>>>) -> Self {
+        self.hls_settings = self.hls_settings.clone().key_processor_cb(cb);
         self
     }
+
+    // -------------------------------------------------------------------------
+    // Backwards-compatible convenience wrappers (keep existing call-sites working)
+    // -------------------------------------------------------------------------
 
     /// Override the full HLS settings used by this fixture (downloader/ABR/etc).
     pub fn with_hls_config(mut self, hls_settings: HlsSettings) -> Self {
@@ -1024,49 +1029,217 @@ impl HlsFixture {
             (StatusCode::OK, headers, bytes.clone())
         }
 
-        // One compact router:
-        // - "/seg/{name}" maps to "seg/<name>"
-        // - "/{path}" serves everything else (master.m3u8, v*.m3u8, init*.bin, etc)
-        Router::new()
-            .route(
-                "/seg/{name}",
-                get({
-                    let blobs = blobs.clone();
-                    let request_counts = request_counts.clone();
-                    let key_validation = key_validation.clone();
-                    move |Path(name): Path<String>, uri: Uri, headers: HeaderMap| {
-                        let key = format!("seg/{}", name);
-                        serve_blob(
-                            Path(key),
-                            uri,
-                            headers,
-                            blobs.clone(),
-                            segment_delay,
-                            request_counts.clone(),
-                            key_validation.clone(),
-                        )
+        // Router layout:
+        //
+        // - `/master.m3u8` is always served at root (bootstrap URL never changes).
+        // - When `base_url_override` is Some(...), we derive a prefix from the URL path:
+        //     base_url = http://host:port/a/b/  => prefix = "a/b"
+        //
+        //   Then we serve most resources ONLY under that prefix:
+        //   - `/<prefix>/v0.m3u8`, `/<prefix>/v1.m3u8`, ...
+        //   - `/<prefix>/init0.bin`, ...
+        //   - `/<prefix>/key0.bin`, ...
+        //   - `/<prefix>/<segment_name>` where `<segment_name>` is what the playlist lists (e.g. `v0_0.bin`)
+        //
+        //   And all default non-prefixed paths (except `/master.m3u8`) intentionally return 404.
+        //
+        // IMPORTANT (axum routing constraints):
+        // We avoid patterns like `v{idx}.m3u8` because axum only allows one parameter per path segment.
+        // Instead we serve prefixed resources via a single `/{prefix}/{name}` handler and map `name`
+        // to the correct internal blob key.
+        let base_url_prefix = self.derived_base_prefix();
+        let mut r = Router::new();
+
+        // Master is always at root.
+        r = r.route(
+            "/master.m3u8",
+            get({
+                let blobs = blobs.clone();
+                let request_counts = request_counts.clone();
+                let key_validation = key_validation.clone();
+                move |uri: Uri, headers: HeaderMap| async move {
+                    serve_blob(
+                        Path("master.m3u8".to_string()),
+                        uri,
+                        headers,
+                        blobs.clone(),
+                        segment_delay,
+                        request_counts.clone(),
+                        key_validation.clone(),
+                    )
+                    .await
+                }
+            }),
+        );
+
+        if let Some(prefix) = base_url_prefix.as_ref() {
+            // Serve prefixed resources under an arbitrary multi-segment prefix (e.g. "a/b/c") without
+            // duplicating handler logic.
+            //
+            // Key idea:
+            // - We keep the handlers "local" and reusable.
+            // - We mount the same mini-router under a generated set of concrete prefix paths up to N=3.
+            //
+            // Why mount instead of wildcard?
+            // - In practice, the router we use here doesn't support a safe/portable "{*tail}" catch-all across
+            //   all versions/configurations, and we also want deterministic behavior.
+            //
+            // Supported after-prefix shapes:
+            // - `/<prefix>/{tail}` (single segment tail) for: v0.m3u8, init0.bin, key0.bin
+            // - `/<prefix>/seg/{seg_name}` (two segments tail) for: seg/<name> (playlist-listed segments)
+            let prefix = prefix.trim_matches('/').to_string();
+
+            // Build a small router mounted at the prefix root.
+            // This router does NOT know about the prefix; it only serves tails.
+            let tail_router = {
+                // Handler for `/<prefix>/{tail}` where tail is ONE segment.
+                let one_seg = Router::new().route(
+                    "/{tail}",
+                    get({
+                        let blobs = blobs.clone();
+                        let request_counts = request_counts.clone();
+                        let key_validation = key_validation.clone();
+                        move |Path(tail): Path<String>, uri: Uri, headers: HeaderMap| async move {
+                            let blob_key = if blobs.contains_key(&tail) {
+                                tail
+                            } else {
+                                // If it's not an exact blob key, treat it as a segment name.
+                                format!("seg/{}", tail)
+                            };
+
+                            serve_blob(
+                                Path(blob_key),
+                                uri,
+                                headers,
+                                blobs.clone(),
+                                segment_delay,
+                                request_counts.clone(),
+                                key_validation.clone(),
+                            )
+                            .await
+                            .into_response()
+                        }
+                    }),
+                );
+
+                // Handler for `/<prefix>/seg/{seg_name}` (two segments after prefix).
+                let seg_two = Router::new().route(
+                    "/seg/{seg_name}",
+                    get({
+                        let blobs = blobs.clone();
+                        let request_counts = request_counts.clone();
+                        let key_validation = key_validation.clone();
+                        move |Path(seg_name): Path<String>, uri: Uri, headers: HeaderMap| async move {
+                            let blob_key = format!("seg/{}", seg_name);
+                            serve_blob(
+                                Path(blob_key),
+                                uri,
+                                headers,
+                                blobs.clone(),
+                                segment_delay,
+                                request_counts.clone(),
+                                key_validation.clone(),
+                            )
+                            .await
+                            .into_response()
+                        }
+                    }),
+                );
+
+                Router::new().merge(seg_two).merge(one_seg)
+            };
+
+            // Mount the same `tail_router` under concrete prefix paths up to depth=3.
+            //
+            // For example, if prefix="a/b/c", we mount:
+            // - "/a"                (depth=1)
+            // - "/a/b"              (depth=2)
+            // - "/a/b/c"            (depth=3)
+            //
+            // This allows us to parameterize tests across depths and ensures no hardcoding.
+            // Also, it keeps code-paths identical for all depths.
+            let comps: Vec<&str> = prefix
+                .split('/')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // Helper: join first `d` components into a path like "/a/b".
+            let mut paths: Vec<String> = Vec::new();
+            for d in 1..=3 {
+                if comps.len() >= d {
+                    let mut p = String::new();
+                    for c in &comps[..d] {
+                        p.push('/');
+                        p.push_str(c);
                     }
-                }),
-            )
-            .route(
-                "/{path}",
-                get({
-                    let blobs = blobs.clone();
-                    let request_counts = request_counts.clone();
-                    let key_validation = key_validation.clone();
-                    move |Path(path): Path<String>, uri: Uri, headers: HeaderMap| {
-                        serve_blob(
-                            Path(path),
-                            uri,
-                            headers,
-                            blobs.clone(),
-                            segment_delay,
-                            request_counts.clone(),
-                            key_validation.clone(),
-                        )
+                    paths.push(p);
+                }
+            }
+
+            // Mount under each supported depth path.
+            for p in paths {
+                r = r.nest(&p, tail_router.clone());
+            }
+        }
+
+        // Default segment route. When prefix is enabled, this MUST be a hard 404.
+        r = r.route(
+            "/seg/{name}",
+            get({
+                let blobs = blobs.clone();
+                let request_counts = request_counts.clone();
+                let key_validation = key_validation.clone();
+                let base_url_prefix = base_url_prefix.clone();
+                move |Path(name): Path<String>, uri: Uri, headers: HeaderMap| async move {
+                    if base_url_prefix.is_some() {
+                        return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
+                            .into_response();
                     }
-                }),
-            )
+                    let key = format!("seg/{}", name);
+                    serve_blob(
+                        Path(key),
+                        uri,
+                        headers,
+                        blobs.clone(),
+                        segment_delay,
+                        request_counts.clone(),
+                        key_validation.clone(),
+                    )
+                    .await
+                    .into_response()
+                }
+            }),
+        );
+
+        // Everything else.
+        // When prefix is enabled, only allow master at root; all other root resources should 404.
+        r.route(
+            "/{path}",
+            get({
+                let blobs = blobs.clone();
+                let request_counts = request_counts.clone();
+                let key_validation = key_validation.clone();
+                let base_url_prefix = base_url_prefix.clone();
+                move |Path(path): Path<String>, uri: Uri, headers: HeaderMap| async move {
+                    if base_url_prefix.is_some() && path != "master.m3u8" {
+                        return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
+                            .into_response();
+                    }
+                    serve_blob(
+                        Path(path),
+                        uri,
+                        headers,
+                        blobs.clone(),
+                        segment_delay,
+                        request_counts.clone(),
+                        key_validation.clone(),
+                    )
+                    .await
+                    .into_response()
+                }
+            }),
+        )
     }
 
     fn build_blobs_with_variants(
