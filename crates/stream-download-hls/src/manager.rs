@@ -183,7 +183,6 @@ pub struct HlsManager {
     segment_sizes: HashMap<u64, u64>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PlaylistSnapshot {
     end_list: bool,
@@ -221,18 +220,13 @@ impl HlsManager {
             media_playlist_url: None,
             next_segment_index: 0,
             init_segment_sent: false,
-            key_cache: HashMap::with_capacity(4), // Usually 1-2 keys
-            init_segment_cache: LruCache::new(NonZeroUsize::new(8).unwrap()), // Keep last 8 init segments
+            key_cache: HashMap::new(),
+            init_segment_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
             segment_sizes: HashMap::new(),
         }
     }
 
-    /// Access the manager's settings/config.
-    ///
-    /// This is intentionally a lightweight accessor to support worker initialization paths
-    /// (e.g. `HlsStreamWorker::new_with_manager(...)`) without having to thread `Arc<HlsSettings>`
-    /// separately when a pre-built manager is injected (tests/fixtures).
-    #[inline]
+    /// Get a reference to the current settings.
     pub fn settings(&self) -> &Arc<HlsSettings> {
         &self.config
     }
@@ -327,13 +321,11 @@ impl HlsManager {
         Ok(self.current_variant()?.codec.clone())
     }
 
-    #[allow(dead_code)]
     fn current_variant_info(&self) -> HlsResult<(VariantId, Option<crate::parser::CodecInfo>)> {
         let variant = self.current_variant()?;
         Ok((variant.id, variant.codec.clone()))
     }
 
-    #[allow(dead_code)]
     fn playlist_snapshot(&self) -> HlsResult<PlaylistSnapshot> {
         let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
             HlsError::Message("no media playlist loaded; call select_variant first".to_string())

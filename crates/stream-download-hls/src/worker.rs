@@ -2,19 +2,20 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
+use tracing::{instrument, trace};
 use url::Url;
+
+use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
+use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
 use crate::manager::apply_middlewares;
 use crate::stream::StreamEvent;
-use crate::{AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware};
 
 #[cfg(feature = "aes-decrypt")]
 use crate::Aes128CbcMiddleware;
-use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
-use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
+use crate::{AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -83,10 +84,16 @@ impl HlsStreamWorker {
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
         seg_size: Option<u64>,
-    ) -> (Option<([u8; 16], [u8; 16])>, Option<u64>) {
+    ) -> Result<(Option<([u8; 16], [u8; 16])>, Option<u64>), HlsError> {
         // Resolve per-segment DRM params (if any) before building middlewares.
+        //
+        // IMPORTANT:
+        // If a segment advertises an AES-128 key, failure to resolve key/IV MUST abort.
+        // Silently streaming encrypted bytes without a decrypt middleware causes confusing downstream
+        // failures (e.g. "garbage" output and retries) and breaks test expectations.
+        //
         let drm_params_opt: Option<([u8; 16], [u8; 16])> =
-            self.resolve_drm_params_for_desc(desc).await;
+            self.resolve_drm_params_for_desc(desc).await?;
 
         // Init length is only meaningful when we stream it "as-is" (no DRM middleware).
         let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
@@ -95,7 +102,7 @@ impl HlsStreamWorker {
             seg_size
         };
 
-        (drm_params_opt, init_len_opt)
+        Ok((drm_params_opt, init_len_opt))
     }
 
     /// Build per-segment middlewares (no self borrow to avoid conflicts).
@@ -107,7 +114,14 @@ impl HlsStreamWorker {
 
         #[cfg(feature = "aes-decrypt")]
         if let Some((key, iv)) = drm_params_opt {
+            // NOTE: key is sensitive; do NOT log it. IV is safe to log for debugging.
+            trace!(
+                iv = ?iv,
+                "HLS DRM: enabling AES-128-CBC middleware for segment"
+            );
             v.push(Arc::new(Aes128CbcMiddleware::new(key, iv)));
+        } else {
+            trace!("HLS DRM: no DRM params resolved; streaming segment without DRM middleware");
         }
 
         v
@@ -248,24 +262,76 @@ impl HlsStreamWorker {
     async fn resolve_drm_params_for_desc(
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
-    ) -> Option<([u8; 16], [u8; 16])> {
+    ) -> Result<Option<([u8; 16], [u8; 16])>, HlsError> {
         #[cfg(not(feature = "aes-decrypt"))]
-        return None;
+        {
+            trace!(
+                is_init = desc.is_init,
+                sequence = desc.sequence,
+                variant_id = desc.variant_id.0,
+                "HLS DRM: aes-decrypt feature disabled; no DRM params will be resolved"
+            );
+            return Ok(None);
+        }
+
         #[cfg(feature = "aes-decrypt")]
-        return self
-            .controller
-            .inner_stream_mut()
-            .resolve_aes128_cbc_params(
-                desc.key.as_ref(),
-                if desc.is_init {
-                    None
-                } else {
-                    Some(desc.sequence)
-                },
-            )
-            .await
-            .ok()
-            .flatten();
+        {
+            trace!(
+                is_init = desc.is_init,
+                sequence = desc.sequence,
+                variant_id = desc.variant_id.0,
+                has_key = desc.key.is_some(),
+                "HLS DRM: resolving DRM params for descriptor"
+            );
+
+            let resolved_result = self
+                .controller
+                .inner_stream_mut()
+                .resolve_aes128_cbc_params(
+                    desc.key.as_ref(),
+                    if desc.is_init {
+                        None
+                    } else {
+                        Some(desc.sequence)
+                    },
+                )
+                .await;
+
+            match resolved_result {
+                Ok(Some((key, iv))) => {
+                    trace!(
+                        iv = ?iv,
+                        "HLS DRM: resolved AES-128-CBC params for descriptor"
+                    );
+                    Ok(Some((key, iv)))
+                }
+                Ok(None) => {
+                    trace!("HLS DRM: no AES-128-CBC params resolved for descriptor");
+                    Ok(None)
+                }
+                Err(e) => {
+                    // If a segment advertises encryption but we failed to resolve key/IV,
+                    // this is a hard error: continuing would stream encrypted bytes as plaintext.
+                    if desc.key.is_some() {
+                        tracing::error!(
+                            error = %e,
+                            is_init = desc.is_init,
+                            sequence = desc.sequence,
+                            variant_id = desc.variant_id.0,
+                            uri = %desc.uri,
+                            "HLS DRM: failed to resolve AES-128 params for encrypted segment"
+                        );
+                        Err(e)
+                    } else {
+                        trace!(
+                            error = %e,
+                            "HLS DRM: resolve_aes128_cbc_params failed (no key present in descriptor)"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+        }
     }
 
     /// Handle live refresh wait with cancellation and seek support.
@@ -769,7 +835,7 @@ impl HlsStreamWorker {
 
         let (drm_params_opt, init_len_opt) = self
             .resolve_segment_processing_params(&desc, seg_size)
-            .await;
+            .await?;
 
         // Side-effect: keep stitched reader following the active variant.
         self.maybe_update_default_stream_key(&desc, last_variant_id);
@@ -835,12 +901,19 @@ impl HlsStreamWorker {
             settings.max_retry_delay,
         );
 
-        let manager_downloader = ResourceDownloader::new(
+        let mut manager_downloader = ResourceDownloader::new(
             request_timeout,
             max_retries,
             retry_base_delay,
             max_retry_delay,
+            cancel_token.clone(),
         );
+
+        #[cfg(feature = "aes-decrypt")]
+        {
+            manager_downloader =
+                manager_downloader.with_key_request_headers(settings.key_request_headers.clone());
+        }
 
         // Read-before-fetch caching for playlists/keys uses the storage handle.
         // Persistence is performed by emitting `StoreResource` via the same ordered stream channel.

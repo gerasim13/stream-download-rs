@@ -31,6 +31,7 @@ use cbc::{
     cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7},
 };
 use futures_util::StreamExt;
+use tracing::trace;
 
 use crate::manager::StreamMiddleware;
 
@@ -89,6 +90,11 @@ impl StreamMiddleware for Aes128CbcMiddleware {
                                 return None;
                             }
 
+                            trace!(
+                                encrypted_len = buf.len(),
+                                "HLS DRM: AES-128-CBC decrypt finalizing buffered segment"
+                            );
+
                             let mut data = buf.to_vec();
                             let decryptor = Decryptor::<Aes128>::new((&key).into(), (&iv).into());
                             let result = decryptor
@@ -96,8 +102,22 @@ impl StreamMiddleware for Aes128CbcMiddleware {
                                 .map_err(HlsError::aes128_cbc_decrypt_failed);
 
                             let out = match result {
-                                Ok(plain) => Bytes::copy_from_slice(plain),
-                                Err(e) => return Some((Err(e), (input, BytesMut::new(), true))),
+                                Ok(plain) => {
+                                    trace!(
+                                        encrypted_len = buf.len(),
+                                        decrypted_len = plain.len(),
+                                        "HLS DRM: AES-128-CBC decrypt succeeded"
+                                    );
+                                    Bytes::copy_from_slice(plain)
+                                }
+                                Err(e) => {
+                                    trace!(
+                                        encrypted_len = buf.len(),
+                                        error = %e,
+                                        "HLS DRM: AES-128-CBC decrypt failed"
+                                    );
+                                    return Some((Err(e), (input, BytesMut::new(), true)));
+                                }
                             };
 
                             return Some((Ok(out), (input, BytesMut::new(), true)));

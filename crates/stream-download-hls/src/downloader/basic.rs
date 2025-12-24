@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::stream::{BoxStream, Stream, StreamExt};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -32,22 +34,48 @@ pub struct ResourceDownloader {
     max_retries: u32,
     retry_base_delay: Duration,
     max_retry_delay: Duration,
+
+    // Cancellation token used for ALL network operations.
+    // Making this mandatory eliminates duplication between cancellable and non-cancellable APIs.
+    cancel: CancellationToken,
+
+    // Optional headers to attach to KEY fetch requests (AES-128 DRM flows).
+    key_request_headers: Option<HashMap<String, String>>,
 }
 
 impl ResourceDownloader {
     /// Create a new downloader with the given configuration values.
+    ///
+    /// A cancellation token is mandatory and will be used for all network operations.
     pub fn new(
         request_timeout: Duration,
         max_retries: u32,
         retry_base_delay: Duration,
         max_retry_delay: Duration,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             request_timeout,
             max_retries,
             retry_base_delay,
             max_retry_delay,
+            cancel,
+            key_request_headers: None,
         }
+    }
+
+    /// Set optional headers to be sent with AES key fetch requests.
+    pub fn with_key_request_headers(
+        mut self,
+        headers: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.key_request_headers = headers;
+        self
+    }
+
+    /// Access the cancellation token used by this downloader.
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     // ----------------------------
@@ -57,20 +85,9 @@ impl ResourceDownloader {
     /// Download bytes from a URL.
     ///
     /// Includes automatic retry with exponential backoff.
+    /// This operation is always cancellable via the downloader's token.
     pub async fn download_bytes(&self, url: &str) -> HlsResult<Bytes> {
-        self.download_bytes_inner(url, None).await
-    }
-
-    /// Download bytes from a URL with cancellation support.
-    ///
-    /// The download will be aborted if the cancellation token is triggered,
-    /// including during retry delays.
-    pub async fn download_bytes_cancellable(
-        &self,
-        url: &str,
-        cancel: &CancellationToken,
-    ) -> HlsResult<Bytes> {
-        self.download_bytes_inner(url, Some(cancel)).await
+        self.download_bytes_inner(url).await
     }
 
     /// Download a playlist file fully into memory.
@@ -79,8 +96,10 @@ impl ResourceDownloader {
     }
 
     /// Download an encryption key fully into memory.
+    ///
+    /// If `key_request_headers` is set, those headers are attached to the request.
     pub async fn download_key(&self, url: &str) -> HlsResult<Bytes> {
-        self.download_bytes(url).await
+        self.download_key_inner(url).await
     }
 
     // ----------------------------
@@ -123,23 +142,17 @@ impl ResourceDownloader {
     // Internals
     // ----------------------------
 
-    async fn download_bytes_inner(
-        &self,
-        url: &str,
-        cancel: Option<&CancellationToken>,
-    ) -> HlsResult<Bytes> {
+    async fn download_bytes_inner(&self, url: &str) -> HlsResult<Bytes> {
         let mut last_error: Option<HlsError> = None;
         let mut delay = self.retry_base_delay;
 
         for attempt in 0..=self.max_retries {
             // Check cancellation before each attempt
-            if let Some(token) = cancel {
-                if token.is_cancelled() {
-                    return Err(HlsError::Cancelled);
-                }
+            if self.cancel.is_cancelled() {
+                return Err(HlsError::Cancelled);
             }
 
-            match self.try_download_once(url, cancel).await {
+            match self.try_download_once(url).await {
                 Ok(bytes) => {
                     if attempt > 0 {
                         debug!(
@@ -156,14 +169,10 @@ impl ResourceDownloader {
                     // Don't sleep after the last attempt
                     if attempt < self.max_retries {
                         // Sleep with cancellation support
-                        if let Some(token) = cancel {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => return Err(HlsError::Cancelled),
-                                _ = tokio::time::sleep(delay) => {},
-                            }
-                        } else {
-                            tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            biased;
+                            _ = self.cancel.cancelled() => return Err(HlsError::Cancelled),
+                            _ = tokio::time::sleep(delay) => {},
                         }
                         delay = (delay * 2).min(self.max_retry_delay);
                     }
@@ -174,20 +183,108 @@ impl ResourceDownloader {
         Err(last_error.unwrap_or_else(|| HlsError::io("download failed with no error")))
     }
 
-    async fn try_download_once(
-        &self,
-        url: &str,
-        cancel: Option<&CancellationToken>,
-    ) -> HlsResult<Bytes> {
+    async fn download_key_inner(&self, url: &str) -> HlsResult<Bytes> {
+        // Fast path: no custom headers => reuse the existing bytes downloader.
+        if self.key_request_headers.is_none() {
+            return self.download_bytes_inner(url).await;
+        }
+
+        // Header-aware path with retries/backoff + cancellation.
+        let mut last_error: Option<HlsError> = None;
+        let mut delay = self.retry_base_delay;
+
+        for attempt in 0..=self.max_retries {
+            // Check cancellation before each attempt
+            if self.cancel.is_cancelled() {
+                return Err(HlsError::Cancelled);
+            }
+
+            match self.try_download_key_once(url).await {
+                Ok(bytes) => {
+                    if attempt > 0 {
+                        debug!(
+                            url = url,
+                            attempts = attempt + 1,
+                            "key download succeeded after retry"
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+
+                    // Don't sleep after the last attempt
+                    if attempt < self.max_retries {
+                        // Sleep with cancellation support
+                        tokio::select! {
+                            biased;
+                            _ = self.cancel.cancelled() => return Err(HlsError::Cancelled),
+                            _ = tokio::time::sleep(delay) => {},
+                        }
+                        delay = (delay * 2).min(self.max_retry_delay);
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| HlsError::io("key download failed with no error")))
+    }
+
+    async fn try_download_once(&self, url: &str) -> HlsResult<Bytes> {
         let url_parsed = parse_url(url)?;
         let url_str = url_parsed.to_string();
         let http = self.create_stream(url_parsed).await?;
 
-        // Collect all chunks with a global timeout and optional cancellation
-        let collect_future = Self::collect_stream_to_bytes(http, cancel);
+        // Collect all chunks with a global timeout and cancellation.
+        let collect_future = Self::collect_stream_to_bytes(http, &self.cancel);
         match timeout(self.request_timeout, collect_future).await {
             Ok(res) => res,
             Err(_) => Err(HlsError::timeout(url_str)),
+        }
+    }
+
+    async fn try_download_key_once(&self, url: &str) -> HlsResult<Bytes> {
+        let url_parsed = parse_url(url)?;
+        let url_str = url_parsed.to_string();
+
+        let mut headers = HeaderMap::new();
+        if let Some(h) = &self.key_request_headers {
+            for (k, v) in h {
+                let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
+                    HlsError::io_kind(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+                let value = HeaderValue::from_str(v).map_err(|e| {
+                    HlsError::io_kind(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+                headers.insert(name, value);
+            }
+        }
+
+        // Create HttpStream using the shared client, but with custom request headers.
+        // Race creation with cancellation.
+        let create_fut =
+            HttpStream::<ReqwestClient>::create_with_headers(url_parsed.clone(), headers);
+
+        let http = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(HlsError::Cancelled),
+            res = timeout(self.request_timeout, create_fut) => {
+                match res {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        let msg = e.decode_error().await;
+                        return Err(HlsError::http_stream_create_failed(msg));
+                    }
+                    Err(_) => return Err(HlsError::timeout(url_str)),
+                }
+            }
+        };
+
+        // Collect all chunks with a global timeout and cancellation.
+        let collect_future = Self::collect_stream_to_bytes(http, &self.cancel);
+        match timeout(self.request_timeout, collect_future).await {
+            Ok(res) => res,
+            Err(_) => Err(HlsError::timeout(url_parsed.to_string())),
         }
     }
 
@@ -224,7 +321,7 @@ impl ResourceDownloader {
 
     async fn collect_stream_to_bytes<S, E>(
         mut stream: S,
-        cancel: Option<&CancellationToken>,
+        cancel: &CancellationToken,
     ) -> HlsResult<Bytes>
     where
         S: Stream<Item = Result<StreamMsg, E>> + Unpin,
@@ -234,14 +331,10 @@ impl ResourceDownloader {
 
         loop {
             // Support cancellation while reading
-            let next = if let Some(token) = cancel {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => return Err(HlsError::Cancelled),
-                    item = stream.next() => item,
-                }
-            } else {
-                stream.next().await
+            let next = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(HlsError::Cancelled),
+                item = stream.next() => item,
             };
 
             match next {

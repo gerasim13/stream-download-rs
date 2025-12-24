@@ -96,6 +96,19 @@ pub trait Client: Send + Sync + Unpin + 'static {
         url: &Self::Url,
     ) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send;
 
+    /// Sends an HTTP GET request to the URL with additional request headers.
+    ///
+    /// Default implementation delegates to `get` and ignores `headers`. Client implementations
+    /// can override to support per-request headers (e.g. key fetch customization).
+    fn get_with_headers(
+        &self,
+        url: &Self::Url,
+        headers: Self::Headers,
+    ) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send {
+        let _ = headers;
+        self.get(url)
+    }
+
     /// Sends an HTTP GET request to the URL utilizing the `Range` header to request a specific part
     /// of the stream.
     ///
@@ -106,6 +119,22 @@ pub trait Client: Send + Sync + Unpin + 'static {
         start: u64,
         end: Option<u64>,
     ) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send;
+
+    /// Sends an HTTP GET request to the URL utilizing the `Range` header with additional request
+    /// headers.
+    ///
+    /// Default implementation delegates to `get_range` and ignores `headers`. Client
+    /// implementations can override to support per-request headers (e.g. DRM/key flows).
+    fn get_range_with_headers(
+        &self,
+        url: &Self::Url,
+        start: u64,
+        end: Option<u64>,
+        headers: Self::Headers,
+    ) -> impl Future<Output = Result<Self::Response, Self::Error>> + Send {
+        let _ = headers;
+        self.get_range(url, start, end)
+    }
 }
 
 /// Represents the content type HTTP response header
@@ -268,6 +297,85 @@ impl<C: Client> HttpStream<C> {
             headers,
             url,
         })
+    }
+
+    /// Creates a new [`HttpStream`] from a [`Client`], adding custom request headers.
+    ///
+    /// This is intended for flows that require per-request headers (e.g. DRM key fetches).
+    /// Client implementations that don't support custom request headers may ignore them.
+    #[instrument(skip(client, url, request_headers), fields(url = url.to_string()))]
+    pub async fn new_with_headers(
+        client: C,
+        url: <Self as SourceStream>::Params,
+        request_headers: C::Headers,
+    ) -> Result<Self, HttpStreamError<C>> {
+        debug!("requesting stream content (custom headers)");
+        let request_start = Instant::now();
+
+        let response = client
+            .get_with_headers(&url, request_headers)
+            .await
+            .map_err(HttpStreamError::FetchFailure)?;
+        debug!(
+            duration = format!("{:?}", request_start.elapsed()),
+            "request finished"
+        );
+
+        let response = response
+            .into_result()
+            .map_err(HttpStreamError::ResponseFailure)?;
+        let content_length = response.content_length().map_or_else(
+            || {
+                warn!("content length header missing");
+                ContentLength::new_unknown()
+            },
+            |content_length| {
+                debug!(content_length, "received content length");
+                ContentLength::new_static(content_length)
+            },
+        );
+
+        let content_type = response.content_type().map_or_else(
+            || {
+                warn!("content type header missing");
+                None
+            },
+            |content_type| {
+                debug!(content_type, "received content type");
+                match content_type.parse::<MediaTypeBuf>() {
+                    Ok(content_type) => Some(ContentType {
+                        r#type: content_type.ty().to_string(),
+                        subtype: content_type.subty().to_string(),
+                    }),
+                    Err(e) => {
+                        warn!("error parsing content type: {e:?}");
+                        None
+                    }
+                }
+            },
+        );
+
+        let headers = response.headers();
+        let stream = response.stream();
+        Ok(Self {
+            stream: Box::new(stream),
+            client,
+            content_length,
+            content_type,
+            headers,
+            url,
+        })
+    }
+
+    /// Create a stream using the default client, but with custom request headers.
+    ///
+    /// Useful when callers rely on the shared global client but need per-request headers.
+    #[instrument(skip(url, request_headers), fields(url = url.to_string()))]
+    pub async fn create_with_headers(
+        url: <Self as SourceStream>::Params,
+        request_headers: C::Headers,
+    ) -> Result<Self, HttpStreamError<C>> {
+        Self::new_with_headers(C::create(), url, request_headers).await
     }
 
     /// The [`ContentType`] of the response stream.

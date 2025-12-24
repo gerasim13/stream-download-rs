@@ -16,10 +16,14 @@ categories = ["multimedia", "asynchronous", "caching"]
 keywords = ["audio", "stream", "media"]
 
 [workspace.dependencies]
+aes = "0.8"
 async-trait = "0.1.68"
 bytes = "1.10"
+cbc = "0.1"
 educe = "0.6"
 futures-util = "0.3"
+hls_m3u8 = "0.5.1"
+lru = "0.12.0"
 mediatype = "0.21"
 opendal = "0.55"
 parking_lot = "0.12.1"

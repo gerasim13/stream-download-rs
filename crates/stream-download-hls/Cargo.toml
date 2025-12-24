@@ -16,19 +16,19 @@ keywords.workspace = true
 [dependencies]
 stream-download = { version = "0.22.9", path = "../stream-download" }
 tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+aes = { workspace = true, optional = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+cbc = { workspace = true, optional = true }
 futures-util = { workspace = true }
+hls_m3u8 = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-aes = { version = "0.8", optional = true }
-cbc = { version = "0.1", optional = true }
-lru = "0.12.0"
-hls_m3u8 = "0.4"
 
 [features]
 default = []

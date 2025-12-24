@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use bytes::Bytes;
 use futures_util::Stream;
 use reqwest::header::{self, AsHeaderName, HeaderMap};
-use tracing::warn;
+use tracing::{trace, warn};
 
 use super::{DecodeError, RANGE_HEADER_KEY, format_range_header_bytes};
 use crate::http::{Client, ClientResponse, ResponseHeaders};
@@ -20,7 +20,7 @@ impl ResponseHeaders for HeaderMap {
 fn get_header_str<K: AsHeaderName>(headers: &HeaderMap, key: K) -> Option<&str> {
     headers.get(key).and_then(|val| {
         val.to_str()
-            .inspect_err(|e| warn!("error converting header value: {e:?}"))
+            .inspect_err(|e| trace!("error converting header value: {e:?}"))
             .ok()
     })
 }
@@ -111,6 +111,14 @@ impl Client for reqwest::Client {
         self.get(url.clone()).send().await
     }
 
+    async fn get_with_headers(
+        &self,
+        url: &Self::Url,
+        headers: Self::Headers,
+    ) -> Result<Self::Response, Self::Error> {
+        self.get(url.clone()).headers(headers).send().await
+    }
+
     async fn get_range(
         &self,
         url: &Self::Url,
@@ -118,6 +126,20 @@ impl Client for reqwest::Client {
         end: Option<u64>,
     ) -> Result<Self::Response, Self::Error> {
         self.get(url.clone())
+            .header(RANGE_HEADER_KEY, format_range_header_bytes(start, end))
+            .send()
+            .await
+    }
+
+    async fn get_range_with_headers(
+        &self,
+        url: &Self::Url,
+        start: u64,
+        end: Option<u64>,
+        headers: Self::Headers,
+    ) -> Result<Self::Response, Self::Error> {
+        self.get(url.clone())
+            .headers(headers)
             .header(RANGE_HEADER_KEY, format_range_header_bytes(start, end))
             .send()
             .await

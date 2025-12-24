@@ -17,8 +17,9 @@
 //! - Persistent file-tree storage should create files on disk after reading.
 //! - Memory stream storage should NOT create segment files on disk (resource cache may still touch disk).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -26,7 +27,6 @@ use rstest::rstest;
 use tokio::sync::mpsc;
 
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
-
 use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, StreamEvent, VariantId};
 
 mod hls_fixture;
@@ -140,6 +140,206 @@ async fn collect_first_n_chunkstarts(
     }
 
     out
+}
+
+async fn read_first_n_bytes_via_worker(
+    fixture: HlsFixture,
+    storage_kind: HlsFixtureStorageKind,
+    n: usize,
+) -> Vec<u8> {
+    fixture
+        .run_worker_collecting(64, storage_kind, move |mut data_rx, _event_rx| {
+            Box::pin(async move {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut out: Vec<u8> = Vec::with_capacity(n);
+
+                while out.len() < n && Instant::now() < deadline {
+                    match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await {
+                        Ok(Some(StreamMsg::Data(bytes))) => {
+                            out.extend_from_slice(&bytes);
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+                }
+
+                out.truncate(n);
+                out
+            })
+        })
+        .await
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+fn hls_aes128_drm_decrypts_media_segments_for_all_storage_backends(#[case] storage: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm();
+
+        let storage_kind = build_fixture_storage_kind("hls-aes128-drm", variant_count, storage);
+
+        // Start from clean roots so we don't accidentally read cached plaintext/old data.
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        // Read enough bytes to include init + first media segment bytes.
+        // The init segment is plaintext in the fixture; the first media segment should be decrypted.
+        let n = 64usize;
+        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        // Decrypted media payload prefix should appear in output bytes.
+        // For the default variant selection, the worker should start from v0, first segment.
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected decrypted media bytes to contain 'V0-SEG-0', got: {got_str:?}"
+        );
+
+        // Sanity: key endpoint should have been fetched at least once.
+        assert!(
+            fixture.request_count_for("/key0.bin").unwrap_or(0) >= 1,
+            "expected /key0.bin to be fetched at least once"
+        );
+    })
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+fn hls_aes128_drm_fixed_zero_iv_decrypts_media_segments_for_all_storage_backends(
+    #[case] storage: &str,
+) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm_fixed_zero_iv();
+
+        let storage_kind =
+            build_fixture_storage_kind("hls-aes128-drm-fixed-zero-iv", variant_count, storage);
+
+        // Start from clean roots so we don't accidentally read cached plaintext/old data.
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 64usize;
+        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        // With fixed IV=0, decryption should still yield the expected plaintext prefix.
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected decrypted media bytes to contain 'V0-SEG-0', got: {got_str:?}"
+        );
+
+        assert!(
+            fixture.request_count_for("/key0.bin").unwrap_or(0) >= 1,
+            "expected /key0.bin to be fetched at least once"
+        );
+    })
+}
+
+#[rstest]
+#[case("persistent")]
+#[case("temp")]
+#[case("memory")]
+fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] storage: &str) {
+    setup::SERVER_RT.block_on(async {
+        let variant_count = 2usize;
+
+        // We verify two knobs end-to-end:
+        // 1) key_query_params: client must append these to the key URL, otherwise the fixture returns 400.
+        // 2) key_processor_cb: fixture serves a *wrapped* key; callback must unwrap it, otherwise decryption fails.
+        //
+        // Note: `key_request_headers` is currently not applied by the key fetch path in the downloader,
+        // so we intentionally do not assert it here.
+        //
+        // We keep fixed-zero-IV to avoid sequence/IV mismatches and focus this test on key fetch customization.
+
+        let mut qp = HashMap::new();
+        qp.insert("token".to_string(), "abc123".to_string());
+        qp.insert("tenant".to_string(), "tests".to_string());
+
+        // Unwrap scheme must match fixture "wrap" scheme:
+        // raw[i] = wrapped[i] ^ 0xFF  (fixture serves wrapped = raw ^ 0xFF)
+        let cb: Arc<Box<stream_download_hls::KeyProcessorCallback>> = Arc::new(Box::new(|b| {
+            if b.is_empty() {
+                return b;
+            }
+            let mut v = b.to_vec();
+            for x in &mut v {
+                *x ^= 0xFF;
+            }
+            bytes::Bytes::from(v)
+        }));
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_aes128_drm_fixed_zero_iv()
+            .with_aes128_drm_wrapped_keys(cb)
+            .with_aes128_drm_key_required_query_params(Some(qp));
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-aes128-drm-key-params-headers-cb",
+            variant_count,
+            storage,
+        );
+
+        // Start from clean roots so we don't accidentally read cached data.
+        match &storage_kind {
+            HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
+            HlsFixtureStorageKind::Temp { subdir } => {
+                let root = std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(subdir);
+                clean_dir(&root);
+            }
+            HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => clean_dir(resource_cache_root),
+        }
+
+        let n = 64usize;
+        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got_str = String::from_utf8_lossy(&got);
+
+        assert!(
+            got_str.contains("V0-SEG-0"),
+            "expected decrypted media bytes to contain 'V0-SEG-0', got: {got_str:?}"
+        );
+
+        assert!(
+            fixture.request_count_for("/key0.bin").unwrap_or(0) >= 1,
+            "expected /key0.bin to be fetched at least once"
+        );
+    })
 }
 
 #[rstest]

@@ -9,6 +9,7 @@ use hls_m3u8::Decryptable;
 use hls_m3u8::MasterPlaylist as HlsMasterPlaylist;
 use hls_m3u8::MediaPlaylist as HlsMediaPlaylist;
 use hls_m3u8::tags::VariantStream as HlsVariantStreamTag;
+use hls_m3u8::types::DecryptionKey as HlsDecryptionKey;
 
 use crate::error::{HlsError, HlsResult};
 
@@ -199,29 +200,62 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
     // Some servers set Playlist-Type=VOD or EVENT without a terminal ENDLIST.
     let end_list = input.contains("#EXT-X-ENDLIST");
 
-    // TODO: handle EXT-X-KEY and SAMPLE-AES via Decryptable if/when needed.
-    let current_key: Option<KeyInfo> = None;
+    // Map hls_m3u8 encryption method -> crate method.
+    //
+    // Note: in hls_m3u8 v0.4.x there is no explicit `EncryptionMethod::None` variant.
+    // Absence of `#EXT-X-KEY` is represented by having no key at all, not by a "NONE" method.
+    fn map_encryption_method(m: &hls_m3u8::types::EncryptionMethod) -> EncryptionMethod {
+        match m {
+            hls_m3u8::types::EncryptionMethod::Aes128 => EncryptionMethod::Aes128,
+            hls_m3u8::types::EncryptionMethod::SampleAes => EncryptionMethod::SampleAes,
+            other => EncryptionMethod::Other(other.to_string()),
+        }
+    }
 
+    fn keyinfo_from_decryption_key(k: &HlsDecryptionKey<'_>) -> Option<KeyInfo> {
+        let method = map_encryption_method(&k.method);
+
+        // hls_m3u8 0.5.1 exposes the URI via `DecryptionKey::uri()`
+        let uri = k.uri().trim();
+        if uri.is_empty() {
+            return None;
+        }
+
+        Some(KeyInfo {
+            method,
+            uri: Some(uri.to_string()),
+            iv: k.iv.to_slice(),
+            key_format: k.format.as_ref().map(|s| s.to_string()),
+            key_format_versions: k.versions.as_ref().map(|s| s.to_string()),
+        })
+    }
+
+    // Determine playlist-level current key (informational): first key found in the playlist.
+    let current_key: Option<KeyInfo> = hls_media
+        .segments
+        .values()
+        .find_map(|seg| seg.keys().get(0).copied())
+        .and_then(keyinfo_from_decryption_key);
+
+    // Build segments and attach the effective key for each segment.
+    //
+    // Crucial detail (matches your working implementation):
+    // `Decryptable::keys()` returns the *effective* key for a segment after applying EXT-X-KEY
+    // propagation logic.
     let segments = hls_media
         .segments
         .iter()
         .enumerate()
         .map(|(index, (_idx, seg))| {
-            // Basic key/IV extraction using Decryptable
-            let seg_key = seg.keys().get(0).map(|k| {
-                let method = EncryptionMethod::Aes128; // minimal assumption for now
-                let key_info = KeyInfo {
-                    method: method.clone(),
-                    uri: Some(k.uri().to_string()),
-                    iv: k.iv.to_slice(), // Option<[u8;16]>
-                    key_format: k.format.as_ref().map(|s| s.to_string()),
-                    key_format_versions: k.versions.as_ref().map(|s| s.to_string()),
-                };
-                SegmentKey {
-                    method,
-                    key_info: Some(key_info),
-                }
-            });
+            let seg_key: Option<SegmentKey> = seg
+                .keys()
+                .get(0)
+                .copied()
+                .and_then(keyinfo_from_decryption_key)
+                .map(|ki| SegmentKey {
+                    method: ki.method.clone(),
+                    key_info: Some(ki),
+                });
 
             MediaSegment {
                 sequence: media_sequence + index as u64,
@@ -235,20 +269,16 @@ pub fn parse_media_playlist(data: &[u8], variant_id: VariantId) -> HlsResult<Med
 
     let init_segment = hls_media.segments.iter().next().and_then(|(_, seg)| {
         seg.map.as_ref().map(|m| {
-            let map_key = m.keys().get(0).map(|k| {
-                let method = EncryptionMethod::Aes128;
-                let key_info = KeyInfo {
-                    method: method.clone(),
-                    uri: Some(k.uri().to_string()),
-                    iv: k.iv.to_slice(),
-                    key_format: k.format.as_ref().map(|s| s.to_string()),
-                    key_format_versions: k.versions.as_ref().map(|s| s.to_string()),
-                };
-                SegmentKey {
-                    method,
-                    key_info: Some(key_info),
-                }
-            });
+            let map_key: Option<SegmentKey> = m
+                .keys()
+                .get(0)
+                .copied()
+                .and_then(keyinfo_from_decryption_key)
+                .map(|ki| SegmentKey {
+                    method: ki.method.clone(),
+                    key_info: Some(ki),
+                });
+
             InitSegment {
                 uri: m.uri().to_string(),
                 key: map_key,

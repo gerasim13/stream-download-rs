@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::Path;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bytes::Bytes;
@@ -24,6 +24,13 @@ use stream_download_hls::{
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use aes::Aes128;
+use aes::cipher::BlockEncryptMut;
+use cbc::Encryptor;
+use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
+
+use stream_download_hls::KeyProcessorCallback;
 
 /// Boxed storage provider adapter for tests.
 ///
@@ -181,6 +188,18 @@ pub struct HlsFixture {
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
     media_payload_bytes: Option<usize>,
+
+    // Optional AES-128 CBC segment encryption ("DRM") for fixture-generated media segments.
+    //
+    // When enabled:
+    // - the variant playlists will include `#EXT-X-KEY:METHOD=AES-128,URI="key{v}.bin"`
+    // - each segment payload under `seg/v{v}_*.bin` is encrypted (PKCS#7 padded)
+    // - key bytes are served under `key{v}.bin`
+    //
+    // Additionally, in this mode the fixture can validate that key requests include:
+    // - required query params (key_query_params)
+    // - required headers (key_request_headers)
+    aes128: Option<HlsFixtureAes128Config>,
 }
 
 /// Which storage backend to use for tests.
@@ -237,6 +256,29 @@ impl HlsFixtureStorage {
     }
 }
 
+#[derive(Clone)]
+struct HlsFixtureAes128Config {
+    /// Per-variant 16-byte keys. These are the "raw" keys that the HLS client must ultimately use.
+    keys_by_variant: Vec<[u8; 16]>,
+
+    /// If set, the playlist will pin the IV (0..0). If false, omit IV and let the client derive it
+    /// from media sequence (HLS spec behavior).
+    fixed_zero_iv: bool,
+
+    /// If set, the fixture will require these query params on key fetches (`/key{v}.bin?...`).
+    required_key_query_params: Option<HashMap<String, String>>,
+    /// If set, the fixture will require these headers on key fetches.
+    required_key_request_headers: Option<HashMap<String, String>>,
+
+    /// If true, the fixture will serve "wrapped" key bytes from `/key{v}.bin` and encrypt segments
+    /// with the *unwrapped* key. In this mode, a `key_processor_cb` is required client-side to
+    /// unwrap the key bytes before decryption.
+    ///
+    /// Wrapping scheme (test-only):
+    /// - served_key[i] = raw_key[i] ^ 0xFF
+    wrap_key_bytes: bool,
+}
+
 impl Default for HlsFixture {
     fn default() -> Self {
         Self::new_default()
@@ -250,7 +292,8 @@ impl HlsFixture {
 
     pub fn new(variant_count: usize, segments_per_variant: usize, segment_delay: Duration) -> Self {
         assert!(variant_count >= 1, "variant_count must be >= 1");
-        let blobs = Self::build_blobs_with_variants(variant_count, segments_per_variant, None);
+        let blobs =
+            Self::build_blobs_with_variants(variant_count, segments_per_variant, None, None);
         Self {
             variant_count,
             segments_per_variant,
@@ -259,6 +302,7 @@ impl HlsFixture {
             request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hls_settings: HlsSettings::default(),
             media_payload_bytes: None,
+            aes128: None,
         }
     }
 
@@ -306,6 +350,141 @@ impl HlsFixture {
             self.variant_count,
             self.segments_per_variant,
             self.media_payload_bytes,
+            self.aes128.as_ref(),
+        );
+        self.blobs = Arc::new(blobs);
+        self
+    }
+
+    /// Enable AES-128 (CBC) encryption for all media segments in the fixture.
+    ///
+    /// This modifies playlists to include `#EXT-X-KEY` and encrypts the bytes served for
+    /// `seg/v{v}_*.bin`. The key is served at `key{v}.bin`.
+    ///
+    /// Notes:
+    /// - By default we omit IV in the playlist (so the client must derive IV from media sequence).
+    pub fn with_aes128_drm(mut self) -> Self {
+        let keys_by_variant = Self::default_variant_keys(self.variant_count);
+        self.aes128 = Some(HlsFixtureAes128Config {
+            keys_by_variant,
+            fixed_zero_iv: false,
+            required_key_query_params: None,
+            required_key_request_headers: None,
+            wrap_key_bytes: false,
+        });
+
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+            self.aes128.as_ref(),
+        );
+        self.blobs = Arc::new(blobs);
+        self
+    }
+
+    /// Same as `with_aes128_drm`, but forces `IV=0x000..0` in the playlist.
+    /// This is useful for debugging when you want deterministic IV without sequence math.
+    pub fn with_aes128_drm_fixed_zero_iv(mut self) -> Self {
+        let keys_by_variant = Self::default_variant_keys(self.variant_count);
+        self.aes128 = Some(HlsFixtureAes128Config {
+            keys_by_variant,
+            fixed_zero_iv: true,
+            required_key_query_params: None,
+            required_key_request_headers: None,
+            wrap_key_bytes: false,
+        });
+
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+            self.aes128.as_ref(),
+        );
+        self.blobs = Arc::new(blobs);
+        self
+    }
+
+    /// Enable AES-128 DRM and require that key fetches include the provided query params and headers.
+    /// Require specific query params on AES-128 key requests and configure the client to append them.
+    ///
+    /// This is useful for tests that verify the downloader appends `key_query_params` to key URLs.
+    ///
+    /// IMPORTANT:
+    /// - If AES-128 is not enabled yet, this method will enable it with defaults.
+    /// - If AES-128 is already enabled, this method preserves the existing AES config.
+    pub fn with_aes128_drm_key_required_query_params(
+        mut self,
+        query_params: Option<HashMap<String, String>>,
+    ) -> Self {
+        // Preserve existing AES config if already enabled; otherwise enable with defaults.
+        let mut cfg = if let Some(existing) = self.aes128.as_ref().cloned() {
+            existing
+        } else {
+            HlsFixtureAes128Config {
+                keys_by_variant: Self::default_variant_keys(self.variant_count),
+                fixed_zero_iv: false,
+                required_key_query_params: None,
+                required_key_request_headers: None,
+                wrap_key_bytes: false,
+            }
+        };
+
+        cfg.required_key_query_params = query_params.clone();
+        self.aes128 = Some(cfg);
+
+        // Configure client-side behavior.
+        self.hls_settings = self.hls_settings.clone().key_query_params(query_params);
+
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+            self.aes128.as_ref(),
+        );
+        self.blobs = Arc::new(blobs);
+        self
+    }
+
+    /// Enable AES-128 DRM in "wrapped key" mode:
+    /// - fixture encrypts segments with raw keys
+    /// - fixture serves wrapped keys at `/key{v}.bin` where wrapped = raw ^ 0xFF
+    /// - caller must provide a `key_processor_cb` that unwraps (raw = wrapped ^ 0xFF)
+    pub fn with_aes128_drm_wrapped_keys(
+        mut self,
+        key_processor_cb: Arc<Box<KeyProcessorCallback>>,
+    ) -> Self {
+        // Enable AES if not enabled yet.
+        let mut cfg = if let Some(existing) = self.aes128.as_ref().cloned() {
+            existing
+        } else {
+            HlsFixtureAes128Config {
+                keys_by_variant: Self::default_variant_keys(self.variant_count),
+                fixed_zero_iv: false,
+                required_key_query_params: None,
+                required_key_request_headers: None,
+                wrap_key_bytes: false,
+            }
+        };
+
+        // In wrapped-key mode we want a deterministic IV policy to avoid depending on
+        // media-sequence/descriptor alignment in tests that focus on key fetch/processing.
+        cfg.fixed_zero_iv = true;
+
+        cfg.wrap_key_bytes = true;
+        self.aes128 = Some(cfg);
+
+        // Configure client-side unwrapping.
+        self.hls_settings = self
+            .hls_settings
+            .clone()
+            .key_processor_cb(Some(key_processor_cb));
+
+        let blobs = Self::build_blobs_with_variants(
+            self.variant_count,
+            self.segments_per_variant,
+            self.media_payload_bytes,
+            self.aes128.as_ref(),
         );
         self.blobs = Arc::new(blobs);
         self
@@ -541,7 +720,9 @@ impl HlsFixture {
             hls_settings.max_retries,
             hls_settings.retry_base_delay,
             hls_settings.max_retry_delay,
-        );
+            CancellationToken::new(),
+        )
+        .with_key_request_headers(hls_settings.key_request_headers.clone());
 
         let manager = HlsManager::new(url, hls_settings, downloader, storage_handle, data_tx);
         (base_url, manager)
@@ -711,34 +892,125 @@ impl HlsFixture {
         let segment_delay = self.segment_delay;
         let request_counts = self.request_counts.clone();
 
+        // Optional validation policy for key fetch requests.
+        let key_validation = self.aes128.as_ref().map(|cfg| {
+            (
+                cfg.required_key_query_params.clone(),
+                cfg.required_key_request_headers.clone(),
+            )
+        });
+
         async fn serve_blob(
             Path(path): Path<String>,
+            uri: Uri,
+            headers_in: HeaderMap,
             blobs: Arc<HashMap<String, Bytes>>,
             segment_delay: Duration,
             request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+            key_validation: Option<(
+                Option<HashMap<String, String>>,
+                Option<HashMap<String, String>>,
+            )>,
         ) -> impl IntoResponse {
             // `path` is already without a leading slash due to router patterns.
             let key = path.trim_start_matches('/');
-            let req_path = format!("/{}", key);
+
+            // IMPORTANT:
+            // - never parse query params from `{path}` manually (encoding can differ)
+            // - use `Uri::query()` + `form_urlencoded` for robust parsing
+            // - count requests by *path only* (so `/key0.bin?token=...` counts as `/key0.bin`)
+            let path_only = key.split('?').next().unwrap_or(key);
+            let req_path = format!("/{}", path_only);
 
             // Count every request (including 404s) so tests can assert "was this fetched".
             if let Ok(mut lock) = request_counts.lock() {
-                *lock.entry(req_path).or_insert(0) += 1;
+                *lock.entry(req_path.clone()).or_insert(0) += 1;
+            }
+
+            // Validate key requests if configured.
+            if path_only.starts_with("key") && path_only.ends_with(".bin") {
+                if let Some((required_qp, required_headers)) = key_validation {
+                    // Query params validation (robust, decoded).
+                    if let Some(req) = required_qp.as_ref() {
+                        let pairs: HashMap<String, String> = uri
+                            .query()
+                            .and_then(|q| {
+                                reqwest::Url::parse(&format!("http://fixture.local/?{q}")).ok()
+                            })
+                            .map(|u| {
+                                u.query_pairs()
+                                    .into_owned()
+                                    .collect::<HashMap<String, String>>()
+                            })
+                            .unwrap_or_default();
+
+                        for (k, v) in req {
+                            match pairs.get(k) {
+                                Some(got) if got == v => {}
+                                Some(got) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        HeaderMap::new(),
+                                        Bytes::from(format!(
+                                            "missing/invalid key query param: {k}={v} (got {got})"
+                                        )),
+                                    );
+                                }
+                                None => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        HeaderMap::new(),
+                                        Bytes::from(format!(
+                                            "missing/invalid key query param: {k}={v} (got <missing>)"
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Header validation.
+                    if let Some(reqh) = required_headers.as_ref() {
+                        for (k, v) in reqh {
+                            match headers_in.get(k.as_str()).and_then(|hv| hv.to_str().ok()) {
+                                Some(got) if got == v => {}
+                                Some(got) => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        HeaderMap::new(),
+                                        Bytes::from(format!(
+                                            "missing/invalid key request header: {k}: {v} (got {got})"
+                                        )),
+                                    );
+                                }
+                                None => {
+                                    return (
+                                        StatusCode::BAD_REQUEST,
+                                        HeaderMap::new(),
+                                        Bytes::from(format!(
+                                            "missing/invalid key request header: {k}: {v} (got <missing>)"
+                                        )),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Optional artificial latency for v0 media segments.
-            if segment_delay != Duration::ZERO && key.starts_with("seg/v0_") {
+            if segment_delay != Duration::ZERO && path_only.starts_with("seg/v0_") {
                 tokio::time::sleep(segment_delay).await;
             }
 
-            let Some(bytes) = blobs.get(key) else {
+            let Some(bytes) = blobs.get(path_only) else {
                 return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new());
             };
 
             let mut headers = HeaderMap::new();
             headers.insert(
                 axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static(if key.ends_with(".m3u8") {
+                HeaderValue::from_static(if path_only.ends_with(".m3u8") {
                     "application/vnd.apple.mpegurl"
                 } else {
                     "application/octet-stream"
@@ -761,13 +1033,17 @@ impl HlsFixture {
                 get({
                     let blobs = blobs.clone();
                     let request_counts = request_counts.clone();
-                    move |Path(name): Path<String>| {
+                    let key_validation = key_validation.clone();
+                    move |Path(name): Path<String>, uri: Uri, headers: HeaderMap| {
                         let key = format!("seg/{}", name);
                         serve_blob(
                             Path(key),
+                            uri,
+                            headers,
                             blobs.clone(),
                             segment_delay,
                             request_counts.clone(),
+                            key_validation.clone(),
                         )
                     }
                 }),
@@ -777,12 +1053,16 @@ impl HlsFixture {
                 get({
                     let blobs = blobs.clone();
                     let request_counts = request_counts.clone();
-                    move |Path(path): Path<String>| {
+                    let key_validation = key_validation.clone();
+                    move |Path(path): Path<String>, uri: Uri, headers: HeaderMap| {
                         serve_blob(
                             Path(path),
+                            uri,
+                            headers,
                             blobs.clone(),
                             segment_delay,
                             request_counts.clone(),
+                            key_validation.clone(),
                         )
                     }
                 }),
@@ -793,6 +1073,7 @@ impl HlsFixture {
         variant_count: usize,
         segments_per_variant: usize,
         media_payload_bytes: Option<usize>,
+        aes128: Option<&HlsFixtureAes128Config>,
     ) -> HashMap<String, Bytes> {
         let mut blobs: HashMap<String, Bytes> = HashMap::new();
         Self::put_master(&mut blobs, variant_count);
@@ -804,6 +1085,7 @@ impl HlsFixture {
                 v,
                 seg_start..seg_end,
                 media_payload_bytes,
+                aes128,
             );
         }
         blobs
@@ -831,6 +1113,7 @@ impl HlsFixture {
         variant_index: usize,
         seg_range: std::ops::Range<usize>,
         media_payload_bytes: Option<usize>,
+        aes128: Option<&HlsFixtureAes128Config>,
     ) {
         fn put_text(blobs: &mut HashMap<String, Bytes>, path: String, body: String) {
             blobs.insert(path, Bytes::from(body));
@@ -838,19 +1121,39 @@ impl HlsFixture {
         fn put_static(blobs: &mut HashMap<String, Bytes>, path: String, body: Bytes) {
             blobs.insert(path, body);
         }
-        fn put_segment_text(blobs: &mut HashMap<String, Bytes>, path: String, payload: String) {
-            blobs.insert(path, Bytes::from(payload));
+        fn put_segment_bytes(blobs: &mut HashMap<String, Bytes>, path: String, payload: Bytes) {
+            blobs.insert(path, payload);
         }
         fn build_media_playlist(
             version: u32,
             init_uri: &str,
             seg_prefix: &str,
             range: std::ops::Range<usize>,
+            aes128: Option<&HlsFixtureAes128Config>,
+            variant_index: usize,
         ) -> String {
             let mut out = String::new();
             out.push_str("#EXTM3U\n");
             out.push_str(&format!("#EXT-X-VERSION:{version}\n"));
+
+            // Stabilize sequence/IV behavior across tests:
+            // - Explicitly set MEDIA-SEQUENCE to 0 so that descriptor sequence numbers and
+            //   playlist segment indices align deterministically.
+            out.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+
             out.push_str("#EXT-X-TARGETDURATION:1\n");
+
+            if let Some(cfg) = aes128 {
+                // HLS AES-128: key URI relative to playlist.
+                let mut key_line =
+                    format!("#EXT-X-KEY:METHOD=AES-128,URI=\"key{variant_index}.bin\"");
+                if cfg.fixed_zero_iv {
+                    key_line.push_str(",IV=0x00000000000000000000000000000000");
+                }
+                out.push_str(&key_line);
+                out.push('\n');
+            }
+
             out.push_str(&format!("#EXT-X-MAP:URI=\"{init_uri}\"\n\n"));
             for i in range.clone() {
                 out.push_str("#EXTINF:1.0,\n");
@@ -859,21 +1162,95 @@ impl HlsFixture {
             out.push_str("#EXT-X-ENDLIST\n");
             out
         }
+
         let v = variant_index;
         let playlist_path = format!("v{v}.m3u8");
         let init_path = format!("init{v}.bin");
         let seg_prefix = format!("v{v}_");
-        let playlist = build_media_playlist(7, &init_path, &seg_prefix, seg_range.clone());
+
+        let playlist =
+            build_media_playlist(7, &init_path, &seg_prefix, seg_range.clone(), aes128, v);
         put_text(blobs, playlist_path, playlist);
 
+        // If AES-128 is enabled, publish key bytes at `key{v}.bin`.
+        if let Some(cfg) = aes128 {
+            let key_path = format!("key{v}.bin");
+            let raw_key = cfg
+                .keys_by_variant
+                .get(v)
+                .copied()
+                .unwrap_or_else(|| [0u8; 16]);
+
+            let served_key: [u8; 16] = if cfg.wrap_key_bytes {
+                // Test-only wrapping: served_key = raw_key ^ 0xFF
+                let mut out = [0u8; 16];
+                for (i, b) in raw_key.iter().enumerate() {
+                    out[i] = b ^ 0xFF;
+                }
+                out
+            } else {
+                raw_key
+            };
+
+            put_static(blobs, key_path, Bytes::copy_from_slice(&served_key));
+        }
+
         // Init payloads: preserve the "INIT-V0"/"INIT-V1" pattern and extend naturally.
-        let init_payload = Bytes::from(format!("INIT-V{v}"));
-        put_static(blobs, init_path, init_payload);
+        //
+        // When AES-128 DRM is enabled, encrypt the init segment as well (AES-128-CBC + PKCS#7),
+        // matching real-world streams and production behavior.
+        let init_plain = format!("INIT-V{v}").into_bytes();
+
+        let init_bytes = if let Some(cfg) = aes128 {
+            let raw_key = cfg
+                .keys_by_variant
+                .get(v)
+                .copied()
+                .unwrap_or_else(|| [0u8; 16]);
+
+            // IV policy:
+            // - if playlist pins IV=0, use all-zero IV
+            // - otherwise use sequence-derived IV; for init, use media-sequence (0 in this fixture)
+            let iv: [u8; 16] = if cfg.fixed_zero_iv {
+                [0u8; 16]
+            } else {
+                // MEDIA-SEQUENCE is 0 in this fixture playlists.
+                [0u8; 16]
+            };
+
+            // AES-128-CBC with PKCS#7 padding (in-place API).
+            let encryptor = Encryptor::<Aes128>::new((&raw_key).into(), (&iv).into());
+
+            let msg_len = init_plain.len();
+            let mut buf = vec![0u8; msg_len + 16];
+            buf[..msg_len].copy_from_slice(&init_plain);
+
+            let ct = encryptor
+                .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+                .expect("fixture AES-128-CBC init encrypt_padded_mut failed");
+
+            Bytes::copy_from_slice(ct)
+        } else {
+            Bytes::from(init_plain)
+        };
+
+        put_static(blobs, init_path, init_bytes);
 
         // Media payloads (unique per variant/sequence).
+        //
+        // Stabilize sequence/IV derivation across tests:
+        // - treat the segment *index within the playlist* as the media sequence number
+        // - use that same number in:
+        //   * the segment URI (via `i`)
+        //   * the payload marker (`V{v}-SEG-{seq}`)
+        //   * AES IV derivation when IV is not pinned
+        //
+        // Note: we still store blobs as `seg/v{v}_{idx}.bin` to preserve existing tests.
         for (idx, i) in seg_range.enumerate() {
-            let base = format!("V{v}-SEG-{i}");
-            let payload = if let Some(n) = media_payload_bytes {
+            let seq = i;
+
+            let base = format!("V{v}-SEG-{seq}");
+            let payload_str = if let Some(n) = media_payload_bytes {
                 if n <= base.len() {
                     base.clone()
                 } else {
@@ -885,7 +1262,67 @@ impl HlsFixture {
             } else {
                 base.clone()
             };
-            put_segment_text(blobs, format!("seg/v{v}_{idx}.bin"), payload);
+
+            let out_bytes = if let Some(cfg) = aes128 {
+                // IMPORTANT:
+                // Segments are always encrypted with the RAW key (the one the client must ultimately use).
+                // If `wrap_key_bytes` is enabled, the fixture will serve a wrapped key from `/key{v}.bin`,
+                // and the client must unwrap it via `key_processor_cb` to recover this raw key.
+                let raw_key = cfg
+                    .keys_by_variant
+                    .get(v)
+                    .copied()
+                    .unwrap_or_else(|| [0u8; 16]);
+
+                // IV policy:
+                // - if playlist pins IV=0, we use all-zero IV here as well
+                // - otherwise mimic HLS default: IV derived from media sequence number
+                let iv: [u8; 16] = if cfg.fixed_zero_iv {
+                    [0u8; 16]
+                } else {
+                    let mut iv = [0u8; 16];
+                    iv[8..].copy_from_slice(&(seq as u64).to_be_bytes());
+                    iv
+                };
+
+                // AES-128-CBC with PKCS#7 padding.
+                //
+                // `cipher` crate version used here does not provide `encrypt_padded_vec_mut`,
+                // so we pad manually by allocating a buffer with extra capacity and using
+                // `encrypt_padded_mut`.
+                let encryptor = Encryptor::<Aes128>::new((&raw_key).into(), (&iv).into());
+
+                let msg = payload_str.into_bytes();
+                let msg_len = msg.len();
+
+                // Allocate enough space for PKCS#7 padding (up to one full block).
+                let mut buf = vec![0u8; msg_len + 16];
+                buf[..msg_len].copy_from_slice(&msg);
+
+                let ct = encryptor
+                    .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+                    .expect("fixture AES-128-CBC encrypt_padded_mut failed");
+
+                Bytes::copy_from_slice(ct)
+            } else {
+                Bytes::from(payload_str)
+            };
+
+            put_segment_bytes(blobs, format!("seg/v{v}_{idx}.bin"), out_bytes);
         }
+    }
+
+    fn default_variant_keys(variant_count: usize) -> Vec<[u8; 16]> {
+        // Deterministic per-variant keys for tests (NOT secure, only for fixture usage).
+        // Key v: [v, v+1, v+2, ...] truncated to 16 bytes.
+        (0..variant_count)
+            .map(|v| {
+                let mut k = [0u8; 16];
+                for (i, b) in k.iter_mut().enumerate() {
+                    *b = (v as u8).wrapping_add(i as u8);
+                }
+                k
+            })
+            .collect()
     }
 }
