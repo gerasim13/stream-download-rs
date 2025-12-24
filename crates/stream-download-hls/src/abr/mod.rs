@@ -215,11 +215,11 @@ impl<S: MediaStream> AbrController<S> {
         byte_len: u64,
         elapsed: Duration,
     ) {
-        // Feed sample to bandwidth estimator.
-        self.bandwidth_estimator.add_sample(
-            elapsed.as_millis() as f64,
-            byte_len.min(u32::MAX as u64) as u32,
-        );
+        // Feed sample to bandwidth estimator. Use sub-millisecond precision to avoid zero-duration
+        // samples that would otherwise produce a zero-weight update.
+        let duration_ms = (elapsed.as_secs_f64() * 1000.0).max(0.001);
+        self.bandwidth_estimator
+            .add_sample(duration_ms, byte_len.min(u32::MAX as u64) as u32);
 
         // Increase buffer estimate by the segment duration.
         self.buffer_seconds_estimate += duration.as_secs_f32();

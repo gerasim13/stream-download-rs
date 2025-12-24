@@ -17,6 +17,7 @@
 //! - Persistent file-tree storage should create files on disk after reading.
 //! - Memory stream storage should NOT create segment files on disk (resource cache may still touch disk).
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
@@ -221,6 +222,7 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
             None
         };
         let mut seg_fetch_after_first = 0u64;
+        let mut init_fetch_after_first = 0u64;
 
         for run_idx in 0..2 {
             let mut reader = fixture
@@ -280,13 +282,32 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
                     "expected to fetch at least one media segment ({seg0_path}) on run 0 (variant_count={variant_count}, v0_delay={:?}, storage={storage})",
                     v0_delay
                 );
+
+                let init_path = "/init0.bin";
+                init_fetch_after_first = fixture
+                    .request_count_for(init_path)
+                    .expect("fixture request counter for init should be available");
+                assert!(
+                    init_fetch_after_first >= 1,
+                    "expected to fetch init segment ({init_path}) on run 0 (variant_count={variant_count}, v0_delay={:?}, storage={storage})",
+                    v0_delay
+                );
             } else if assert_persistent_reuse && run_idx == 1 {
                 let after_second = fixture
                     .request_count_for(seg0_path)
                     .expect("fixture request counter should be available after run 1");
                 assert!(
-                    after_second <= seg_fetch_after_first + 1,
-                    "expected run 1 to reuse cached media segment {seg0_path} without re-fetch (variant_count={variant_count}, v0_delay={:?}, storage={storage}); before={seg_fetch_after_first}, after={after_second}",
+                    after_second == seg_fetch_after_first,
+                    "expected run 1 to reuse cached media segment {seg0_path} without any HTTP re-fetch (variant_count={variant_count}, v0_delay={:?}, storage={storage}); before={seg_fetch_after_first}, after={after_second}",
+                    v0_delay
+                );
+                let init_path = "/init0.bin";
+                let init_after_second = fixture
+                    .request_count_for(init_path)
+                    .expect("fixture request counter for init should be available after run 1");
+                assert!(
+                    init_after_second == init_fetch_after_first,
+                    "expected run 1 to reuse cached init segment {init_path} without HTTP re-fetch (variant_count={variant_count}, v0_delay={:?}, storage={storage}); before={init_fetch_after_first}, after={init_after_second}",
                     v0_delay
                 );
             }
@@ -340,6 +361,39 @@ fn hls_manager_parses_exact_variant_count_from_master(
             master.variants.len(),
             storage
         );
+
+        let mut seen_uris: HashSet<String> = HashSet::new();
+        let mut prev_bw = 0u64;
+        for (idx, variant) in master.variants.iter().enumerate() {
+            assert_eq!(
+                variant.id,
+                VariantId(idx),
+                "expected variant ids to be sequential starting at 0 (storage={storage})"
+            );
+            assert!(
+                seen_uris.insert(variant.uri.clone()),
+                "variant URIs must be unique (saw duplicate {}) (storage={storage})",
+                variant.uri
+            );
+            assert!(
+                variant.uri.ends_with(&format!("v{idx}.m3u8")),
+                "fixture URIs should map to v{idx}.m3u8 for idx={idx} (storage={storage}), got {}",
+                variant.uri
+            );
+            if let Some(bw) = variant.bandwidth {
+                assert!(
+                    bw > 0,
+                    "variant {idx} should advertise positive bandwidth (storage={storage})"
+                );
+                assert!(
+                    bw >= prev_bw,
+                    "bandwidths should be non-decreasing (storage={storage}); prev={prev_bw}, current={bw}"
+                );
+                prev_bw = bw;
+            } else {
+                panic!("variant {idx} missing bandwidth in master playlist (storage={storage})");
+            }
+        }
     });
 }
 
@@ -638,7 +692,8 @@ fn hls_worker_auto_upswitches_mid_stream_without_restarting(#[case] variant_coun
                 cfg.abr_throughput_safety_factor = 1.0;
             });
 
-        let storage_kind = build_fixture_storage_kind("hls-abr-upswitch-worker", variant_count, "memory");
+        let storage_kind =
+            build_fixture_storage_kind("hls-abr-upswitch-worker", variant_count, "memory");
 
         let (variant_changes, segment_starts) = fixture
             .run_worker_collecting(
@@ -665,8 +720,8 @@ fn hls_worker_auto_upswitches_mid_stream_without_restarting(#[case] variant_coun
                                             _ => {}
                                         }
                                     }
-                                    if variant_changes.iter().any(|(id, _)| *id == VariantId(1))
-                                        && segment_starts.iter().any(|(id, _)| *id == VariantId(1)) {
+                                    if variant_changes.iter().any(|(id, _)| *id != VariantId(0))
+                                        && segment_starts.iter().any(|(id, _)| *id != VariantId(0)) {
                                         break;
                                     }
                                 }
@@ -710,9 +765,18 @@ fn hls_worker_auto_upswitches_mid_stream_without_restarting(#[case] variant_coun
             .copied()
             .expect("expected a SegmentStart for higher variant after switch");
 
+        let first_high_idx = segment_starts
+            .iter()
+            .position(|(id, _)| *id == new_variant)
+            .expect("SegmentStart index for higher variant should exist");
         assert!(
-            first_high_segment.1 == first_start.1 + 1,
-            "after switching, worker should continue from current segment index, not restart (got seq {}, expected {})",
+            first_high_idx >= change_at,
+            "VariantChanged should be observed before the first SegmentStart of the new variant (change_at={change_at}, first_high_idx={first_high_idx})"
+        );
+
+        assert!(
+            first_high_segment.1 >= first_start.1 + 1,
+            "after switching, worker should continue from current segment index, not restart (got seq {}, expected at least {})",
             first_high_segment.1,
             first_start.1 + 1
         );

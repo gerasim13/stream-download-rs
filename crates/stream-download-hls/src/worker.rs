@@ -148,6 +148,35 @@ impl HlsStreamWorker {
         &mut self,
         desc: &crate::manager::SegmentDescriptor,
     ) -> Option<u64> {
+        // Best-effort: if the segment already exists in persistent storage, reuse its length to
+        // avoid a network HEAD probe.
+        let storage_len = {
+            // Build the same key used by the cache probe path below.
+            let filename_hint = {
+                let uri = desc.uri.as_str();
+                let no_query = uri.split('?').next().unwrap_or(uri);
+                no_query.rsplit('/').next().map(|s| Arc::<str>::from(s))
+            };
+            filename_hint.as_deref().and_then(|base| {
+                let seg_key: ResourceKey =
+                    format!("{}/{}", self.master_hash, desc.variant_id.0).into();
+                let full_key: ResourceKey = format!("{}/{}", seg_key.0, base).into();
+                self.storage_handle.len(&full_key).ok().flatten()
+            })
+        };
+
+        if let Some(len) = storage_len {
+            // Record the observed length to avoid future probes.
+            if desc.is_init {
+                self.controller.inner_stream_mut().set_segment_size(0, len);
+            } else {
+                self.controller
+                    .inner_stream_mut()
+                    .set_segment_size(desc.sequence, len);
+            }
+            return Some(len);
+        }
+
         let seg_size_opt = if desc.is_init {
             self.controller.inner_stream().segment_size(0)
         } else {
@@ -331,36 +360,26 @@ impl HlsStreamWorker {
         Ok(gathered_len)
     }
 
-    /// Process a single segment descriptor: computes size, handles skip, DRM, events and streaming.
-    #[instrument(skip(self, last_variant_id))]
-    async fn process_descriptor(
-        &mut self,
-        desc: crate::manager::SegmentDescriptor,
-        last_variant_id: &mut Option<crate::model::VariantId>,
-    ) -> Result<(), HlsStreamError> {
-        // Determine segment size if needed for skip math
-        let seg_size = self.compute_segment_size(&desc).await;
-
-        // Handle full-segment skip if we have enough bytes_to_skip and know size
+    /// Try to skip an entire segment if we know its size (best-effort).
+    /// Returns `true` if the segment is fully skipped and the caller should stop processing it.
+    fn try_skip_full_segment_by_size(&mut self, seg_size: Option<u64>) -> bool {
         if let (Some(size), true) = (seg_size, self.bytes_to_skip > 0) {
             if self.bytes_to_skip >= size {
                 self.bytes_to_skip -= size;
                 self.current_position += size;
-                return Ok(());
+                return true;
             }
         }
+        false
+    }
 
-        // Resolve DRM (AES-128-CBC) parameters before emitting events or building middlewares
-        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
-            self.resolve_drm_params_for_desc(&desc).await;
-        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
-            None
-        } else {
-            seg_size
-        };
-
-        // If the variant changed, notify the storage layer so the stitched reader follows the
-        // new logical stream key.
+    /// If the variant changed, notify the storage layer so the stitched reader follows the
+    /// new logical stream key.
+    fn maybe_update_default_stream_key(
+        &mut self,
+        desc: &crate::manager::SegmentDescriptor,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) {
         if *last_variant_id != Some(desc.variant_id) {
             // IMPORTANT: for persistent caching with deterministic file-tree layout, the stream key MUST be:
             // `"<master_hash>/<variant_id>"`.
@@ -372,9 +391,146 @@ impl HlsStreamWorker {
                         stream_key: new_stream_key,
                     }));
         }
+    }
 
-        self.emit_pre_segment_events(last_variant_id, &desc, seg_size, init_len_opt);
+    fn stream_key_for_desc(&self, desc: &crate::manager::SegmentDescriptor) -> ResourceKey {
+        // For persistent caching with deterministic file-tree layout, the stream key MUST be:
+        // `"<master_hash>/<variant_id>"`.
+        format!("{}/{}", self.master_hash, desc.variant_id.0).into()
+    }
 
+    fn chunk_kind_for_desc(&self, desc: &crate::manager::SegmentDescriptor) -> ChunkKind {
+        if desc.is_init {
+            ChunkKind::Init
+        } else {
+            ChunkKind::Media
+        }
+    }
+
+    fn filename_hint_for_desc(&self, desc: &crate::manager::SegmentDescriptor) -> Option<Arc<str>> {
+        // Filename hint: for now we use the URI basename (query stripped) when possible.
+        // This will be used later by file-based storage factories for deterministic naming.
+        let uri = desc.uri.as_str();
+        let no_query = uri.split('?').next().unwrap_or(uri);
+        no_query.rsplit('/').next().map(|s| Arc::<str>::from(s))
+    }
+
+    fn cached_segment_key(
+        &self,
+        stream_key: &ResourceKey,
+        filename_hint: &Option<Arc<str>>,
+    ) -> Option<ResourceKey> {
+        // We address segments by a ResourceKey that is the relative path from storage_root:
+        // "<master_hash>/<variant_id>/<segment_basename>".
+        filename_hint.as_deref().map(|base| {
+            // NOTE: variant_id is encoded into stream_key as "<master_hash>/<variant_id>".
+            // We want the full path including the segment basename.
+            ResourceKey(format!("{}/{}", stream_key.0, base).into())
+        })
+    }
+
+    /// Best-effort cache probe.
+    /// Returns `Some(len)` on HIT, `None` on MISS / error / disabled.
+    fn probe_cached_segment_len(&self, seg_key: &Option<ResourceKey>) -> Option<u64> {
+        let Some(seg_key) = seg_key.as_ref() else {
+            tracing::trace!("segment cache: disabled for this segment (missing filename_hint)");
+            return None;
+        };
+
+        match self.storage_handle.len(seg_key) {
+            Ok(Some(len)) if len > 0 => {
+                tracing::trace!("segment cache: HIT key='{}' ({} bytes)", seg_key.0, len);
+                Some(len)
+            }
+            Ok(Some(_len)) => {
+                // Exists but empty: treat as miss to allow refetch.
+                tracing::trace!(
+                    "segment cache: MISS (empty) key='{}' - treating as miss",
+                    seg_key.0
+                );
+                None
+            }
+            Ok(None) => {
+                tracing::trace!("segment cache: MISS key='{}'", seg_key.0);
+                None
+            }
+            Err(e) => {
+                tracing::trace!(
+                    "segment cache: READ ERROR key='{}' err='{}' (treating as miss)",
+                    seg_key.0,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    async fn emit_cached_segment_as_chunk(
+        &mut self,
+        desc: &crate::manager::SegmentDescriptor,
+        stream_key: ResourceKey,
+        kind: ChunkKind,
+        seg_size: Option<u64>,
+        filename_hint: Option<Arc<str>>,
+        cached_len: u64,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) -> Result<(), HlsStreamError> {
+        // Handle full-segment skip for cached data (media only).
+        if self.bytes_to_skip > 0 && !desc.is_init {
+            if self.bytes_to_skip >= cached_len {
+                self.bytes_to_skip -= cached_len;
+                self.current_position += cached_len;
+                self.emit_post_segment_events(desc);
+                return Ok(());
+            }
+            // Partial skip within cached segment is not supported yet; fall through and consume it.
+            self.bytes_to_skip = 0;
+        }
+
+        self.emit_pre_segment_events(last_variant_id, desc, seg_size, Some(cached_len));
+
+        // Update segmented length snapshot for a cached HIT: we "materialize" the
+        // segment boundary without downloading bytes.
+        {
+            let mut guard = self
+                .segmented_length
+                .write()
+                .map_err(|_| HlsStreamError::Cancelled)?;
+            guard.segments.push(DynamicLength {
+                reported: cached_len,
+                gathered: Some(cached_len),
+            });
+        }
+
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkStart {
+                stream_key: stream_key.clone(),
+                kind,
+                reported_len: seg_size.or(Some(cached_len)),
+                filename_hint: filename_hint.clone(),
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
+
+        self.data_sender
+            .send(StreamMsg::Control(StreamControl::ChunkEnd {
+                stream_key,
+                kind,
+                gathered_len: cached_len,
+            }))
+            .await
+            .map_err(|_| HlsStreamError::Cancelled)?;
+
+        // Do NOT update ABR on cache HIT: offline-safe behavior.
+        self.emit_post_segment_events(desc);
+
+        Ok(())
+    }
+
+    async fn open_segment_stream(
+        &mut self,
+        desc: &crate::manager::SegmentDescriptor,
+    ) -> Result<Option<crate::model::HlsByteStream>, HlsStreamError> {
         // Build a stream according to skip and init rules
         let stream_res = if self.bytes_to_skip > 0 && !desc.is_init {
             let start = self.bytes_to_skip;
@@ -393,8 +549,8 @@ impl HlsStreamWorker {
                 .await
         };
 
-        let stream = match stream_res {
-            Ok(s) => s,
+        match stream_res {
+            Ok(s) => Ok(Some(s)),
             Err(e) => {
                 tracing::error!(
                     "Failed to open segment stream: {}, retrying in {:?}",
@@ -402,132 +558,104 @@ impl HlsStreamWorker {
                     self.retry_delay
                 );
                 self.backoff_sleep().await?;
-                return Ok(());
+                // Retryable failure: caller should continue the loop without treating it as fatal.
+                Ok(None)
             }
-        };
-
-        // Emit ordered control message to start a new chunk in segmented storage.
-        //
-        // We store chunks under a per-variant stream key so different variants/codecs do not mix.
-        // For persistent caching with deterministic file-tree layout, the stream key MUST be:
-        // `"<master_hash>/<variant_id>"`.
-        //
-        // The stitched reader follows `SharedState::default_stream_key`, which we can switch via
-        // `StreamControl::SetDefaultStreamKey`.
-        let stream_key: ResourceKey = format!("{}/{}", self.master_hash, desc.variant_id.0).into();
-        let kind = if desc.is_init {
-            ChunkKind::Init
-        } else {
-            ChunkKind::Media
-        };
-
-        // Filename hint: for now we use the URI basename (query stripped) when possible.
-        // This will be used later by file-based storage factories for deterministic naming.
-        let filename_hint = {
-            let uri = desc.uri.as_str();
-            let no_query = uri.split('?').next().unwrap_or(uri);
-            no_query.rsplit('/').next().map(|s| Arc::<str>::from(s))
-        };
-
-        // ---------------------------------------------------------------------
-        // Segment cache probe (best-effort)
-        //
-        // We address segments by a ResourceKey that is the relative path from storage_root:
-        // "<master_hash>/<variant_id>/<segment_basename>".
-        //
-        // On HIT:
-        // - do NOT hit the network,
-        // - still emit ChunkStart/ChunkEnd so segmented storage can attach the existing file
-        //   and readers can consume it,
-        // - use StorageHandle::len for gathered_len when possible.
-        //
-        // On error:
-        // - treat as MISS (best-effort), but log.
-        // ---------------------------------------------------------------------
-        let cached_segment_key: Option<ResourceKey> = filename_hint.as_deref().map(|base| {
-            // NOTE: variant_id is encoded into stream_key as "<master_hash>/<variant_id>".
-            // We want the full path including the segment basename.
-            ResourceKey(format!("{}/{}", stream_key.0, base).into())
-        });
-
-        if let Some(seg_key) = cached_segment_key.as_ref() {
-            match self.storage_handle.len(seg_key) {
-                Ok(Some(len)) if len > 0 => {
-                    tracing::trace!("segment cache: HIT key='{}' ({} bytes)", seg_key.0, len);
-
-                    // Update segmented length snapshot for a cached HIT: we "materialize" the
-                    // segment boundary without downloading bytes.
-                    {
-                        let mut guard = self
-                            .segmented_length
-                            .write()
-                            .map_err(|_| HlsStreamError::Cancelled)?;
-                        guard.segments.push(DynamicLength {
-                            reported: len,
-                            gathered: Some(len),
-                        });
-                    }
-
-                    self.data_sender
-                        .send(StreamMsg::Control(StreamControl::ChunkStart {
-                            stream_key: stream_key.clone(),
-                            kind,
-                            reported_len: seg_size,
-                            filename_hint: filename_hint.clone(),
-                        }))
-                        .await
-                        .map_err(|_| HlsStreamError::Cancelled)?;
-
-                    self.data_sender
-                        .send(StreamMsg::Control(StreamControl::ChunkEnd {
-                            stream_key,
-                            kind,
-                            gathered_len: len,
-                        }))
-                        .await
-                        .map_err(|_| HlsStreamError::Cancelled)?;
-
-                    // Do NOT update ABR on cache HIT: offline-safe behavior.
-                    // Emit segment boundary events after finishing streaming.
-                    self.emit_post_segment_events(&desc);
-
-                    return Ok(());
-                }
-                Ok(Some(_len)) => {
-                    // Exists but empty: treat as miss to allow refetch.
-                    tracing::trace!(
-                        "segment cache: MISS (empty) key='{}' - treating as miss",
-                        seg_key.0
-                    );
-                }
-                Ok(None) => {
-                    tracing::trace!("segment cache: MISS key='{}'", seg_key.0);
-                }
-                Err(e) => {
-                    tracing::trace!(
-                        "segment cache: READ ERROR key='{}' err='{}' (treating as miss)",
-                        seg_key.0,
-                        e
-                    );
-                }
-            }
-        } else {
-            tracing::trace!("segment cache: disabled for this segment (missing filename_hint)");
         }
+    }
 
+    fn push_segment_length_on_start(&self, seg_size: Option<u64>) -> Result<(), HlsStreamError> {
         // Update segmented length snapshot (best-effort) on ChunkStart.
         // We append a new segment entry in the same order we emit ChunkStart boundaries.
-        {
-            let reported = seg_size.unwrap_or(0);
-            let mut guard = self
-                .segmented_length
-                .write()
-                .map_err(|_| HlsStreamError::Cancelled)?;
+        let reported = seg_size.unwrap_or(0);
+        let mut guard = self
+            .segmented_length
+            .write()
+            .map_err(|_| HlsStreamError::Cancelled)?;
+        guard.segments.push(DynamicLength {
+            reported,
+            gathered: None,
+        });
+        Ok(())
+    }
+
+    fn update_segment_length_on_end(&self, gathered_len: u64) -> Result<(), HlsStreamError> {
+        // Update segmented length snapshot (best-effort) on ChunkEnd.
+        let mut guard = self
+            .segmented_length
+            .write()
+            .map_err(|_| HlsStreamError::Cancelled)?;
+        if let Some(last) = guard.segments.last_mut() {
+            last.gathered = Some(gathered_len);
+            // If reported was unknown (0), keep reported in sync to avoid 0-length sums.
+            if last.reported == 0 {
+                last.reported = gathered_len;
+            }
+        } else {
+            // Should not happen (ChunkEnd without ChunkStart), but keep it robust.
             guard.segments.push(DynamicLength {
-                reported,
-                gathered: None,
+                reported: gathered_len,
+                gathered: Some(gathered_len),
             });
         }
+        Ok(())
+    }
+
+    /// Process a single segment descriptor: computes size, handles skip, DRM, events and streaming.
+    #[instrument(skip(self, last_variant_id))]
+    async fn process_descriptor(
+        &mut self,
+        desc: crate::manager::SegmentDescriptor,
+        last_variant_id: &mut Option<crate::model::VariantId>,
+    ) -> Result<(), HlsStreamError> {
+        // Determine segment size if needed for skip math
+        let seg_size = self.compute_segment_size(&desc).await;
+
+        // Handle full-segment skip if we have enough bytes_to_skip and know size
+        if self.try_skip_full_segment_by_size(seg_size) {
+            return Ok(());
+        }
+
+        // Resolve DRM (AES-128-CBC) parameters before emitting events or building middlewares
+        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
+            self.resolve_drm_params_for_desc(&desc).await;
+        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
+            None
+        } else {
+            seg_size
+        };
+
+        self.maybe_update_default_stream_key(&desc, last_variant_id);
+
+        let stream_key = self.stream_key_for_desc(&desc);
+        let kind = self.chunk_kind_for_desc(&desc);
+        let filename_hint = self.filename_hint_for_desc(&desc);
+
+        // Cache probe before network work.
+        let cached_key = self.cached_segment_key(&stream_key, &filename_hint);
+        if let Some(cached_len) = self.probe_cached_segment_len(&cached_key) {
+            return self
+                .emit_cached_segment_as_chunk(
+                    &desc,
+                    stream_key,
+                    kind,
+                    seg_size,
+                    filename_hint,
+                    cached_len,
+                    last_variant_id,
+                )
+                .await;
+        }
+
+        self.emit_pre_segment_events(last_variant_id, &desc, seg_size, init_len_opt);
+
+        let Some(stream) = self.open_segment_stream(&desc).await? else {
+            // `open_segment_stream` already performed backoff_sleep on failure.
+            return Ok(());
+        };
+
+        // Update segmented length snapshot (best-effort) on ChunkStart.
+        self.push_segment_length_on_start(seg_size)?;
 
         self.data_sender
             .send(StreamMsg::Control(StreamControl::ChunkStart {
@@ -550,26 +678,7 @@ impl HlsStreamWorker {
         self.controller
             .on_media_segment_downloaded(desc.duration, gathered_len, elapsed);
 
-        // Update segmented length snapshot (best-effort) on ChunkEnd.
-        {
-            let mut guard = self
-                .segmented_length
-                .write()
-                .map_err(|_| HlsStreamError::Cancelled)?;
-            if let Some(last) = guard.segments.last_mut() {
-                last.gathered = Some(gathered_len);
-                // If reported was unknown (0), keep reported in sync to avoid 0-length sums.
-                if last.reported == 0 {
-                    last.reported = gathered_len;
-                }
-            } else {
-                // Should not happen (ChunkEnd without ChunkStart), but keep it robust.
-                guard.segments.push(DynamicLength {
-                    reported: gathered_len,
-                    gathered: Some(gathered_len),
-                });
-            }
-        }
+        self.update_segment_length_on_end(gathered_len)?;
 
         // Emit ordered control message to finalize the chunk.
         self.data_sender
