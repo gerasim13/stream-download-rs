@@ -1029,7 +1029,7 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
             .with_segment_delay(Duration::ZERO)
             .with_hls_config(
                 HlsSettings::default()
-                    .selection_manual(VariantId(variant_idx as usize)),
+                    .variant_stream_selector(move |_| Some(VariantId(variant_idx as usize))),
             );
 
         let storage_kind = build_fixture_storage_kind("hls-worker-manual", 4, storage);

@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 rodio = { workspace = true }
 regex = { workspace = true }
+bytes = { workspace = true }
 reqwest = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
@@ -49,4 +50,8 @@ required-features = ["opendal"]
 
 [[example]]
 name = "hls"
+required-features = ["hls"]
+
+[[example]]
+name = "hls_drm"
 required-features = ["hls"]

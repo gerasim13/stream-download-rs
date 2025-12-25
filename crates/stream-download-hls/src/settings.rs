@@ -194,18 +194,10 @@ impl fmt::Debug for HlsSettings {
 }
 
 impl HlsSettings {
-    // -------------------------
-    // Constructors
-    // -------------------------
-
     /// Create default settings.
     pub fn new() -> Self {
         Self::default()
     }
-
-    // -------------------------
-    // URL resolution helpers
-    // -------------------------
 
     /// Override base URL used to form final URLs for segments and keys.
     pub fn base_url(mut self, base_url: Url) -> Self {
@@ -219,18 +211,6 @@ impl HlsSettings {
         self
     }
 
-    // -------------------------
-    // Variant selection helpers
-    // -------------------------
-
-    /// Select AUTO variant selection (ABR-controlled).
-    ///
-    /// Equivalent to clearing the selector callback.
-    pub fn selection_auto(mut self) -> Self {
-        self.variant_stream_selector = None;
-        self
-    }
-
     /// Sets a variant selector callback (return `None` for AUTO, or `Some(id)` for MANUAL).
     pub fn variant_stream_selector(
         mut self,
@@ -239,21 +219,6 @@ impl HlsSettings {
         self.variant_stream_selector = Some(Arc::new(Box::new(cb)));
         self
     }
-
-    /// Convenience helper for fixed MANUAL selection.
-    pub fn selection_manual(mut self, variant_id: VariantId) -> Self {
-        self.variant_stream_selector = Some(Arc::new(Box::new(move |_master| Some(variant_id))));
-        self
-    }
-
-    /// Returns true if selection is AUTO (no selector callback set).
-    pub fn is_selection_auto(&self) -> bool {
-        self.variant_stream_selector.is_none()
-    }
-
-    // -------------------------
-    // Downloader setters
-    // -------------------------
 
     pub fn request_timeout(mut self, v: Duration) -> Self {
         self.request_timeout = v;
@@ -274,10 +239,6 @@ impl HlsSettings {
         self.max_retry_delay = v;
         self
     }
-
-    // -------------------------
-    // HLS setters
-    // -------------------------
 
     pub fn live_refresh_interval(mut self, v: Option<Duration>) -> Self {
         self.live_refresh_interval = v;
@@ -311,10 +272,6 @@ impl HlsSettings {
         self.prefetch_buffer_size = v;
         self
     }
-
-    // -------------------------
-    // ABR setters
-    // -------------------------
 
     pub fn abr_min_buffer_for_up_switch(mut self, v: f32) -> Self {
         self.abr_min_buffer_for_up_switch = v;

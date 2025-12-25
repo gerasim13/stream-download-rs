@@ -3,8 +3,11 @@ use std::error::Error;
 use std::io::{self, ErrorKind};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use reqwest::Url;
+use rodio::cpal::FromSample;
 use stream_download::source::DecodeError;
 use stream_download::storage::ProvidesStorageHandle;
 use stream_download::{Settings, StreamDownload};
@@ -26,13 +29,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_file(false)
         .init();
 
-    let url = "https://stream.silvercomet.top/hls/master.m3u8";
+    let url = "https://stream.silvercomet.top/drm/master.m3u8";
     let url = Url::parse(url)
         .map_err(|e| io::Error::new(ErrorKind::Other, format!("invalid HLS url '{}': {e}", url)))?;
     let manual_variant_idx = 0;
     let settings = Settings::default();
     let hls_settings = HlsSettings::default()
         .variant_stream_selector(move |_| Some(VariantId(manual_variant_idx)));
+    // .key_processor_cb(Some(Arc::new(Box::new(|key| {
+    //     // this will panic for sure
+    //     Bytes::new()
+    // }))));
 
     // Persistent, deterministic on-disk storage layout:
     // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
