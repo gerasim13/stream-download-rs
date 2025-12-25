@@ -14,6 +14,7 @@ stream-download = { path = "../crates/stream-download", features = [
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal", optional = true }
 stream-download-hls = { path = "../crates/stream-download-hls", optional = true, features = ["aes-decrypt"] }
+stream-download-audio = { path = "../crates/stream-download-audio", optional = true, features = ["rodio"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 rodio = { workspace = true }
@@ -33,6 +34,7 @@ aws-sdk-s3 = { workspace = true, optional = true }
 [features]
 mpv = ["dep:libmpv2"]
 hls = ["dep:stream-download-hls"]
+audio = ["dep:stream-download-audio"]
 opendal = [
   "dep:stream-download-opendal",
   "dep:testcontainers-modules",
@@ -55,3 +57,11 @@ required-features = ["hls"]
 [[example]]
 name = "hls_drm"
 required-features = ["hls"]
+
+[[example]]
+name = "audio_hls"
+required-features = ["audio", "hls"]
+
+[[example]]
+name = "audio_mp3"
+required-features = ["audio"]
