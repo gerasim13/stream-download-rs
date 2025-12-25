@@ -86,6 +86,7 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
         let mut current_init_hash: u64 = 0;
         let mut is_collecting_init = false;
         let mut media_buffer = Vec::new();
+        let mut pending_init_bytes: Option<Bytes> = None; // Pending init to send with first media
 
         // Main reading loop
         loop {
@@ -165,19 +166,7 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
                     } else {
                         // Collecting media segment bytes
                         media_buffer.extend_from_slice(&bytes);
-
-                        // Send packet when buffer reaches reasonable size (256KB)
-                        if media_buffer.len() >= 256 * 1024 {
-                            let pkt = Packet {
-                                init_hash: current_init_hash,
-                                init_bytes: Bytes::new(), // Init already sent
-                                media_bytes: Bytes::from(std::mem::take(&mut media_buffer)),
-                                variant_index: None,
-                            };
-                            if out.send(pkt).await.is_err() {
-                                return Ok(()); // Consumer dropped
-                            }
-                        }
+                        // Note: We only send packets on ChunkEnd to ensure complete segments
                     }
                 }
                 StreamMsg::Control(control) => {
@@ -205,40 +194,30 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
                                     current_init_bytes.len()
                                 );
 
-                                // If hash changed, we need to send init bytes with next packet
+                                // If hash changed, save init bytes to send with next media packet
                                 if new_hash != current_init_hash {
                                     tracing::info!(
-                                        "HlsPacketProducer: init hash changed: {} -> {}",
+                                        "HlsPacketProducer: init hash changed: {} -> {}, saving init bytes to send with first media",
                                         current_init_hash,
                                         new_hash
                                     );
                                     current_init_hash = new_hash;
-
-                                    // Send a packet with init bytes immediately
-                                    let pkt = Packet {
-                                        init_hash: current_init_hash,
-                                        init_bytes: Bytes::from(current_init_bytes.clone()),
-                                        media_bytes: Bytes::new(),
-                                        variant_index: None,
-                                    };
-                                    tracing::info!("HlsPacketProducer: sending init packet, hash={}, init_bytes={}", current_init_hash, pkt.init_bytes.len());
-                                    if out.send(pkt).await.is_err() {
-                                        tracing::error!("HlsPacketProducer: failed to send init packet - consumer dropped");
-                                        return Ok(()); // Consumer dropped
-                                    }
+                                    pending_init_bytes = Some(Bytes::from(current_init_bytes.clone()));
                                 }
                             } else if kind == ChunkKind::Media {
                                 // Media segment ended, flush buffer
                                 if !media_buffer.is_empty() {
+                                    let init_bytes_to_send = pending_init_bytes.take().unwrap_or_else(|| Bytes::new());
                                     let pkt = Packet {
                                         init_hash: current_init_hash,
-                                        init_bytes: Bytes::new(),
+                                        init_bytes: init_bytes_to_send.clone(),
                                         media_bytes: Bytes::from(std::mem::take(&mut media_buffer)),
                                         variant_index: None,
                                     };
-                                    tracing::debug!("HlsPacketProducer: sending media packet, size={} bytes", pkt.media_bytes.len());
+                                    tracing::info!("HlsPacketProducer: sending packet, init_bytes={}, media_bytes={}", 
+                                        pkt.init_bytes.len(), pkt.media_bytes.len());
                                     if out.send(pkt).await.is_err() {
-                                        tracing::error!("HlsPacketProducer: failed to send media packet - consumer dropped");
+                                        tracing::error!("HlsPacketProducer: failed to send packet - consumer dropped");
                                         return Ok(()); // Consumer dropped
                                     }
                                 }

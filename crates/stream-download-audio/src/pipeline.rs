@@ -320,10 +320,18 @@ impl Pipeline {
                             let samples_to_push = &self.tmp_buffer[..needed];
 
                             // Push into PCM ring with backpressure (non-blocking).
+                            let mut pushed = 0;
                             for &s in samples_to_push {
                                 if pcm_prod.try_push(s).is_err() {
                                     break;
                                 }
+                                pushed += 1;
+                            }
+                            
+                            if pushed > 0 {
+                                tracing::trace!("Pipeline: pushed {} samples to PCM ring", pushed);
+                            } else {
+                                tracing::warn!("Pipeline: PCM ring full, no samples pushed");
                             }
                         }
                         Err(_) => {

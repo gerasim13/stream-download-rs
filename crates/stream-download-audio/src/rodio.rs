@@ -41,19 +41,28 @@ impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
     /// # Arguments
     /// * `stream` - AudioStream to adapt for rodio
     pub fn new(stream: AudioStream<P>) -> Self {
+        tracing::info!("RodioSourceAdapter::new called");
         let inner = Arc::new(Mutex::new(stream));
         let cur_spec = inner.lock().unwrap().spec();
+        tracing::info!("RodioSourceAdapter: current spec: sample_rate={}, channels={}", 
+            cur_spec.sample_rate, cur_spec.channels);
 
         // Spawn background refill thread which pulls PCM in chunks and sends to a channel.
         let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
         let inner_cloned = Arc::clone(&inner);
         std::thread::spawn(move || {
+            tracing::info!("RodioSourceAdapter: background refill thread started");
             let chunk_len = 4096usize;
+            let mut total_samples = 0;
             loop {
                 let mut buf = vec![0.0f32; chunk_len];
                 // Pull from AudioStream; if no data right now, back off briefly to avoid busy spin.
                 let n = inner_cloned.lock().unwrap().read_interleaved(&mut buf);
                 if n > 0 {
+                    total_samples += n;
+                    if total_samples % 40960 == 0 { // Log every ~1 second at 48kHz
+                        tracing::debug!("RodioSourceAdapter: read {} samples total", total_samples);
+                    }
                     let _ = tx.send(buf[..n].to_vec());
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(2));
