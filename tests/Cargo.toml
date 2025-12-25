@@ -13,6 +13,7 @@ stream-download = { path = "../crates/stream-download", features = [
 ] }
 stream-download-opendal = { path = "../crates/stream-download-opendal" }
 stream-download-hls = { path = "../crates/stream-download-hls", features = ["aes-decrypt"] }
+stream-download-audio = { path = "../crates/stream-download-audio", features = ["rodio"] }
 tower-http = { workspace = true, features = ["fs"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 opendal = { workspace = true, features = ["services-http"] }

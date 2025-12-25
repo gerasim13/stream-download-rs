@@ -98,6 +98,7 @@ where
             },
             media_bytes: Bytes::copy_from_slice(&buf[..n]),
             variant_index,
+            sequence: None, // HTTP streams don't have sequence numbers
         };
 
         // Use synchronous send in blocking thread

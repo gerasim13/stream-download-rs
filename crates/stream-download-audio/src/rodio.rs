@@ -37,15 +37,18 @@ impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
     /// Create a new `RodioSourceAdapter` from an `AudioStream`.
     ///
     /// The adapter takes ownership of the stream and wraps it internally for thread-safe access.
-    /// 
+    ///
     /// # Arguments
     /// * `stream` - AudioStream to adapt for rodio
     pub fn new(stream: AudioStream<P>) -> Self {
         tracing::info!("RodioSourceAdapter::new called");
         let inner = Arc::new(Mutex::new(stream));
         let cur_spec = inner.lock().unwrap().spec();
-        tracing::info!("RodioSourceAdapter: current spec: sample_rate={}, channels={}", 
-            cur_spec.sample_rate, cur_spec.channels);
+        tracing::info!(
+            "RodioSourceAdapter: current spec: sample_rate={}, channels={}",
+            cur_spec.sample_rate,
+            cur_spec.channels
+        );
 
         // Spawn background refill thread which pulls PCM in chunks and sends to a channel.
         let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
@@ -54,20 +57,59 @@ impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
             tracing::info!("RodioSourceAdapter: background refill thread started");
             let chunk_len = 4096usize;
             let mut total_samples = 0;
+            let mut total_reads = 0;
+            let mut zero_reads = 0;
+            let mut first_samples_logged = false;
             loop {
                 let mut buf = vec![0.0f32; chunk_len];
                 // Pull from AudioStream; if no data right now, back off briefly to avoid busy spin.
                 let n = inner_cloned.lock().unwrap().read_interleaved(&mut buf);
+                total_reads += 1;
                 if n > 0 {
                     total_samples += n;
-                    if total_samples % 40960 == 0 { // Log every ~1 second at 48kHz
-                        tracing::debug!("RodioSourceAdapter: read {} samples total", total_samples);
+
+                    // Log first successful read
+                    if !first_samples_logged {
+                        tracing::info!(
+                            "RodioSourceAdapter: FIRST READ - got {} samples after {} reads ({} zero reads)",
+                            n,
+                            total_reads,
+                            zero_reads
+                        );
+                        first_samples_logged = true;
                     }
-                    let _ = tx.send(buf[..n].to_vec());
+
+                    if total_samples % 40960 == 0 {
+                        // Log every ~1 second at 48kHz
+                        tracing::info!(
+                            "RodioSourceAdapter: read {} samples total ({} reads, {} zero reads)",
+                            total_samples,
+                            total_reads,
+                            zero_reads
+                        );
+                    }
+                    match tx.send(buf[..n].to_vec()) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "RodioSourceAdapter: failed to send chunk to main thread: {}",
+                                e
+                            );
+                            break;
+                        }
+                    }
                 } else {
+                    zero_reads += 1;
+                    if zero_reads % 500 == 0 {
+                        tracing::warn!(
+                            "RodioSourceAdapter: {} consecutive zero reads from AudioStream",
+                            zero_reads
+                        );
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
+            tracing::info!("RodioSourceAdapter: background refill thread exiting");
         });
 
         Self {

@@ -4,11 +4,7 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use bytes::Bytes;
-use kanal::{AsyncReceiver, AsyncSender, ReceiveError};
-use ringbuf::{
-    HeapCons, HeapProd, HeapRb,
-    traits::{Consumer, Producer, Split},
-};
+use kanal::{AsyncReceiver, AsyncSender, ReceiveError, Sender as KanalSender, Receiver as KanalReceiver};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -27,6 +23,9 @@ pub struct Packet {
     pub init_bytes: Bytes,
     pub media_bytes: Bytes,
     pub variant_index: Option<usize>,
+    /// Segment sequence number (for HLS: media sequence from playlist)
+    /// This is primarily for observability and testing.
+    pub sequence: Option<u64>,
 }
 
 /// Blocking feeder implementing Read over a queue of byte chunks.
@@ -78,8 +77,10 @@ pub struct Pipeline {
     container_name: Option<String>,
     /// Last init hash to detect changes
     last_init_hash: Option<u64>,
-    /// Temporary buffer for converted samples
-    tmp_buffer: Vec<f32>,
+    /// Planar buffers for each channel (up to 2 channels for stereo)
+    /// Using planar format allows symphonia to automatically convert sample formats
+    planar_buf_l: Vec<f32>,
+    planar_buf_r: Vec<f32>,
     /// Flag indicating first decode after reopening
     is_first_decode_after_reopen: bool,
     /// Optional: gating seek until probe is complete
@@ -94,7 +95,8 @@ impl Pipeline {
             decoder: None,
             container_name: None,
             last_init_hash: None,
-            tmp_buffer: Vec::new(),
+            planar_buf_l: Vec::new(),
+            planar_buf_r: Vec::new(),
             is_first_decode_after_reopen: false,
             seek_enabled: false,
         }
@@ -108,7 +110,8 @@ impl Pipeline {
             decoder: None,
             container_name: None,
             last_init_hash: None,
-            tmp_buffer: Vec::new(),
+            planar_buf_l: Vec::new(),
+            planar_buf_r: Vec::new(),
             is_first_decode_after_reopen: false,
             seek_enabled: false,
         })
@@ -162,7 +165,14 @@ impl Pipeline {
         // Select default audio track and get audio parameters.
         let (_tid, ap) = match format.default_track(TrackType::Audio) {
             Some(t) => match t.codec_params.as_ref().and_then(|cp| cp.audio()).cloned() {
-                Some(ap) => (t.id, ap),
+                Some(ap) => {
+                    tracing::info!(
+                        "Pipeline: creating decoder - sample_rate={:?}, channels={:?}",
+                        ap.sample_rate,
+                        ap.channels.clone().map(|c| c.count())
+                    );
+                    (t.id, ap)
+                }
                 None => {
                     return Err("no audio params on selected track".into());
                 }
@@ -205,6 +215,14 @@ impl Pipeline {
         on_event: &Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
         output_spec: AudioSpec,
     ) -> Result<(), String> {
+        tracing::info!(
+            "Pipeline: processing packet, sequence={:?}, init_hash={}, init_bytes={}, media_bytes={}",
+            packet.sequence,
+            packet.init_hash,
+            packet.init_bytes.len(),
+            packet.media_bytes.len()
+        );
+        
         let new_hash = packet.init_hash;
         let need_reopen = self.last_init_hash.map(|h| h != new_hash).unwrap_or(true);
 
@@ -279,7 +297,7 @@ impl Pipeline {
         &mut self,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
         output_spec: AudioSpec,
-        pcm_prod: &mut HeapProd<f32>,
+        pcm_tx: &KanalSender<Vec<f32>>,
     ) {
         loop {
             // If format/decoder not ready, break to fetch next Packet.
@@ -297,45 +315,62 @@ impl Pipeline {
                             let frames = gab.frames();
                             let needed = chans * frames;
                             if needed == 0 {
+                                tracing::debug!("Pipeline: decoded 0 frames, skipping");
                                 continue;
                             }
+                            
+                            // Log first successful decode after reopen
+                            if self.is_first_decode_after_reopen {
+                                tracing::info!("Pipeline: FIRST DECODE after reopen - {} channels, {} frames = {} samples", 
+                                    chans, frames, needed);
+                            }
 
-                            // Resize temp buffer and convert to interleaved f32.
-                            self.tmp_buffer.resize(needed, 0.0);
-                            gab.copy_to_slice_interleaved::<f32, _>(&mut self.tmp_buffer[..needed]);
+                            // Use planar format - symphonia automatically converts from any sample format
+                            // (i32 for FLAC, f32 for AAC, i16 for MP3) to f32
+                            // This matches the proven approach from zvqengine
+                            self.planar_buf_l.resize(frames, 0.0);
+                            self.planar_buf_r.resize(frames, 0.0);
+                            
+                            // Copy to planar slices - symphonia handles format conversion automatically
+                            let mut planar_slices: [&mut [f32]; 2] = [
+                                &mut self.planar_buf_l[..frames],
+                                &mut self.planar_buf_r[..frames],
+                            ];
+                            gab.copy_to_slice_planar(&mut planar_slices);
+
+                            // Convert planar to interleaved for output (LRLRLR...)
+                            let mut interleaved = Vec::with_capacity(needed);
+                            for i in 0..frames {
+                                interleaved.push(self.planar_buf_l[i]);
+                                if chans > 1 {
+                                    interleaved.push(self.planar_buf_r[i]);
+                                }
+                            }
 
                             // TODO: resample if input != output_spec (pass-through for now).
 
                             // Apply processors chain (in-place).
                             if let Ok(procs) = processors.lock() {
                                 for p in procs.iter() {
-                                    let _ = p.process(&mut self.tmp_buffer[..needed], output_spec);
+                                    let _ = p.process(&mut interleaved[..], output_spec);
                                 }
                             }
 
                             // Reset the flag after first use
                             self.is_first_decode_after_reopen = false;
 
-                            // Only push processed samples (may be less than needed if silence was inserted)
-                            let samples_to_push = &self.tmp_buffer[..needed];
-
-                            // Push into PCM ring with backpressure (non-blocking).
-                            let mut pushed = 0;
-                            for &s in samples_to_push {
-                                if pcm_prod.try_push(s).is_err() {
-                                    break;
-                                }
-                                pushed += 1;
-                            }
-                            
-                            if pushed > 0 {
-                                tracing::trace!("Pipeline: pushed {} samples to PCM ring", pushed);
-                            } else {
-                                tracing::warn!("Pipeline: PCM ring full, no samples pushed");
+                            // Send entire batch of samples at once for better performance.
+                            // This blocks the decoder thread when channel is full,
+                            // preventing sample loss during initialization.
+                            if pcm_tx.send(interleaved).is_err() {
+                                // Consumer disconnected, stop decoding
+                                tracing::info!("Pipeline: PCM consumer disconnected");
+                                return;
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Decoder wants more bytes or encountered recoverable error; break to fetch next Packet.
+                            tracing::debug!("Pipeline: decoder.decode() error: {:?}, breaking", e);
                             break;
                         }
                     }
@@ -351,9 +386,11 @@ impl Pipeline {
                         .map(|ioe| ioe.kind() == std::io::ErrorKind::WouldBlock)
                         .unwrap_or(false);
                     if is_would_block {
+                        tracing::debug!("Pipeline: format.next_packet() returned WouldBlock, breaking to fetch more");
                         break;
                     }
                     // Other non-fatal errors: also break to fetch more.
+                    tracing::debug!("Pipeline: format.next_packet() returned error: {}, breaking", e);
                     break;
                 }
             }
@@ -413,9 +450,14 @@ pub struct PipelineRunner {
     pub byte_tx: Option<AsyncSender<Packet>>,
     pub byte_rx: Option<AsyncReceiver<Packet>>,
 
-    // PCM ring: decoder -> consumer (sync)
-    pub pcm_prod: Option<HeapProd<f32>>,
-    pub pcm_cons: Option<HeapCons<f32>>,
+    // PCM channel: decoder -> consumer (sync, bounded with blocking backpressure)
+    // Sends batches of samples (Vec<f32>) for better performance
+    pub pcm_tx: Option<KanalSender<Vec<f32>>>,
+    pub pcm_rx: Option<KanalReceiver<Vec<f32>>>,
+
+    /// Internal buffer for partial batches (when output buffer is smaller than decoded batch)
+    partial_batch: Option<Vec<f32>>,
+    partial_batch_offset: usize,
 
     /// Optional event callback to bubble up player events without tying to a hub here.
     pub on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
@@ -424,35 +466,74 @@ pub struct PipelineRunner {
 impl PipelineRunner {
     pub fn new(byte_capacity: usize, pcm_capacity: usize) -> Self {
         let (byte_tx, byte_rx) = kanal::bounded_async(byte_capacity);
-
-        let pcm_rb = HeapRb::<f32>::new(pcm_capacity);
-        let (pcm_prod, pcm_cons) = pcm_rb.split();
+        let (pcm_tx, pcm_rx) = kanal::bounded(pcm_capacity);
 
         Self {
             byte_tx: Some(byte_tx),
             byte_rx: Some(byte_rx),
-            pcm_prod: Some(pcm_prod),
-            pcm_cons: Some(pcm_cons),
+            pcm_tx: Some(pcm_tx),
+            pcm_rx: Some(pcm_rx),
+            partial_batch: None,
+            partial_batch_offset: 0,
             on_event: None,
         }
     }
 
-    /// Pop up to `out.len()` samples from the PCM ring buffer.
+    /// Pop up to `out.len()` samples from the PCM channel.
     /// Returns the number of samples actually popped.
     pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
         let mut n = 0usize;
-        while n < out.len() {
-            match self
-                .pcm_cons
-                .as_mut()
-                .expect("pcm_consumer already taken")
-                .try_pop()
-            {
-                Some(s) => {
-                    out[n] = s;
-                    n += 1;
+        
+        // First, drain any partial batch from previous call
+        if let Some(ref partial) = self.partial_batch {
+            let remaining_in_partial = partial.len() - self.partial_batch_offset;
+            let remaining_in_out = out.len() - n;
+            let to_copy = remaining_in_out.min(remaining_in_partial);
+            
+            out[n..n + to_copy].copy_from_slice(
+                &partial[self.partial_batch_offset..self.partial_batch_offset + to_copy]
+            );
+            n += to_copy;
+            self.partial_batch_offset += to_copy;
+            
+            // If we consumed entire partial batch, clear it
+            if self.partial_batch_offset >= partial.len() {
+                self.partial_batch = None;
+                self.partial_batch_offset = 0;
+            }
+            
+            // If output buffer is full, return
+            if n >= out.len() {
+                return n;
+            }
+        }
+        
+        // Try to fill output buffer from received sample batches
+        loop {
+            if n >= out.len() {
+                break;
+            }
+            
+            let pcm_rx = match self.pcm_rx.as_ref() {
+                Some(rx) => rx,
+                None => return n, // pcm_rx already taken
+            };
+            
+            match pcm_rx.try_recv() {
+                Ok(Some(batch)) => {
+                    let remaining = out.len() - n;
+                    let to_copy = remaining.min(batch.len());
+                    out[n..n + to_copy].copy_from_slice(&batch[..to_copy]);
+                    n += to_copy;
+                    
+                    // If batch is larger than remaining space, save the rest for next call
+                    if to_copy < batch.len() {
+                        self.partial_batch = Some(batch);
+                        self.partial_batch_offset = to_copy;
+                        break; // Output buffer is full
+                    }
                 }
-                None => break,
+                Ok(None) | Err(_) => break,
             }
         }
         n
@@ -464,9 +545,9 @@ impl PipelineRunner {
         output_spec: AudioSpec,
         processors: Arc<Mutex<Vec<Arc<dyn AudioProcessor>>>>,
     ) -> tokio::task::JoinHandle<()> {
-        // Move required ring ends and settings into the decoding task.
+        // Move required channel ends and settings into the decoding task.
         let byte_rx = self.byte_rx.take().expect("byte_rx already taken");
-        let mut pcm_prod = self.pcm_prod.take().expect("pcm_prod already taken");
+        let pcm_tx = self.pcm_tx.take().expect("pcm_tx already taken");
         let on_event = self.on_event.clone();
 
         // Clone the async receiver to get a sync receiver for blocking thread
@@ -482,10 +563,14 @@ impl PipelineRunner {
                 // Pull next packet using sync receiver (blocking).
                 let packet = match sync_byte_rx.recv() {
                     Ok(pkt) => {
-                        tracing::debug!("Decoder loop: received packet (init_hash={}, init_bytes={}, media_bytes={})",
-                            pkt.init_hash, pkt.init_bytes.len(), pkt.media_bytes.len());
+                        tracing::debug!(
+                            "Decoder loop: received packet (init_hash={}, init_bytes={}, media_bytes={})",
+                            pkt.init_hash,
+                            pkt.init_bytes.len(),
+                            pkt.media_bytes.len()
+                        );
                         pkt
-                    },
+                    }
                     Err(ReceiveError::Closed) => {
                         tracing::info!("Decoder loop: producer closed (ReceiveError::Closed)");
                         break;
@@ -512,7 +597,7 @@ impl PipelineRunner {
                 }
 
                 // Decode available packets until format needs more bytes or EOF.
-                pipeline.decode_available_packets(processors.clone(), output_spec, &mut pcm_prod);
+                pipeline.decode_available_packets(processors.clone(), output_spec, &pcm_tx);
             }
 
             // End-of-stream

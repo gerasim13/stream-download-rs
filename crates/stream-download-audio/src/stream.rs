@@ -43,7 +43,7 @@ impl EventHub {
 ///
 /// This type implements `SampleSource` and is intended to be fed by a background
 /// pipeline (I/O, decode, resample, effects).
-/// 
+///
 /// Generic over `StorageProvider` to allow flexible storage backends.
 /// Note: HLS backend currently manages its own storage internally.
 pub struct AudioStream<P: StorageProvider> {
@@ -126,7 +126,9 @@ impl<P: StorageProvider> AudioStream<P> {
         url: Url,
         _storage_provider: P,
         audio_settings: AudioSettings,
-        _stream_settings: stream_download::Settings<stream_download::http::HttpStream<reqwest::Client>>,
+        _stream_settings: stream_download::Settings<
+            stream_download::http::HttpStream<reqwest::Client>,
+        >,
     ) -> Self {
         // Convert AudioSettings to AudioOptions for now
         let opts = AudioOptions {
@@ -137,7 +139,7 @@ impl<P: StorageProvider> AudioStream<P> {
             abr_min_switch_interval: std::time::Duration::from_secs(4),
             abr_up_hysteresis_ratio: 0.15,
         };
-        
+
         let producer = HttpPacketProducer::new(url);
         Self::from_packet_producer(producer, opts, None, true).await // enable_seek=true
     }
@@ -158,7 +160,7 @@ impl<P: StorageProvider> AudioStream<P> {
     }
 
     /// Clear the PCM buffer.
-    /// 
+    ///
     /// This is useful when seeking to avoid playing stale audio.
     pub fn clear_buffer(&mut self) {
         // Drain all samples from PCM ring buffer
@@ -176,7 +178,7 @@ impl AudioStream<stream_download::storage::temp::TempStorageProvider> {
     /// * `storage_root` - Directory path for persistent HLS caching (playlists, keys, segments)
     /// * `audio_settings` - Audio pipeline settings (sample rate, channels, etc.)
     /// * `hls_settings` - HLS-specific settings (ABR, variant selection, etc.)
-    /// 
+    ///
     /// # Notes
     /// HLS requires persistent storage for caching playlists/keys. This is managed internally
     /// by HlsPacketProducer. If `storage_root` is None, a temp directory will be used.
@@ -196,7 +198,7 @@ impl AudioStream<stream_download::storage::temp::TempStorageProvider> {
             abr_min_switch_interval: std::time::Duration::from_secs(4),
             abr_up_hysteresis_ratio: 0.15,
         };
-        
+
         // HlsPacketProducer manages its own storage
         let producer = HlsPacketProducer::new(url, hls_settings, storage_root);
         Self::from_packet_producer(producer, opts, None, true).await // enable_seek=true
@@ -207,9 +209,9 @@ impl<P: StorageProvider> SampleSource for AudioStream<P> {
     fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
         // Use synchronous pop since we're now using sync ringbuf
         let n = self.pop_chunk(out);
-        if n < out.len() {
-            trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
-        }
+        // if n < out.len() {
+        //     trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
+        // }
         n
     }
 
@@ -224,11 +226,12 @@ impl<P: StorageProvider> SampleSource for AudioStream<P> {
         // Send seek command to producer task if command channel is available
         if let Some(ref tx) = self.command_tx {
             // Use sync send - no block_on needed!
-            tx.send(ProducerCommand::Seek(to))
-                .map_err(|_| std::io::Error::new(
+            tx.send(ProducerCommand::Seek(to)).map_err(|_| {
+                std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    "failed to send seek command - producer task may have stopped"
-                ))?;
+                    "failed to send seek command - producer task may have stopped",
+                )
+            })?;
 
             tracing::info!("Seek command sent: {:?}", to);
             Ok(())
