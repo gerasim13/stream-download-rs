@@ -341,9 +341,7 @@ impl HlsManager {
             let data = if let Some(cached) = self.init_segment_cache.get(&resolved_uri) {
                 cached.clone()
             } else {
-                let downloaded = self
-                    .download_segment(&init_segment.uri, init_segment.key.as_ref(), None)
-                    .await?;
+                let downloaded = self.download_segment(&init_segment.uri).await?;
                 // Record init segment size for seek map
                 self.set_segment_size(0, downloaded.len() as u64);
                 self.init_segment_cache
@@ -370,9 +368,7 @@ impl HlsManager {
     ) -> HlsResult<crate::manager::SegmentType> {
         let codec_info = self.current_codec_info()?;
 
-        let data = self
-            .download_segment(&seg.uri, seg.key.as_ref(), Some(seg.sequence))
-            .await?;
+        let data = self.download_segment(&seg.uri).await?;
         // Record media segment size for seek map
         self.set_segment_size(seg.sequence, data.len() as u64);
 
@@ -645,29 +641,9 @@ impl HlsManager {
         Ok(None)
     }
 
-    async fn decrypt_segment_if_needed(
-        &mut self,
-        data: Bytes,
-        _key: Option<&SegmentKey>,
-        _sequence: Option<u64>,
-    ) -> HlsResult<Bytes> {
-        // Decryption is performed in the `HlsStreamWorker` pipeline via `StreamMiddleware`
-        // (e.g. `Aes128CbcMiddleware`) when `aes-decrypt` is enabled.
-        //
-        // `HlsManager` may still resolve key/IV parameters for the worker, but it does not
-        // transform segment bytes here.
-        Ok(data)
-    }
-
-    async fn download_segment(
-        &mut self,
-        uri: &str,
-        key: Option<&SegmentKey>,
-        sequence: Option<u64>,
-    ) -> HlsResult<Bytes> {
+    async fn download_segment(&mut self, uri: &str) -> HlsResult<Bytes> {
         let resolved_url = self.resolve_url(uri)?;
         let data = self.downloader.download_bytes(&resolved_url).await?;
-        let data = self.decrypt_segment_if_needed(data, key, sequence).await?;
         Ok(data)
     }
 }
