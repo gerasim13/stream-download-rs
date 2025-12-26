@@ -810,6 +810,8 @@ where
             StreamControl::ChunkStart {
                 stream_key,
                 kind,
+                variant: _,
+                sequence: _,
                 reported_len,
                 filename_hint,
                 start_offset,
@@ -818,6 +820,8 @@ where
             StreamControl::ChunkEnd {
                 stream_key: _,
                 kind: _,
+                variant: _,
+                sequence: _,
                 gathered_len,
             } => self.finalize_current_segment(gathered_len),
 

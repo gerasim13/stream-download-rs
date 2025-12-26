@@ -145,11 +145,11 @@ fn audio_hls_vod_full_drain_emits_end_of_stream_and_stream_closes(
         // - Iterate the audio stream until `AudioControl::EndOfStream` is observed.
         // - Validate PCM chunk invariants for every non-empty PCM chunk.
         // - Assert the stream closes (`next_msg()` returns None) promptly after EOS.
+        // - Additionally assert that ordered segment boundaries carry a neutral `(variant, index)`
+        //   and that media segment indexes are sequential with no repeats **per variant**.
         //
-        // This is the closest analog to "play the track from start to finish" for HLS VOD.
-        //
-        // NOTE:
-        // This test is ignored until audio-HLS reliably propagates ENDLIST -> ordered EOS + closure.
+        // This is the closest analog to "play the track from start to finish" for HLS VOD,
+        // plus a strict regression guard for ordered segment iteration correctness.
         let fixture = AudioFixture::start(Default::default()).await;
 
         let mut hls_settings = HlsSettings::default();
@@ -176,6 +176,11 @@ fn audio_hls_vod_full_drain_emits_end_of_stream_and_stream_closes(
         let mut seen_spec: Option<stream_download_audio::AudioSpec> = None;
         let mut total_samples: usize = 0;
 
+        // Collect ordered media segment indexes per variant as observed via ordered controls.
+        // We require that for each variant, indexes are strictly increasing by 1 with no repeats.
+        let mut seg_starts_by_variant: HashMap<usize, Vec<u64>> = HashMap::new();
+        let mut seg_ends_by_variant: HashMap<usize, Vec<u64>> = HashMap::new();
+
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -194,6 +199,21 @@ fn audio_hls_vod_full_drain_emits_end_of_stream_and_stream_closes(
                     } else {
                         seen_spec = Some(spec);
                     }
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsSegmentStart { id }))) => {
+                    let seq = id.sequence.expect(
+                        "expected ordered HlsSegmentStart to carry `id.sequence` (neutral index)",
+                    );
+                    seg_starts_by_variant
+                        .entry(id.variant)
+                        .or_default()
+                        .push(seq);
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsSegmentEnd { id }))) => {
+                    let seq = id.sequence.expect(
+                        "expected ordered HlsSegmentEnd to carry `id.sequence` (neutral index)",
+                    );
+                    seg_ends_by_variant.entry(id.variant).or_default().push(seq);
                 }
                 Ok(Some(AudioMsg::Pcm(chunk))) => {
                     if chunk.pcm.is_empty() {
@@ -274,6 +294,60 @@ fn audio_hls_vod_full_drain_emits_end_of_stream_and_stream_closes(
             "expected ordered AudioControl::EndOfStream while draining HLS VOD (mode={})",
             mode
         );
+
+        // Strict ordered segment assertions (per variant):
+        // - segment starts are strictly increasing by 1 (no gaps, no repeats) per variant
+        // - segment ends match the starts per variant (same count and same sequence list)
+        assert!(
+            !seg_starts_by_variant.is_empty(),
+            "expected to observe ordered HlsSegmentStart controls with sequence (mode={})",
+            mode
+        );
+
+        for (variant, seqs) in &seg_starts_by_variant {
+            assert!(
+                !seqs.is_empty(),
+                "expected at least one segment start sequence for variant {} (mode={})",
+                variant,
+                mode
+            );
+
+            for w in seqs.windows(2) {
+                let a = w[0];
+                let b = w[1];
+                assert_eq!(
+                    b,
+                    a + 1,
+                    "expected sequential segment indexes for variant {} (mode={}): got {} then {}",
+                    variant,
+                    mode,
+                    a,
+                    b
+                );
+            }
+        }
+
+        for (variant, starts) in &seg_starts_by_variant {
+            let ends = seg_ends_by_variant.get(variant).unwrap_or_else(|| {
+                panic!(
+                    "missing HlsSegmentEnd list for variant {} (mode={})",
+                    variant, mode
+                )
+            });
+
+            assert_eq!(
+                ends.len(),
+                starts.len(),
+                "segment end count must match start count for variant {} (mode={})",
+                variant,
+                mode
+            );
+            assert_eq!(
+                ends, starts,
+                "segment end sequences must match start sequences for variant {} (mode={})",
+                variant, mode
+            );
+        }
 
         // After EOS, the stream should close promptly (channel closed).
         let closed = tokio::time::timeout(Duration::from_secs(5), stream.next_msg())

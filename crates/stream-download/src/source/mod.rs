@@ -66,6 +66,25 @@ pub enum StreamControl {
         stream_key: ResourceKey,
         /// The kind of chunk being started (init vs media).
         kind: ChunkKind,
+
+        /// Optional neutral "variant" identifier for segmented streams.
+        ///
+        /// This is intentionally stream-agnostic (not HLS-specific). For example:
+        /// - HLS can set this to the variant index in the master playlist order.
+        /// - Other segmented sources can use it as a stream/quality index.
+        ///
+        /// When absent, consumers may derive identity from `stream_key` or other metadata.
+        variant: Option<u64>,
+
+        /// Optional neutral sequential index for this chunk within the logical stream.
+        ///
+        /// This is intentionally stream-agnostic (not HLS-specific). For example:
+        /// - HLS can set this to the media sequence number.
+        /// - Other segmented sources can use it as a monotonically increasing segment index.
+        ///
+        /// When present, this enables strict, ordered tests like "no gaps, no repeats".
+        sequence: Option<u64>,
+
         /// Optional reported length in bytes (e.g. HTTP `Content-Length`) for the chunk.
         reported_len: Option<u64>,
         /// Optional filename hint (e.g. playlist basename) for deterministic caching.
@@ -85,6 +104,13 @@ pub enum StreamControl {
         stream_key: ResourceKey,
         /// The kind of chunk being finalized (init vs media).
         kind: ChunkKind,
+
+        /// Optional neutral "variant" identifier for segmented streams (see `ChunkStart::variant`).
+        variant: Option<u64>,
+
+        /// Optional neutral sequential index for this chunk (see `ChunkStart::index`).
+        sequence: Option<u64>,
+
         /// Actual bytes gathered/written for this chunk.
         gathered_len: u64,
     },

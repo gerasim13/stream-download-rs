@@ -699,6 +699,12 @@ impl HlsStreamWorker {
             .send(StreamMsg::Control(StreamControl::ChunkStart {
                 stream_key: stream_key.clone(),
                 kind,
+                variant: Some(desc.variant_id.0 as u64),
+                sequence: if desc.is_init {
+                    None
+                } else {
+                    Some(desc.sequence)
+                },
                 reported_len: seg_size.or(Some(cached_len)),
                 filename_hint: filename_hint.clone(),
                 start_offset,
@@ -710,6 +716,12 @@ impl HlsStreamWorker {
             .send(StreamMsg::Control(StreamControl::ChunkEnd {
                 stream_key,
                 kind,
+                variant: Some(desc.variant_id.0 as u64),
+                sequence: if desc.is_init {
+                    None
+                } else {
+                    Some(desc.sequence)
+                },
                 gathered_len: cached_len,
             }))
             .await
@@ -782,6 +794,12 @@ impl HlsStreamWorker {
             .send(StreamMsg::Control(StreamControl::ChunkStart {
                 stream_key: routing.stream_key.clone(),
                 kind: routing.kind,
+                variant: Some(ctx.desc.variant_id.0 as u64),
+                sequence: if ctx.desc.is_init {
+                    None
+                } else {
+                    Some(ctx.desc.sequence)
+                },
                 reported_len: ctx.seg_size,
                 filename_hint: routing.filename_hint.clone(),
                 start_offset: 0,
@@ -809,6 +827,12 @@ impl HlsStreamWorker {
             .send(StreamMsg::Control(StreamControl::ChunkEnd {
                 stream_key: routing.stream_key,
                 kind: routing.kind,
+                variant: Some(ctx.desc.variant_id.0 as u64),
+                sequence: if ctx.desc.is_init {
+                    None
+                } else {
+                    Some(ctx.desc.sequence)
+                },
                 gathered_len,
             }))
             .await

@@ -25,16 +25,19 @@
 //! Instead, we use `async_stream::stream!` and yield `io::Result<SourceMsg>` explicitly.
 //! This avoids `?` inside branches that some macros may not accept and keeps control flow obvious.
 //!
-//! Variant derivation strategy
-//! ---------------------------
-//! `stream-download-hls` emits `StreamControl::SetDefaultStreamKey { stream_key }` where the key is
-//! `"<master_hash>/<variant_id>"` (variant_id is a numeric index). We parse the last path component
-//! as `usize` and use it as `HlsChunkId.variant`.
+//! Variant/index derivation strategy
+//! --------------------------------
+//! We require the upstream ordered control protocol (`stream-download::source::StreamControl`) to
+//! carry **neutral identifiers** on chunk boundaries:
+//! - `variant: Option<u64>` — a stream/quality/variant identifier (HLS uses the master variant index)
+//! - `index: Option<u64>` — a monotonically increasing chunk index (HLS uses the media sequence number)
 //!
-//! Sequence numbers
-//! ---------------
-//! `StreamControl` does not carry HLS media sequence numbers. We therefore emit
-//! `HlsChunkId { sequence: None }`. Tests should primarily assert on `variant`.
+//! This keeps the core protocol stream-agnostic and allows strict ordered tests like:
+//! - "segments are sequential with no gaps and no repeats (per variant)"
+//! - "variant switches are applied at init/media boundaries"
+//!
+//! We intentionally do not rely on `SetDefaultStreamKey` ordering or broadcast events for identity.
+//! `SetDefaultStreamKey` (if present) is treated as a no-op in this source.
 
 use std::any::Any;
 use std::io;
@@ -43,9 +46,9 @@ use std::sync::Arc;
 
 use futures_util::Stream;
 use futures_util::StreamExt;
+use reqwest::Url;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 use stream_download::storage::ProvidesStorageHandle;
@@ -241,26 +244,30 @@ impl AudioSource for HlsAudioSource {
     }
 }
 
-/// Tracks ordered HLS identity as seen through ordered `StreamControl`.
+/// Tracks ordered segmented identity as seen through ordered `StreamControl`.
+///
+/// This is intentionally stateless: we require the upstream to populate neutral `variant` and `index`
+/// fields on `ChunkStart/ChunkEnd`. This avoids any reliance on `SetDefaultStreamKey` ordering.
 #[derive(Default)]
-struct HlsControlContext {
-    /// Current variant derived from `SetDefaultStreamKey`.
-    current_variant: Option<usize>,
-}
+struct HlsControlContext;
 
 impl HlsControlContext {
     fn map_control(&mut self, ctrl: StreamControl) -> Option<SourceMsg> {
         match ctrl {
-            StreamControl::SetDefaultStreamKey { stream_key } => {
-                if let Some(v) = parse_variant_from_stream_key(&stream_key.0) {
-                    self.current_variant = Some(v);
-                }
-                None
-            }
-            StreamControl::ChunkStart { kind, .. } => {
+            // No-op: boundaries must be self-contained.
+            StreamControl::SetDefaultStreamKey { .. } => None,
+
+            StreamControl::ChunkStart {
+                kind,
+                variant,
+                sequence,
+                ..
+            } => {
+                let variant =
+                    variant.expect("expected StreamControl::ChunkStart.variant to be set");
                 let id = HlsChunkId {
-                    variant: self.current_variant.unwrap_or(0),
-                    sequence: None,
+                    variant: variant as usize,
+                    sequence,
                 };
 
                 match kind {
@@ -270,10 +277,17 @@ impl HlsControlContext {
                     }
                 }
             }
-            StreamControl::ChunkEnd { kind, .. } => {
+
+            StreamControl::ChunkEnd {
+                kind,
+                variant,
+                sequence,
+                ..
+            } => {
+                let variant = variant.expect("expected StreamControl::ChunkEnd.variant to be set");
                 let id = HlsChunkId {
-                    variant: self.current_variant.unwrap_or(0),
-                    sequence: None,
+                    variant: variant as usize,
+                    sequence,
                 };
 
                 match kind {
@@ -283,16 +297,8 @@ impl HlsControlContext {
                     }
                 }
             }
+
             StreamControl::StoreResource { .. } => None,
         }
     }
-}
-
-/// Parse a variant index from an HLS stream key string.
-///
-/// Expected format: `"<master_hash>/<variant_id>"`.
-fn parse_variant_from_stream_key(stream_key: &str) -> Option<usize> {
-    let key = stream_key.trim_end_matches('/');
-    let last = key.rsplit('/').next()?;
-    last.parse::<usize>().ok()
 }
