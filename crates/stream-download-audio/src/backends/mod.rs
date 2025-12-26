@@ -18,6 +18,7 @@ use kanal::{AsyncReceiver, AsyncSender};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::PlayerEvent;
 use crate::pipeline::Packet;
 
 /// Commands that can be sent to a packet producer.
@@ -44,11 +45,13 @@ pub trait PacketProducer: Send + Sync {
     /// * `out` - Channel to send packets through
     /// * `commands` - Optional channel to receive commands (seek, flush, etc.)
     /// * `cancel` - Optional cancellation token to stop the producer
+    /// * `on_event` - Optional callback for bubbling up backend/player events (e.g. HLS VariantChanged)
     async fn run(
         &mut self,
         out: AsyncSender<Packet>,
         commands: Option<AsyncReceiver<ProducerCommand>>,
         cancel: Option<CancellationToken>,
+        on_event: Option<std::sync::Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
     ) -> std::io::Result<()>;
 }
 

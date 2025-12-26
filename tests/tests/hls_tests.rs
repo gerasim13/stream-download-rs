@@ -1167,6 +1167,349 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
 #[rstest]
 #[case(2)]
 #[case(4)]
+fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: usize) {
+    SERVER_RT.block_on(async {
+        // Integration-level assertion:
+        // When AUTO mode is enabled (no selector callback), the *worker* should start from
+        // `HlsSettings::abr_initial_variant_index` without locking ABR into manual mode.
+        //
+        // We must test this via the HlsStreamWorker path (not AbrController), because the override
+        // is applied in worker initialization.
+
+        let initial_variant_index = if variant_count > 1 { 1usize } else { 0usize };
+
+        let fixture = HlsFixture::with_variant_count(variant_count).with_hls_config({
+            let mut s = HlsSettings::default();
+
+            // Make ABR permissive so follow-up tests can still switch; here we only check startup.
+            s.abr_min_switch_interval = Duration::ZERO;
+            s.abr_min_buffer_for_up_switch = 0.0;
+            s.abr_up_hysteresis_ratio = 0.0;
+            s.abr_throughput_safety_factor = 1.0;
+
+            // Ensure AUTO mode (no manual selector) and set the initial variant override.
+            s.variant_stream_selector = None;
+            s.abr_initial_variant_index = Some(initial_variant_index);
+
+            s
+        });
+
+        let storage_kind =
+            build_fixture_storage_kind("hls-abr-initial-variant-index", variant_count, "memory");
+        let storage = fixture.build_storage(storage_kind);
+        let storage_handle = storage.storage_handle();
+
+        let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
+        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
+        let segmented_length = Arc::new(std::sync::RwLock::new(
+            stream_download::storage::SegmentedLength::default(),
+        ));
+
+        let (_base_url, worker) = fixture
+            .worker(
+                storage_handle,
+                data_tx,
+                seek_rx,
+                cancel.clone(),
+                event_tx,
+                segmented_length,
+            )
+            .await;
+
+        // Spawn the worker loop.
+        tokio::spawn(async move {
+            let _ = worker.run().await;
+        });
+
+        // Observe the first SegmentStart event and assert its variant_id.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut first_seg_variant: Option<VariantId> = None;
+
+        while Instant::now() < deadline {
+            // Drain data to avoid backpressure (we only need events).
+            while let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(5), data_rx.recv()).await
+            {
+                // ignore
+            }
+
+            match tokio::time::timeout(Duration::from_millis(250), event_rx.recv()).await {
+                Ok(Ok(StreamEvent::SegmentStart { variant_id, .. })) => {
+                    first_seg_variant = Some(variant_id);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {}
+                Err(_) => {}
+            }
+        }
+
+        assert_eq!(
+            first_seg_variant,
+            Some(VariantId(initial_variant_index)),
+            "expected AUTO startup to begin from abr_initial_variant_index={} (variant_count={})",
+            initial_variant_index,
+            variant_count
+        );
+    });
+}
+
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_count: usize) {
+    SERVER_RT.block_on(async {
+        assert!(
+            variant_count >= 2,
+            "this test requires at least 2 variants (got {})",
+            variant_count
+        );
+
+        // Start from the highest variant so a downswitch to the lowest (0) is meaningful.
+        let start_variant_index = variant_count - 1;
+        let expected_variant_index = 0usize;
+
+        // Make the starting (high) variant *very* slow and make segments *large* so ABR gets a clear,
+        // throughput-driven signal and is forced to pick a lower-bandwidth variant.
+        //
+        // Notes:
+        // - ABR decisions depend on measured throughput and (optionally) buffer heuristics.
+        // - If segments are tiny, even large sleeps may not produce a strong enough throughput delta.
+        // - Increasing payload size makes the same delay translate into a much lower effective bps.
+        let mut delays = std::collections::HashMap::<usize, Duration>::new();
+        delays.insert(start_variant_index, Duration::from_millis(1500));
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_media_payload_bytes(800_000)
+            .with_per_variant_segment_delays(delays)
+            .with_hls_config({
+                let mut s = HlsSettings::default();
+
+                // AUTO mode.
+                s.variant_stream_selector = None;
+                s.abr_initial_variant_index = Some(start_variant_index);
+
+                // Make switching permissive and responsive.
+                s.abr_min_switch_interval = Duration::ZERO;
+                s.abr_throughput_safety_factor = 1.0;
+                s.abr_down_hysteresis_ratio = 0.0;
+
+                s
+            });
+
+        // Use clean Temp storage to avoid cache hits masking network timing effects.
+        let storage_kind = build_fixture_storage_kind(
+            "hls-abr-downswitch-per-variant-delay",
+            variant_count,
+            "temp",
+        );
+        if let HlsFixtureStorageKind::Temp { subdir } = &storage_kind {
+            let root = std::env::temp_dir()
+                .join("stream-download-tests")
+                .join(subdir);
+            clean_dir(&root);
+        }
+
+        let storage = fixture.build_storage(storage_kind);
+        let storage_handle = storage.storage_handle();
+
+        let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
+        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
+        let segmented_length = Arc::new(std::sync::RwLock::new(
+            stream_download::storage::SegmentedLength::default(),
+        ));
+
+        let (_base_url, worker) = fixture
+            .worker(
+                storage_handle,
+                data_tx,
+                seek_rx,
+                cancel.clone(),
+                event_tx,
+                segmented_length,
+            )
+            .await;
+
+        tokio::spawn(async move {
+            let _ = worker.run().await;
+        });
+
+        // Observe SegmentStart and wait until we see the lowest variant.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut initial_variant_seen: Option<VariantId> = None;
+        let mut saw_change = false;
+        let mut saw_lowest = false;
+
+        while Instant::now() < deadline {
+            // Drain data to avoid backpressure (we only need events).
+            while let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(5), data_rx.recv()).await
+            {
+                // ignore
+            }
+
+            match tokio::time::timeout(Duration::from_millis(250), event_rx.recv()).await {
+                Ok(Ok(StreamEvent::SegmentStart { variant_id, .. })) => {
+                    if initial_variant_seen.is_none() {
+                        initial_variant_seen = Some(variant_id);
+                        continue;
+                    }
+
+                    let initial = initial_variant_seen.unwrap();
+                    if variant_id != initial {
+                        saw_change = true;
+                    }
+                    if variant_id == VariantId(expected_variant_index) {
+                        saw_lowest = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {}
+                Err(_) => {}
+            }
+        }
+
+        assert!(
+            saw_change,
+            "expected at least one non-initial variant change (inferred from SegmentStart) under per-variant delay shaping, but none was observed"
+        );
+        assert!(
+            saw_lowest,
+            "expected ABR to downswitch to the lowest variant ({}) under per-variant delay shaping, but did not observe SegmentStart for it in time",
+            expected_variant_index
+        );
+    });
+}
+
+#[rstest]
+#[case(2)]
+#[case(4)]
+fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_count: usize) {
+    SERVER_RT.block_on(async {
+        assert!(
+            variant_count >= 2,
+            "this test requires at least 2 variants (got {})",
+            variant_count
+        );
+
+        let start_variant_index = 0usize;
+        let expected_variant_index = variant_count - 1;
+
+        // Make higher variants fast and the starting (low) variant slow to encourage upswitch.
+        // (We don't need to slow everything; just making v0 slower is enough to bias ABR upward.)
+        let mut delays = std::collections::HashMap::<usize, Duration>::new();
+        delays.insert(start_variant_index, Duration::from_millis(250));
+
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_per_variant_segment_delays(delays)
+            .with_hls_config({
+                let mut s = HlsSettings::default();
+
+                // AUTO mode.
+                s.variant_stream_selector = None;
+                s.abr_initial_variant_index = Some(start_variant_index);
+
+                // Make switching permissive.
+                s.abr_min_switch_interval = Duration::ZERO;
+                s.abr_min_buffer_for_up_switch = 0.0;
+                s.abr_up_hysteresis_ratio = 0.0;
+                s.abr_throughput_safety_factor = 1.0;
+
+                s
+            });
+
+        let storage_kind = build_fixture_storage_kind(
+            "hls-abr-upswitch-per-variant-delay",
+            variant_count,
+            "temp",
+        );
+        if let HlsFixtureStorageKind::Temp { subdir } = &storage_kind {
+            let root = std::env::temp_dir()
+                .join("stream-download-tests")
+                .join(subdir);
+            clean_dir(&root);
+        }
+
+        let storage = fixture.build_storage(storage_kind);
+        let storage_handle = storage.storage_handle();
+
+        let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
+        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
+        let segmented_length = Arc::new(std::sync::RwLock::new(
+            stream_download::storage::SegmentedLength::default(),
+        ));
+
+        let (_base_url, worker) = fixture
+            .worker(
+                storage_handle,
+                data_tx,
+                seek_rx,
+                cancel.clone(),
+                event_tx,
+                segmented_length,
+            )
+            .await;
+
+        tokio::spawn(async move {
+            let _ = worker.run().await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut initial_variant_seen: Option<VariantId> = None;
+        let mut saw_change = false;
+        let mut saw_highest = false;
+
+        while Instant::now() < deadline {
+            while let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(5), data_rx.recv()).await
+            {
+                // ignore
+            }
+
+            match tokio::time::timeout(Duration::from_millis(250), event_rx.recv()).await {
+                Ok(Ok(StreamEvent::SegmentStart { variant_id, .. })) => {
+                    if initial_variant_seen.is_none() {
+                        initial_variant_seen = Some(variant_id);
+                        continue;
+                    }
+
+                    let initial = initial_variant_seen.unwrap();
+                    if variant_id != initial {
+                        saw_change = true;
+                    }
+                    if variant_id == VariantId(expected_variant_index) {
+                        saw_highest = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {}
+                Err(_) => {}
+            }
+        }
+
+        assert!(
+            saw_change,
+            "expected at least one non-initial variant change (inferred from SegmentStart) under per-variant delay shaping, but none was observed"
+        );
+        assert!(
+            saw_highest,
+            "expected ABR to upswitch to the highest variant ({}) under per-variant delay shaping, but did not observe SegmentStart for it in time",
+            expected_variant_index
+        );
+    });
+}
+
+#[rstest]
+#[case(2)]
+#[case(4)]
 fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)

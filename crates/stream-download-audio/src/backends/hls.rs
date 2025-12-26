@@ -15,6 +15,7 @@ use stream_download_hls::{HlsPersistentStorageProvider, HlsSettings, HlsStream, 
 use crate::backends::ProducerCommand;
 use crate::backends::common::io_other;
 use crate::pipeline::Packet;
+use crate::{AbrVariantChangeReason, PlayerEvent};
 
 /// Internal state for HLS packet production.
 struct HlsProducerState {
@@ -32,10 +33,20 @@ struct HlsProducerState {
     current_sequence: Option<u64>,
     /// Current variant index (for future use)
     current_variant_index: Option<usize>,
+
+    /// Callback to bubble up audio-level player events.
+    on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
+    /// Last variant index we emitted via `PlayerEvent::VariantChanged` (to fill `from`).
+    last_variant_index: Option<usize>,
+
+    /// Last variant index we emitted via `PlayerEvent::HlsInitStart` (dedupe).
+    last_init_start_variant: Option<usize>,
+    /// Last (variant, sequence) we emitted via `PlayerEvent::HlsSegmentStart` (dedupe).
+    last_segment_start: Option<(usize, u64)>,
 }
 
 impl HlsProducerState {
-    fn new() -> Self {
+    fn new(on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>) -> Self {
         Self {
             current_init_bytes: Vec::new(),
             current_init_hash: 0,
@@ -44,6 +55,10 @@ impl HlsProducerState {
             pending_init_bytes: None,
             current_sequence: None,
             current_variant_index: None,
+            on_event,
+            last_variant_index: None,
+            last_init_start_variant: None,
+            last_segment_start: None,
         }
     }
 
@@ -55,6 +70,31 @@ impl HlsProducerState {
     ) {
         while let Ok(event) = event_rx.try_recv() {
             match event {
+                StreamEvent::VariantChanged { variant_id, .. } => {
+                    if let Some(cb) = &self.on_event {
+                        let to = variant_id.0;
+                        let from = self.last_variant_index;
+
+                        let reason = if from.is_none() {
+                            AbrVariantChangeReason::Initial
+                        } else {
+                            AbrVariantChangeReason::Auto
+                        };
+
+                        cb(PlayerEvent::VariantChanged { from, to, reason });
+
+                        self.last_variant_index = Some(to);
+                    }
+                }
+                StreamEvent::InitStart { variant_id, .. } => {
+                    let v = variant_id.0;
+                    if self.last_init_start_variant != Some(v) {
+                        if let Some(cb) = &self.on_event {
+                            cb(PlayerEvent::HlsInitStart { variant: v });
+                        }
+                        self.last_init_start_variant = Some(v);
+                    }
+                }
                 StreamEvent::SegmentStart {
                     sequence,
                     variant_id,
@@ -65,8 +105,21 @@ impl HlsProducerState {
                         sequence,
                         variant_id
                     );
+
+                    let v = variant_id.0;
                     self.current_sequence = Some(sequence);
-                    self.current_variant_index = Some(variant_id.0);
+                    self.current_variant_index = Some(v);
+
+                    let key = (v, sequence);
+                    if self.last_segment_start != Some(key) {
+                        if let Some(cb) = &self.on_event {
+                            cb(PlayerEvent::HlsSegmentStart {
+                                variant: v,
+                                sequence,
+                            });
+                        }
+                        self.last_segment_start = Some(key);
+                    }
                 }
                 _ => {
                     // Ignore other events for now
@@ -174,11 +227,15 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
     /// - Collect init segment bytes
     /// - Compute init_hash for variant switching detection
     /// - Track variant_index for proper event reporting
+    ///
+    /// Additionally, it subscribes to HLS out-of-band events and propagates
+    /// `StreamEvent::VariantChanged` as `PlayerEvent::VariantChanged`.
     async fn run(
         &mut self,
         out: AsyncSender<Packet>,
         commands: Option<kanal::AsyncReceiver<crate::backends::ProducerCommand>>,
         cancel: Option<CancellationToken>,
+        on_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
     ) -> std::io::Result<()> {
         // Persistent storage provider + StorageHandle are now mandatory for HLS so that
         // read-before-fetch caching of playlists/keys is enabled.
@@ -209,7 +266,7 @@ impl crate::backends::PacketProducer for HlsPacketProducer {
         let mut event_rx = stream.subscribe_events();
 
         // Unified state management
-        let mut state = HlsProducerState::new();
+        let mut state = HlsProducerState::new(on_event);
 
         // Main reading loop
         loop {

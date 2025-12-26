@@ -16,6 +16,39 @@ pub enum SelectionMode {
     Manual(usize),
 }
 
+/// Why the decoder lifecycle changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderLifecycleReason {
+    /// Initial decoder creation for the first successfully probed stream.
+    Initial,
+    /// Decoder was recreated because init segment changed (e.g. due to variant switch).
+    InitChanged,
+    /// Decoder was recreated due to a seek (if/when supported).
+    Seek,
+    /// Decoder was recreated due to an explicit flush/reset (if/when supported).
+    Flush,
+}
+
+/// Audio-level reason for HLS variant changes.
+///
+/// This is intentionally an enum (not a string) so callers can reliably branch on it
+/// and tests can assert exact behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbrVariantChangeReason {
+    /// Initial variant selection during startup (e.g. the first transition from "no variant yet"
+    /// to the configured initial variant index).
+    ///
+    /// This is expected to happen before meaningful throughput measurements exist and should be
+    /// treated differently in strict ABR-switch tests (typically filtered out).
+    Initial,
+    /// Automatic ABR decision based on throughput/buffer heuristics.
+    Auto,
+    /// Explicit manual selection by the user (by variant index).
+    Manual,
+    /// Unknown/unspecified reason.
+    Unknown,
+}
+
 /// Basic PCM specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioSpec {
@@ -52,11 +85,45 @@ pub trait SampleSource: Send {
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Started,
-    VariantSwitched {
+
+    /// HLS ABR variant changed (decision made by the HLS layer).
+    ///
+    /// This is the "decision" signal. It does NOT necessarily mean the first init/media bytes for
+    /// the new variant have started flowing yet.
+    VariantChanged {
         from: Option<usize>,
         to: usize,
-        reason: String,
+        reason: AbrVariantChangeReason,
     },
+
+    /// HLS init segment started for a specific variant.
+    ///
+    /// This is an "application" signal: once you observe this for `variant=to`, the pipeline has
+    /// actually transitioned into fetching/consuming the new variant's init/media boundaries.
+    HlsInitStart {
+        variant: usize,
+    },
+
+    /// HLS media segment started for a specific variant.
+    ///
+    /// This is the strongest signal for strict ABR assertions because it is emitted at segment
+    /// boundaries (i.e., when we actually start consuming media for that variant).
+    HlsSegmentStart {
+        variant: usize,
+        sequence: u64,
+    },
+
+    /// Decoder lifecycle event (creation/recreation).
+    ///
+    /// This replaces the previous `VariantSwitched` event, which was ambiguous: it was emitted
+    /// during decoder initialization (often due to init changes) and did not strictly imply that
+    /// the underlying HLS variant selection had changed.
+    DecoderInitialized {
+        /// Variant index associated with the packet that triggered (re)initialization, if known.
+        variant: Option<usize>,
+        reason: DecoderLifecycleReason,
+    },
+
     FormatChanged {
         sample_rate: u32,
         channels: u16,

@@ -3,6 +3,8 @@ use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
+use crate::api::DecoderLifecycleReason;
+
 use bytes::Bytes;
 use kanal::{
     AsyncReceiver, AsyncSender, ReceiveError, Receiver as KanalReceiver, Sender as KanalSender,
@@ -157,6 +159,7 @@ impl Pipeline {
         current_channels: u16,
         dec_opts: &AudioDecoderOptions,
         on_event: &Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
+        decoder_init_reason: DecoderLifecycleReason,
     ) -> Result<
         (
             Box<dyn symphonia::core::formats::FormatReader + Send + Sync>,
@@ -189,10 +192,9 @@ impl Pipeline {
             Ok(dec) => {
                 // Emit events
                 if let Some(cb) = on_event {
-                    cb(PlayerEvent::VariantSwitched {
-                        from: None,
-                        to: packet.variant_index.unwrap_or(0),
-                        reason: "init switch".into(),
+                    cb(PlayerEvent::DecoderInitialized {
+                        variant: packet.variant_index,
+                        reason: decoder_init_reason,
                     });
                     cb(PlayerEvent::FormatChanged {
                         sample_rate: ap.sample_rate.unwrap_or(current_sample_rate),
@@ -234,6 +236,14 @@ impl Pipeline {
                 self.last_init_hash, new_hash
             );
 
+            // Compute decoder initialization reason BEFORE we reset pipeline state.
+            // Otherwise we would lose the information required to distinguish Initial vs InitChanged.
+            let decoder_init_reason = if self.last_init_hash.is_some() {
+                DecoderLifecycleReason::InitChanged
+            } else {
+                DecoderLifecycleReason::Initial
+            };
+
             // New feeder and reader.
             self.feeder = Arc::new(Mutex::new(Feeder::new()));
             {
@@ -263,6 +273,7 @@ impl Pipeline {
                         output_spec.channels,
                         &AudioDecoderOptions::default(),
                         on_event,
+                        decoder_init_reason,
                     ) {
                         Ok((format, dec)) => {
                             self.decoder = Some(dec);

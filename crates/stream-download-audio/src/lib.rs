@@ -14,8 +14,8 @@ mod stream;
 mod rodio;
 
 // Re-export useful stream-download types for convenience.
-pub use stream_download::storage::StorageProvider;
 pub use stream_download::Settings;
+pub use stream_download::storage::StorageProvider;
 
 // Re-export useful HLS types for convenience.
 pub use stream_download_hls::{
@@ -24,7 +24,8 @@ pub use stream_download_hls::{
 
 // Public API re-exports.
 pub use crate::api::{
-    AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource, SelectionMode,
+    AbrVariantChangeReason, AudioOptions, AudioProcessor, AudioSpec, DecoderLifecycleReason,
+    PlayerEvent, SampleSource, SelectionMode,
 };
 pub use crate::settings::{AudioSettings, ResamplingQuality};
 pub use crate::stream::AudioStream;

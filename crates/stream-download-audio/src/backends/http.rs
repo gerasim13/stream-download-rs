@@ -73,6 +73,7 @@ impl PacketProducer for HttpPacketProducer {
         out: AsyncSender<Packet>,
         _commands: Option<kanal::AsyncReceiver<crate::backends::ProducerCommand>>,
         cancel: Option<CancellationToken>,
+        _on_event: Option<std::sync::Arc<dyn Fn(crate::PlayerEvent) + Send + Sync>>,
     ) -> IoResult<()> {
         // TODO: Implement seek support for HTTP streams
         // For now, commands are ignored

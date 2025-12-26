@@ -65,6 +65,7 @@ impl<P: StorageProvider> AudioStream<P> {
         opts: AudioOptions,
         cancel: Option<CancellationToken>,
         enable_seek: bool,
+        on_producer_event: Option<Arc<dyn Fn(PlayerEvent) + Send + Sync>>,
     ) -> Self {
         let spec = Arc::new(Mutex::new(AudioSpec {
             sample_rate: opts.target_sample_rate,
@@ -84,6 +85,15 @@ impl<P: StorageProvider> AudioStream<P> {
         let events_clone = events.clone();
         runner.on_event = Some(Arc::new(move |ev| events_clone.send(ev)));
 
+        // Allow the packet producer to emit player events too (e.g., HLS VariantChanged).
+        //
+        // If the caller didn't provide a producer callback, default to broadcasting via the same hub.
+        let on_producer_event = on_producer_event.or_else(|| {
+            let events_clone = events.clone();
+            Some(Arc::new(move |ev: PlayerEvent| events_clone.send(ev))
+                as Arc<dyn Fn(PlayerEvent) + Send + Sync>)
+        });
+
         // Create command channel for seek support if enabled
         // Use async receiver (for producer task) and sync sender (for AudioStream::seek)
         let (command_tx, command_rx) = if enable_seek {
@@ -95,11 +105,20 @@ impl<P: StorageProvider> AudioStream<P> {
         };
 
         // Launch packet producer (async) using the producer half from runner.
+        //
+        // If the producer supports emitting player events, it can use the provided callback.
         let byte_tx = runner.byte_tx.take().expect("byte producer already taken");
         tokio::spawn(async move {
-            if let Err(e) = producer.run(byte_tx, command_rx, cancel).await {
+            // Best-effort: if the producer doesn't use `on_producer_event`, nothing changes.
+            if let Err(e) = producer
+                .run(byte_tx, command_rx, cancel, on_producer_event.clone())
+                .await
+            {
                 trace!("Packet producer error: {:?}", e);
             }
+
+            // Keep `on_producer_event` alive for the duration of the task even if not used directly here.
+            let _ = on_producer_event;
         });
 
         // Launch decoder loop (spawn_blocking internally)
@@ -141,7 +160,7 @@ impl<P: StorageProvider> AudioStream<P> {
         };
 
         let producer = HttpPacketProducer::new(url);
-        Self::from_packet_producer(producer, opts, None, true).await // enable_seek=true
+        Self::from_packet_producer(producer, opts, None, true, None).await // enable_seek=true
     }
 
     /// Subscribe to player events.
@@ -199,9 +218,17 @@ impl AudioStream<stream_download::storage::temp::TempStorageProvider> {
             abr_up_hysteresis_ratio: 0.15,
         };
 
-        // HlsPacketProducer manages its own storage
+        // HlsPacketProducer manages its own storage.
+        //
+        // Provide an event callback so the HLS layer can bubble up `PlayerEvent::VariantChanged`
+        // (derived from `stream_download_hls::StreamEvent::VariantChanged`) to AudioStream observers.
+        //
+        // Important: we do NOT try to replace `EventHub` after construction. Instead, we pass a
+        // producer-event callback into `from_packet_producer`, which will default to broadcasting
+        // into the same hub.
         let producer = HlsPacketProducer::new(url, hls_settings, storage_root);
-        Self::from_packet_producer(producer, opts, None, true).await // enable_seek=true
+
+        Self::from_packet_producer(producer, opts, None, true, None).await // enable_seek=true
     }
 }
 

@@ -175,14 +175,29 @@ pub struct HlsFixture {
     variant_count: usize,
     segments_per_variant: usize,
     content: FixtureContent,
+
+    /// Global per-segment delay used by the fixture server (legacy).
+    ///
+    /// NOTE: This delay applies only to `seg/v0_*` responses (see `serve_path` below).
     segment_delay: Duration,
+
+    /// Optional per-variant segment delay overrides (delay per segment response).
+    ///
+    /// Keys are variant indices (0-based) and values are artificial latency to add
+    /// for that variant's media segment responses (e.g. `seg/v1_*`).
+    ///
+    /// This is used to create deterministic ABR scenarios (downswitch/upswitch/oscillation)
+    /// without modifying production code.
+    per_variant_segment_delay: Arc<HashMap<usize, Duration>>,
+
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
 
     /// Optional base URL override (full URL, not just a prefix string).
     ///
     /// When set, the fixture will derive a *path prefix* from this URL and serve most resources
-    /// ONLY under that prefix, to validate that the code under test resolves URLs via `base_url`.
+    /// only under that prefix, to validate that the code under test resolves URLs via `base_url`.
+    base_url_override: Option<reqwest::Url>,
     ///
     /// Example:
     /// - base_url = `http://127.0.0.1:1234/a/b/`
@@ -192,8 +207,6 @@ pub struct HlsFixture {
     /// - `/master.m3u8` is always served at root (bootstrap never changes)
     /// - `/<prefix>/...` is served depending on the chosen content mode
     /// - default non-prefixed paths (except `/master.m3u8`) intentionally return 404
-    base_url_override: Option<reqwest::Url>,
-
     // Optional AES-128 CBC segment encryption ("DRM") for fixture-generated media segments.
     //
     // NOTE: This is only supported in Mock mode (because encryption is applied to generated blobs).
@@ -312,6 +325,7 @@ impl HlsFixture {
                 media_payload_bytes: None,
             },
             segment_delay,
+            per_variant_segment_delay: Arc::new(HashMap::new()),
             request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hls_settings: HlsSettings::default(),
             base_url_override: None,
@@ -352,6 +366,27 @@ impl HlsFixture {
     /// Override delay for `seg/v0_*` responses (use `Duration::ZERO` to disable).
     pub fn with_segment_delay(mut self, d: Duration) -> Self {
         self.segment_delay = d;
+        self
+    }
+
+    /// Override per-variant delay for `seg/v{variant}_*` responses.
+    ///
+    /// This delay applies to media segment responses (not playlists/keys) and is useful for
+    /// deterministic ABR tests where one variant is made "slow" relative to others.
+    pub fn with_variant_segment_delay(mut self, variant: usize, delay: Duration) -> Self {
+        Arc::make_mut(&mut self.per_variant_segment_delay).insert(variant, delay);
+        self
+    }
+
+    /// Replace the full per-variant delay map.
+    pub fn with_per_variant_segment_delays(mut self, delays: HashMap<usize, Duration>) -> Self {
+        self.per_variant_segment_delay = Arc::new(delays);
+        self
+    }
+
+    /// Clear all per-variant delay overrides.
+    pub fn clear_per_variant_segment_delays(mut self) -> Self {
+        Arc::make_mut(&mut self.per_variant_segment_delay).clear();
         self
     }
 
@@ -926,6 +961,7 @@ impl HlsFixture {
 
     fn build_router(&self) -> Router {
         let segment_delay = self.segment_delay;
+        let per_variant_segment_delay = self.per_variant_segment_delay.clone();
         let request_counts = self.request_counts.clone();
 
         let content = self.content.clone();
@@ -944,6 +980,7 @@ impl HlsFixture {
             headers_in: HeaderMap,
             content: FixtureContent,
             segment_delay: Duration,
+            per_variant_segment_delay: Arc<HashMap<usize, Duration>>,
             request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
             key_validation: Option<(
                 Option<HashMap<String, String>>,
@@ -1036,9 +1073,27 @@ impl HlsFixture {
                 }
             }
 
-            // Optional artificial latency for v0 media segments.
+            // Optional artificial latency for media segments.
+            //
+            // Legacy behavior:
+            // - `segment_delay` applies only to `seg/v0_*`.
             if segment_delay != Duration::ZERO && path_only.starts_with("seg/v0_") {
                 tokio::time::sleep(segment_delay).await;
+            }
+            // New behavior:
+            // - `per_variant_segment_delay` applies to `seg/v{variant}_*` for any variant.
+            //
+            // This is used to create deterministic ABR scenarios by making one variant slower than others.
+            if let Some(rest) = path_only.strip_prefix("seg/v") {
+                if let Some((variant_str, _)) = rest.split_once('_') {
+                    if let Ok(variant_idx) = variant_str.parse::<usize>() {
+                        if let Some(d) = per_variant_segment_delay.get(&variant_idx).copied() {
+                            if d != Duration::ZERO {
+                                tokio::time::sleep(d).await;
+                            }
+                        }
+                    }
+                }
             }
 
             let bytes: Bytes = match content {
@@ -1110,6 +1165,7 @@ impl HlsFixture {
                 let request_counts = request_counts.clone();
                 let key_validation = key_validation.clone();
                 let content = content.clone();
+                let per_variant_segment_delay = per_variant_segment_delay.clone();
                 move |uri: Uri, headers: HeaderMap| async move {
                     serve_path(
                         Path("master.m3u8".to_string()),
@@ -1117,10 +1173,12 @@ impl HlsFixture {
                         headers,
                         content.clone(),
                         segment_delay,
+                        per_variant_segment_delay.clone(),
                         request_counts.clone(),
                         key_validation.clone(),
                     )
                     .await
+                    .into_response()
                 }
             }),
         );
@@ -1152,6 +1210,7 @@ impl HlsFixture {
                         let request_counts = request_counts.clone();
                         let key_validation = key_validation.clone();
                         let content = content.clone();
+                        let per_variant_segment_delay = per_variant_segment_delay.clone();
                         move |Path(tail): Path<String>, uri: Uri, headers: HeaderMap| async move {
                             // In Mock mode, playlists may refer to "v0_0.bin" and we map it to "seg/v0_0.bin".
                             // In RealDir mode we serve exactly the file path requested by the playlist.
@@ -1172,6 +1231,7 @@ impl HlsFixture {
                                 headers,
                                 content.clone(),
                                 segment_delay,
+                                per_variant_segment_delay.clone(),
                                 request_counts.clone(),
                                 key_validation.clone(),
                             )
@@ -1187,6 +1247,7 @@ impl HlsFixture {
                         let request_counts = request_counts.clone();
                         let key_validation = key_validation.clone();
                         let content = content.clone();
+                        let per_variant_segment_delay = per_variant_segment_delay.clone();
                         move |Path(seg_name): Path<String>, uri: Uri, headers: HeaderMap| async move {
                             let key = match &content {
                                 FixtureContent::Mock { .. } => format!("seg/{}", seg_name),
@@ -1199,10 +1260,12 @@ impl HlsFixture {
                                 headers,
                                 content.clone(),
                                 segment_delay,
+                                per_variant_segment_delay.clone(),
                                 request_counts.clone(),
                                 key_validation.clone(),
                             )
                             .await
+                            .into_response()
                         }
                     }),
                 );
@@ -1252,6 +1315,7 @@ impl HlsFixture {
                 let key_validation = key_validation.clone();
                 let base_url_prefix = base_url_prefix.clone();
                 let content = content.clone();
+                let per_variant_segment_delay = per_variant_segment_delay.clone();
                 move |Path(name): Path<String>, uri: Uri, headers: HeaderMap| async move {
                     if base_url_prefix.is_some() {
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
@@ -1268,6 +1332,7 @@ impl HlsFixture {
                         headers,
                         content.clone(),
                         segment_delay,
+                        per_variant_segment_delay.clone(),
                         request_counts.clone(),
                         key_validation.clone(),
                     )
@@ -1286,6 +1351,7 @@ impl HlsFixture {
                 let key_validation = key_validation.clone();
                 let base_url_prefix = base_url_prefix.clone();
                 let content = content.clone();
+                let per_variant_segment_delay = per_variant_segment_delay.clone();
                 move |Path(path): Path<String>, uri: Uri, headers: HeaderMap| async move {
                     if base_url_prefix.is_some() && path != "master.m3u8" {
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
@@ -1297,6 +1363,7 @@ impl HlsFixture {
                         headers,
                         content.clone(),
                         segment_delay,
+                        per_variant_segment_delay.clone(),
                         request_counts.clone(),
                         key_validation.clone(),
                     )

@@ -726,9 +726,10 @@ impl HlsStreamWorker {
         let gathered_len = self.pump_stream_chunks(stream).await?;
         let elapsed = start_time.elapsed();
 
-        // ABR: report network downloads only.
-        self.controller
-            .on_media_segment_downloaded(ctx.desc.duration, gathered_len, elapsed);
+        if !ctx.desc.is_init {
+            self.controller
+                .on_media_segment_downloaded(ctx.desc.duration, gathered_len, elapsed);
+        }
 
         // Segmented length: end boundary.
         self.update_segment_length_on_end(gathered_len)?;
@@ -991,15 +992,23 @@ impl HlsStreamWorker {
         let settings = manager.settings().clone();
         let initial_variant_index = {
             // If selector returns Some(VariantId) => start in MANUAL mode at that variant.
-            // If selector is absent or returns None => start in AUTO mode, using manager default.
+            // If selector is absent or returns None => start in AUTO mode.
             let selected = settings
                 .variant_stream_selector
                 .as_ref()
                 .and_then(|cb| (cb)(master));
 
             match selected {
-                None => manager.current_variant_index().unwrap_or(0),
                 Some(id) => id.0,
+                None => {
+                    // AUTO mode: optionally override the startup variant (useful for deterministic tests
+                    // and product tuning). Clamp to available range.
+                    let max_idx = master.variants.len().saturating_sub(1);
+                    let configured = settings
+                        .abr_initial_variant_index
+                        .unwrap_or_else(|| manager.current_variant_index().unwrap_or(0));
+                    std::cmp::min(configured, max_idx)
+                }
             }
         };
 

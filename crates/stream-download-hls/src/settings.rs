@@ -97,6 +97,20 @@ pub struct HlsSettings {
     // ----------------------------
     // ABR behavior
     // ----------------------------
+    /// Optional initial variant index for AUTO (ABR-controlled) startup.
+    ///
+    /// When `variant_stream_selector` is `None` (AUTO mode), the worker/controller needs to pick an
+    /// initial variant before any meaningful throughput samples exist. Historically this has been
+    /// variant `0` (or whatever the manager had selected).
+    ///
+    /// If this is set, AUTO startup will begin by selecting this variant index (0-based) *without*
+    /// locking ABR into manual mode. This is useful for deterministic tests (e.g. starting from a
+    /// high variant to force a downswitch) and for product tuning.
+    ///
+    /// If the index is out of bounds for the loaded master playlist, it will be clamped to the last
+    /// available variant index.
+    pub abr_initial_variant_index: Option<usize>,
+
     /// Minimum buffer (in seconds) above which the controller allows up-switching.
     /// Default: 0.0 (disabled gating).
     pub abr_min_buffer_for_up_switch: f32,
@@ -150,6 +164,7 @@ impl Default for HlsSettings {
             prefetch_buffer_size: 2,
 
             // ABR defaults
+            abr_initial_variant_index: None,
             abr_min_buffer_for_up_switch: 0.0,
             abr_down_switch_buffer: 3.0,
             abr_throughput_safety_factor: 0.8,
@@ -177,6 +192,7 @@ impl fmt::Debug for HlsSettings {
             .field("retry_timeout", &self.retry_timeout)
             .field("prefetch_buffer_size", &self.prefetch_buffer_size)
             // ABR
+            .field("abr_initial_variant_index", &self.abr_initial_variant_index)
             .field(
                 "abr_min_buffer_for_up_switch",
                 &self.abr_min_buffer_for_up_switch,
@@ -208,6 +224,22 @@ impl HlsSettings {
     /// Clear the base URL override.
     pub fn clear_base_url(mut self) -> Self {
         self.base_url = None;
+        self
+    }
+
+    /// Sets the initial variant index for AUTO (ABR-controlled) startup selection.
+    ///
+    /// This does NOT lock the stream into manual mode; ABR may still switch variants afterward.
+    ///
+    /// Note: if the index is out of bounds, the worker will clamp it to the last available variant.
+    pub fn abr_initial_variant_index(mut self, index: usize) -> Self {
+        self.abr_initial_variant_index = Some(index);
+        self
+    }
+
+    /// Clears the AUTO startup variant override.
+    pub fn clear_abr_initial_variant_index(mut self) -> Self {
+        self.abr_initial_variant_index = None;
         self
     }
 
