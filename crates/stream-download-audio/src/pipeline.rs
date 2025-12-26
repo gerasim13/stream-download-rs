@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use bytes::Bytes;
-use kanal::{AsyncReceiver, AsyncSender, ReceiveError, Sender as KanalSender, Receiver as KanalReceiver};
+use kanal::{
+    AsyncReceiver, AsyncSender, ReceiveError, Receiver as KanalReceiver, Sender as KanalSender,
+};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::formats::probe::Hint;
@@ -222,7 +224,7 @@ impl Pipeline {
             packet.init_bytes.len(),
             packet.media_bytes.len()
         );
-        
+
         let new_hash = packet.init_hash;
         let need_reopen = self.last_init_hash.map(|h| h != new_hash).unwrap_or(true);
 
@@ -318,11 +320,15 @@ impl Pipeline {
                                 tracing::debug!("Pipeline: decoded 0 frames, skipping");
                                 continue;
                             }
-                            
+
                             // Log first successful decode after reopen
                             if self.is_first_decode_after_reopen {
-                                tracing::info!("Pipeline: FIRST DECODE after reopen - {} channels, {} frames = {} samples", 
-                                    chans, frames, needed);
+                                tracing::info!(
+                                    "Pipeline: FIRST DECODE after reopen - {} channels, {} frames = {} samples",
+                                    chans,
+                                    frames,
+                                    needed
+                                );
                             }
 
                             // Use planar format - symphonia automatically converts from any sample format
@@ -330,7 +336,7 @@ impl Pipeline {
                             // This matches the proven approach from zvqengine
                             self.planar_buf_l.resize(frames, 0.0);
                             self.planar_buf_r.resize(frames, 0.0);
-                            
+
                             // Copy to planar slices - symphonia handles format conversion automatically
                             let mut planar_slices: [&mut [f32]; 2] = [
                                 &mut self.planar_buf_l[..frames],
@@ -386,11 +392,16 @@ impl Pipeline {
                         .map(|ioe| ioe.kind() == std::io::ErrorKind::WouldBlock)
                         .unwrap_or(false);
                     if is_would_block {
-                        tracing::debug!("Pipeline: format.next_packet() returned WouldBlock, breaking to fetch more");
+                        tracing::debug!(
+                            "Pipeline: format.next_packet() returned WouldBlock, breaking to fetch more"
+                        );
                         break;
                     }
                     // Other non-fatal errors: also break to fetch more.
-                    tracing::debug!("Pipeline: format.next_packet() returned error: {}, breaking", e);
+                    tracing::debug!(
+                        "Pipeline: format.next_packet() returned error: {}, breaking",
+                        e
+                    );
                     break;
                 }
             }
@@ -408,10 +419,19 @@ impl Read for Pipeline {
                 if guard.eof {
                     return Ok(0);
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "no data available",
-                ));
+                // For Symphonia probing, returning WouldBlock here can be interpreted as
+                // "no bytes available", which may cause probe to fail immediately with
+                // "no data available" before the feeder has accumulated enough bytes.
+                //
+                // In our pipeline, data arrives asynchronously via `push_bytes`, but the
+                // probing/format reader is running on a blocking thread. To make the
+                // `Read` contract friendlier for probing, we block briefly waiting for
+                // initial bytes instead of surfacing WouldBlock.
+                //
+                // This keeps the behavior deterministic for tests and avoids spurious
+                // probe failures on startup.
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
             } else {
                 break;
             }
@@ -483,49 +503,49 @@ impl PipelineRunner {
     /// Returns the number of samples actually popped.
     pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
         let mut n = 0usize;
-        
+
         // First, drain any partial batch from previous call
         if let Some(ref partial) = self.partial_batch {
             let remaining_in_partial = partial.len() - self.partial_batch_offset;
             let remaining_in_out = out.len() - n;
             let to_copy = remaining_in_out.min(remaining_in_partial);
-            
+
             out[n..n + to_copy].copy_from_slice(
-                &partial[self.partial_batch_offset..self.partial_batch_offset + to_copy]
+                &partial[self.partial_batch_offset..self.partial_batch_offset + to_copy],
             );
             n += to_copy;
             self.partial_batch_offset += to_copy;
-            
+
             // If we consumed entire partial batch, clear it
             if self.partial_batch_offset >= partial.len() {
                 self.partial_batch = None;
                 self.partial_batch_offset = 0;
             }
-            
+
             // If output buffer is full, return
             if n >= out.len() {
                 return n;
             }
         }
-        
+
         // Try to fill output buffer from received sample batches
         loop {
             if n >= out.len() {
                 break;
             }
-            
+
             let pcm_rx = match self.pcm_rx.as_ref() {
                 Some(rx) => rx,
                 None => return n, // pcm_rx already taken
             };
-            
+
             match pcm_rx.try_recv() {
                 Ok(Some(batch)) => {
                     let remaining = out.len() - n;
                     let to_copy = remaining.min(batch.len());
                     out[n..n + to_copy].copy_from_slice(&batch[..to_copy]);
                     n += to_copy;
-                    
+
                     // If batch is larger than remaining space, save the rest for next call
                     if to_copy < batch.len() {
                         self.partial_batch = Some(batch);

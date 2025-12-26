@@ -2,13 +2,13 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::{fs, io};
 
+use fixtures::{SERVER_RT, music_path, server_addr};
 use proptest::prelude::*;
-use setup::{SERVER_RT, music_path, server_addr};
 use stream_download::storage::bounded::BoundedStorageProvider;
 use stream_download::storage::memory::MemoryStorageProvider;
 use stream_download::{Settings, StreamDownload};
 
-mod setup;
+mod fixtures;
 
 #[derive(Debug)]
 struct StreamParams {

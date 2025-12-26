@@ -34,8 +34,8 @@ kanal = "0.1.1"
 async-trait = { workspace = true }
 
 # Lock-free ring buffer for PCM frames (SPSC)
-async-ringbuf = "0.3.4"
-ringbuf = "0.4.8"
+async-ringbuf = "0.3.5"
+ringbuf = "0.4.9"
 
 # High-quality resampling (runs asynchronously in a worker)
 rubato = "0.16.2"

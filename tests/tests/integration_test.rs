@@ -4,11 +4,11 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::time::Duration;
 use std::{fs, io};
 
-use opendal::{Operator, services};
-use rstest::rstest;
-use setup::{
+use fixtures::{
     ASSETS, Command, ErrorTestStorageProvider, SERVER_RT, TestClient, music_path, server_addr,
 };
+use opendal::{Operator, services};
+use rstest::rstest;
 use stream_download::async_read::AsyncReadStreamParams;
 use stream_download::http::{HttpStream, HttpStreamError};
 use stream_download::process::{self, ProcessStreamParams};
@@ -23,7 +23,7 @@ use stream_download_opendal::{OpendalStream, OpendalStreamParams, StreamDownload
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_blocking;
 
-mod setup;
+mod fixtures;
 
 fn get_file_buf() -> Vec<u8> {
     fs::read(music_path()).unwrap()

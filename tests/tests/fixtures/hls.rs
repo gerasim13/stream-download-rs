@@ -32,6 +32,19 @@ use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
 
 use stream_download_hls::KeyProcessorCallback;
 
+/// Fixture can either serve fully in-memory blobs (mock mode) or serve real files from a directory
+/// (real-media mode).
+#[derive(Clone, Debug)]
+enum FixtureContent {
+    Mock {
+        blobs: Arc<HashMap<String, Bytes>>,
+        media_payload_bytes: Option<usize>,
+    },
+    RealDir {
+        root: Arc<std::path::PathBuf>,
+    },
+}
+
 /// Boxed storage provider adapter for tests.
 ///
 /// Motivation
@@ -52,6 +65,40 @@ use stream_download_hls::KeyProcessorCallback;
 pub struct BoxedStorageProvider {
     inner: BoxedStorageProviderInner,
     capacity: Option<usize>,
+}
+
+impl HlsFixture {
+    pub fn with_real_dir(mut self, root: std::path::PathBuf) -> Self {
+        self.content = FixtureContent::RealDir {
+            root: Arc::new(root),
+        };
+        self.aes128 = None;
+        self
+    }
+
+    fn mock_blobs(&self) -> Option<&Arc<HashMap<String, Bytes>>> {
+        match &self.content {
+            FixtureContent::Mock { blobs, .. } => Some(blobs),
+            FixtureContent::RealDir { .. } => None,
+        }
+    }
+
+    fn mock_media_payload_bytes(&self) -> Option<usize> {
+        match &self.content {
+            FixtureContent::Mock {
+                media_payload_bytes,
+                ..
+            } => *media_payload_bytes,
+            FixtureContent::RealDir { .. } => None,
+        }
+    }
+
+    fn real_root(&self) -> Option<&std::path::PathBuf> {
+        match &self.content {
+            FixtureContent::RealDir { root } => Some(root.as_ref()),
+            FixtureContent::Mock { .. } => None,
+        }
+    }
 }
 
 enum BoxedStorageProviderInner {
@@ -158,36 +205,14 @@ impl StorageProvider for BoxedStorageProvider {
     }
 }
 
-/// Minimal in-memory HLS fixture server used by integration tests.
-///
-/// This fixture does NOT attempt to generate valid TS/fMP4. It serves simple byte payloads so
-/// tests can validate:
-/// - variant discovery (master playlist parsing),
-/// - variant switching effects (URIs differ),
-/// - streamed bytes change when variant changes,
-/// - ordering invariants at the `StreamMsg`/storage boundary layer.
-///
-/// Paths served under base (all generated in-memory):
-/// - `/master.m3u8`
-/// - `/v{idx}.m3u8` for each variant (e.g. `/v0.m3u8`, `/v1.m3u8`, ...)
-/// - `/init{idx}.bin` for each variant
-/// - `/seg/{name}` maps to the internal blob key `seg/{name}` (unless remapped; see `base_url_prefix`)
-/// - `/{path}` catch-all maps to blob key `{path}`
-///
-/// Notes:
-/// - Optional delay can be injected for v0 media segment responses to simulate poor network.
-/// - Variants and their segment ranges are configurable (to simulate "variant starts later").
-/// - Request counters are tracked per-path so tests can assert caching behavior (e.g. second run
-///   should not re-fetch segments when the cache is warm).
 #[derive(Clone)]
 pub struct HlsFixture {
     variant_count: usize,
     segments_per_variant: usize,
-    blobs: Arc<HashMap<String, Bytes>>,
+    content: FixtureContent,
     segment_delay: Duration,
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
-    media_payload_bytes: Option<usize>,
 
     /// Optional base URL override (full URL, not just a prefix string).
     ///
@@ -200,25 +225,13 @@ pub struct HlsFixture {
     ///
     /// Serving policy when enabled:
     /// - `/master.m3u8` is always served at root (bootstrap never changes)
-    /// - `/<prefix>/v0.m3u8`, `/<prefix>/v1.m3u8`, ...
-    /// - `/<prefix>/init0.bin`, ...
-    /// - `/<prefix>/key0.bin`, ...
-    /// - `/<prefix>/<segment_name>` (where `<segment_name>` is what the playlist lists, e.g. `v0_0.bin`)
+    /// - `/<prefix>/...` is served depending on the chosen content mode
     /// - default non-prefixed paths (except `/master.m3u8`) intentionally return 404
-    ///
-    /// This is parameterizable: you can pass different base_url paths to ensure there is no hardcoding.
     base_url_override: Option<reqwest::Url>,
 
     // Optional AES-128 CBC segment encryption ("DRM") for fixture-generated media segments.
     //
-    // When enabled:
-    // - the variant playlists will include `#EXT-X-KEY:METHOD=AES-128,URI="key{v}.bin"`
-    // - each segment payload under `seg/v{v}_*.bin` is encrypted (PKCS#7 padded)
-    // - key bytes are served under `key{v}.bin`
-    //
-    // Additionally, in this mode the fixture can validate that key requests include:
-    // - required query params (key_query_params)
-    // - required headers (key_request_headers)
+    // NOTE: This is only supported in Mock mode (because encryption is applied to generated blobs).
     aes128: Option<HlsFixtureAes128Config>,
 }
 
@@ -329,11 +342,13 @@ impl HlsFixture {
         Self {
             variant_count,
             segments_per_variant,
-            blobs: Arc::new(blobs),
+            content: FixtureContent::Mock {
+                blobs: Arc::new(blobs),
+                media_payload_bytes: None,
+            },
             segment_delay,
             request_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             hls_settings: HlsSettings::default(),
-            media_payload_bytes: None,
             base_url_override: None,
             aes128: None,
         }
@@ -408,25 +423,45 @@ impl HlsFixture {
     /// Override media payload size for generated segments. When set, payloads are padded/truncated
     /// to this size (while keeping the variant/segment prefix intact) to drive ABR heuristics.
     pub fn with_media_payload_bytes(mut self, bytes: usize) -> Self {
-        self.media_payload_bytes = Some(bytes);
+        // This knob only makes sense in Mock mode (we generate/pad mock segment payloads).
+        if self.real_root().is_some() {
+            panic!("with_media_payload_bytes is only supported in Mock mode");
+        }
+
+        let media_payload_bytes = Some(bytes);
         let blobs = Self::build_blobs_with_variants(
             self.variant_count,
             self.segments_per_variant,
-            self.media_payload_bytes,
+            media_payload_bytes,
             self.aes128.as_ref(),
         );
-        self.blobs = Arc::new(blobs);
+
+        self.content = FixtureContent::Mock {
+            blobs: Arc::new(blobs),
+            media_payload_bytes,
+        };
         self
     }
 
     fn refresh_blobs_from_config(mut self) -> Self {
+        // DRM/blob regeneration only applies to Mock mode.
+        if self.real_root().is_some() {
+            panic!("refresh_blobs_from_config is only supported in Mock mode");
+        }
+
+        let media_payload_bytes = self.mock_media_payload_bytes();
+
         let blobs = Self::build_blobs_with_variants(
             self.variant_count,
             self.segments_per_variant,
-            self.media_payload_bytes,
+            media_payload_bytes,
             self.aes128.as_ref(),
         );
-        self.blobs = Arc::new(blobs);
+
+        self.content = FixtureContent::Mock {
+            blobs: Arc::new(blobs),
+            media_payload_bytes,
+        };
         self
     }
 
@@ -893,9 +928,10 @@ impl HlsFixture {
     }
 
     fn build_router(&self) -> Router {
-        let blobs = self.blobs.clone();
         let segment_delay = self.segment_delay;
         let request_counts = self.request_counts.clone();
+
+        let content = self.content.clone();
 
         // Optional validation policy for key fetch requests.
         let key_validation = self.aes128.as_ref().map(|cfg| {
@@ -905,11 +941,11 @@ impl HlsFixture {
             )
         });
 
-        async fn serve_blob(
+        async fn serve_path(
             Path(path): Path<String>,
             uri: Uri,
             headers_in: HeaderMap,
-            blobs: Arc<HashMap<String, Bytes>>,
+            content: FixtureContent,
             segment_delay: Duration,
             request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
             key_validation: Option<(
@@ -1008,8 +1044,28 @@ impl HlsFixture {
                 tokio::time::sleep(segment_delay).await;
             }
 
-            let Some(bytes) = blobs.get(path_only) else {
-                return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new());
+            let bytes: Bytes = match content {
+                FixtureContent::Mock { blobs, .. } => {
+                    let Some(bytes) = blobs.get(path_only) else {
+                        return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new());
+                    };
+                    bytes.clone()
+                }
+                FixtureContent::RealDir { root } => {
+                    // In real-media mode, `path_only` is treated as a relative file path under `root`.
+                    let rel = std::path::Path::new(path_only);
+                    if rel
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        return (StatusCode::BAD_REQUEST, HeaderMap::new(), Bytes::new());
+                    }
+                    let full = root.join(rel);
+                    match tokio::fs::read(&full).await {
+                        Ok(buf) => Bytes::from(buf),
+                        Err(_) => return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new()),
+                    }
+                }
             };
 
             let mut headers = HeaderMap::new();
@@ -1026,7 +1082,7 @@ impl HlsFixture {
                 HeaderValue::from_static("no-cache"),
             );
 
-            (StatusCode::OK, headers, bytes.clone())
+            (StatusCode::OK, headers, bytes)
         }
 
         // Router layout:
@@ -1054,15 +1110,15 @@ impl HlsFixture {
         r = r.route(
             "/master.m3u8",
             get({
-                let blobs = blobs.clone();
                 let request_counts = request_counts.clone();
                 let key_validation = key_validation.clone();
+                let content = content.clone();
                 move |uri: Uri, headers: HeaderMap| async move {
-                    serve_blob(
+                    serve_path(
                         Path("master.m3u8".to_string()),
                         uri,
                         headers,
-                        blobs.clone(),
+                        content.clone(),
                         segment_delay,
                         request_counts.clone(),
                         key_validation.clone(),
@@ -1096,57 +1152,65 @@ impl HlsFixture {
                 let one_seg = Router::new().route(
                     "/{tail}",
                     get({
-                        let blobs = blobs.clone();
                         let request_counts = request_counts.clone();
                         let key_validation = key_validation.clone();
+                        let content = content.clone();
                         move |Path(tail): Path<String>, uri: Uri, headers: HeaderMap| async move {
-                            let blob_key = if blobs.contains_key(&tail) {
-                                tail
-                            } else {
-                                // If it's not an exact blob key, treat it as a segment name.
-                                format!("seg/{}", tail)
+                            // In Mock mode, playlists may refer to "v0_0.bin" and we map it to "seg/v0_0.bin".
+                            // In RealDir mode we serve exactly the file path requested by the playlist.
+                            let key = match &content {
+                                FixtureContent::Mock { blobs, .. } => {
+                                    if blobs.contains_key(&tail) {
+                                        tail
+                                    } else {
+                                        format!("seg/{}", tail)
+                                    }
+                                }
+                                FixtureContent::RealDir { .. } => tail,
                             };
 
-                            serve_blob(
-                                Path(blob_key),
+                            serve_path(
+                                Path(key),
                                 uri,
                                 headers,
-                                blobs.clone(),
+                                content.clone(),
                                 segment_delay,
                                 request_counts.clone(),
                                 key_validation.clone(),
                             )
                             .await
-                            .into_response()
                         }
                     }),
                 );
 
                 // Handler for `/<prefix>/seg/{seg_name}` (two segments after prefix).
-                let seg_two = Router::new().route(
+                let seg_router = Router::new().route(
                     "/seg/{seg_name}",
                     get({
-                        let blobs = blobs.clone();
                         let request_counts = request_counts.clone();
                         let key_validation = key_validation.clone();
+                        let content = content.clone();
                         move |Path(seg_name): Path<String>, uri: Uri, headers: HeaderMap| async move {
-                            let blob_key = format!("seg/{}", seg_name);
-                            serve_blob(
-                                Path(blob_key),
+                            let key = match &content {
+                                FixtureContent::Mock { .. } => format!("seg/{}", seg_name),
+                                FixtureContent::RealDir { .. } => format!("seg/{}", seg_name),
+                            };
+
+                            serve_path(
+                                Path(key),
                                 uri,
                                 headers,
-                                blobs.clone(),
+                                content.clone(),
                                 segment_delay,
                                 request_counts.clone(),
                                 key_validation.clone(),
                             )
                             .await
-                            .into_response()
                         }
                     }),
                 );
 
-                Router::new().merge(seg_two).merge(one_seg)
+                Router::new().merge(seg_router).merge(one_seg)
             };
 
             // Mount the same `tail_router` under concrete prefix paths up to depth=3.
@@ -1187,21 +1251,25 @@ impl HlsFixture {
         r = r.route(
             "/seg/{name}",
             get({
-                let blobs = blobs.clone();
                 let request_counts = request_counts.clone();
                 let key_validation = key_validation.clone();
                 let base_url_prefix = base_url_prefix.clone();
+                let content = content.clone();
                 move |Path(name): Path<String>, uri: Uri, headers: HeaderMap| async move {
                     if base_url_prefix.is_some() {
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
                             .into_response();
                     }
-                    let key = format!("seg/{}", name);
-                    serve_blob(
+                    let key = match &content {
+                        FixtureContent::Mock { .. } => format!("seg/{}", name),
+                        FixtureContent::RealDir { .. } => format!("seg/{}", name),
+                    };
+
+                    serve_path(
                         Path(key),
                         uri,
                         headers,
-                        blobs.clone(),
+                        content.clone(),
                         segment_delay,
                         request_counts.clone(),
                         key_validation.clone(),
@@ -1217,20 +1285,20 @@ impl HlsFixture {
         r.route(
             "/{path}",
             get({
-                let blobs = blobs.clone();
                 let request_counts = request_counts.clone();
                 let key_validation = key_validation.clone();
                 let base_url_prefix = base_url_prefix.clone();
+                let content = content.clone();
                 move |Path(path): Path<String>, uri: Uri, headers: HeaderMap| async move {
                     if base_url_prefix.is_some() && path != "master.m3u8" {
                         return (StatusCode::NOT_FOUND, HeaderMap::new(), Bytes::new())
                             .into_response();
                     }
-                    serve_blob(
+                    serve_path(
                         Path(path),
                         uri,
                         headers,
-                        blobs.clone(),
+                        content.clone(),
                         segment_delay,
                         request_counts.clone(),
                         key_validation.clone(),

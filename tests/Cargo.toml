@@ -24,6 +24,7 @@ axum = { workspace = true }
 bytes = { workspace = true }
 cbc = { workspace = true }
 futures-util = { workspace = true }
+kanal = { workspace = true }
 proptest = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
