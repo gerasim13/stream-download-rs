@@ -48,24 +48,34 @@ pub struct AudioObserveResult {
     pub total_samples: usize,
 }
 
-/// Audio-specific local assets server fixture with optional per-file throttling.
+/// Audio test fixture.
 ///
-/// This is intentionally isolated from the shared `fixtures/setup.rs` server so audio tests can run
-/// in parallel without relying on global throttling state.
-pub struct AudioAssetsServerFixture {
-    addr: std::net::SocketAddr,
+/// This merges:
+/// - the per-test local assets server (previously `AudioAssetsServerFixture`)
+/// - test helper utilities (`wait_for_control`, `wait_for_pcm_samples`, etc.)
+///
+/// The intent is to make `AudioFixture` a single stateful object that owns the server and provides
+/// all helper methods needed by tests.
+pub struct AudioFixture {
+    server_addr: std::net::SocketAddr,
     request_log: Arc<tokio::sync::Mutex<Vec<RequestEntry>>>,
     request_seq: Arc<AtomicUsize>,
 }
 
-impl AudioAssetsServerFixture {
+impl AudioFixture {
     /// Assets root directory (relative to the `tests` crate).
     pub const ASSETS_ROOT: &'static str = "../assets";
+
+    /// Root directory (under the assets server) containing real HLS audio test data.
+    pub const HLS_ASSETS_DIR: &'static str = "hls";
+
+    /// Master playlist filename inside `HLS_ASSETS_DIR`.
+    pub const HLS_MASTER: &'static str = "master.m3u8";
 
     /// Stream chunk size used by throttling.
     const THROTTLE_CHUNK_BYTES: usize = 16 * 1024;
 
-    /// Start a new server instance.
+    /// Start a new isolated audio assets server fixture.
     ///
     /// `per_file_delay` keys are paths relative to the assets root, without a leading `/`, e.g.:
     /// - "hls/index-slq-a1.m3u8"
@@ -97,7 +107,7 @@ impl AudioAssetsServerFixture {
             .set_nonblocking(true)
             .expect("set_nonblocking audio assets server");
 
-        let addr = listener.local_addr().expect("audio assets server addr");
+        let server_addr = listener.local_addr().expect("audio assets server addr");
 
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
@@ -107,27 +117,37 @@ impl AudioAssetsServerFixture {
         });
 
         Self {
-            addr,
+            server_addr,
             request_log,
             request_seq,
         }
     }
 
     pub fn addr(&self) -> std::net::SocketAddr {
-        self.addr
+        self.server_addr
     }
 
     pub fn base_url(&self) -> Url {
-        Url::parse(&format!("http://{}", self.addr)).expect("base_url")
+        Url::parse(&format!("http://{}", self.server_addr)).expect("base_url")
     }
 
     pub fn url_for(&self, relative_path: &str) -> Url {
         let rel = relative_path.trim_start_matches('/');
-        Url::parse(&format!("http://{}/{}", self.addr, rel)).expect("url_for")
+        Url::parse(&format!("http://{}/{}", self.server_addr, rel)).expect("url_for")
     }
 
     pub fn hls_master_url(&self) -> Url {
-        self.url_for("hls/master.m3u8")
+        self.url_for(&format!("{}/{}", Self::HLS_ASSETS_DIR, Self::HLS_MASTER))
+    }
+
+    pub fn hls_master_url_for(server_addr: std::net::SocketAddr) -> Url {
+        Url::parse(&format!(
+            "http://{}/{}/{}",
+            server_addr,
+            Self::HLS_ASSETS_DIR,
+            Self::HLS_MASTER
+        ))
+        .expect("failed to build HLS master URL")
     }
 
     /// Current request sequence counter value (monotonically increasing).
@@ -191,9 +211,40 @@ impl AudioAssetsServerFixture {
         }
         None
     }
+
+    /// Construct an `AudioDecodeStream` for the real HLS assets served by this fixture's server.
+    pub async fn audio_stream_hls_real_assets(
+        &self,
+        hls_settings: stream_download_hls::HlsSettings,
+        storage_root: Option<std::path::PathBuf>,
+    ) -> AudioDecodeStream {
+        let url = self.hls_master_url();
+
+        AudioDecodeStream::new_hls(
+            url,
+            hls_settings,
+            AudioDecodeOptions::default(),
+            storage_root,
+        )
+        .await
+        .expect("failed to create AudioDecodeStream(HLS)")
+    }
+
+    /// Construct an `AudioDecodeStream` for the real HLS assets served by this fixture's server,
+    /// with a helper to mutate the provided `HlsSettings` before stream creation.
+    pub async fn audio_stream_hls_real_assets_with_hls_settings(
+        &self,
+        mut hls_settings: HlsSettings,
+        mutate_hls_settings: impl FnOnce(&mut HlsSettings),
+        storage_root: Option<std::path::PathBuf>,
+    ) -> stream_download_audio::AudioDecodeStream {
+        mutate_hls_settings(&mut hls_settings);
+        self.audio_stream_hls_real_assets(hls_settings, storage_root)
+            .await
+    }
 }
 
-/// GET handler used by `AudioAssetsServerFixture`.
+/// GET handler used by `AudioFixture`.
 async fn throttled_assets_get(
     uri: axum::http::Uri,
     delays: Arc<tokio::sync::RwLock<HashMap<String, Duration>>>,
@@ -222,7 +273,7 @@ async fn throttled_assets_get(
         guard.get(&key).cloned().unwrap_or(Duration::ZERO)
     };
 
-    let path: PathBuf = PathBuf::from(AudioAssetsServerFixture::ASSETS_ROOT).join(&key);
+    let path: PathBuf = PathBuf::from(AudioFixture::ASSETS_ROOT).join(&key);
 
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
@@ -239,7 +290,7 @@ async fn throttled_assets_get(
             return None;
         }
 
-        let mut buf = vec![0u8; AudioAssetsServerFixture::THROTTLE_CHUNK_BYTES];
+        let mut buf = vec![0u8; AudioFixture::THROTTLE_CHUNK_BYTES];
         match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
             Ok(0) => None,
             Ok(n) => {
@@ -276,87 +327,11 @@ async fn throttled_assets_get(
     resp
 }
 
-/// Audio test fixture helpers.
+/// Audio helper utilities (ordered protocol) for tests.
 ///
-/// Purpose
-/// -------
-/// Organize audio integration tests in the same style as the HLS tests:
-/// - centralize knowledge about fixture asset paths
-/// - provide a single place to build URLs
-/// - provide a single place to create `AudioDecodeStream`
-/// - provide deterministic helpers to wait for ordered controls / PCM thresholds
-pub struct AudioFixture;
-
+/// This `impl` is intentionally on the stateful `AudioFixture` so tests can keep all
+/// audio-related functionality in one place.
 impl AudioFixture {
-    /// Root directory (under the assets server) containing real HLS audio test data.
-    pub const HLS_ASSETS_DIR: &'static str = "hls";
-
-    /// Master playlist filename inside `HLS_ASSETS_DIR`.
-    pub const HLS_MASTER: &'static str = "master.m3u8";
-
-    pub fn hls_master_url(server_addr: std::net::SocketAddr) -> Url {
-        Url::parse(&format!(
-            "http://{}/{}/{}",
-            server_addr,
-            Self::HLS_ASSETS_DIR,
-            Self::HLS_MASTER
-        ))
-        .expect("failed to build HLS master URL")
-    }
-
-    /// Construct an `AudioDecodeStream` for the real HLS assets served by an audio-specific server.
-    ///
-    /// This avoids global throttling shared across tests.
-    ///
-    /// Returns both the `AudioDecodeStream` and the `AudioAssetsServerFixture` so tests can make strict
-    /// assertions about the request sequence (e.g. that after ABR switch we fetch segments from
-    /// the new variant).
-    pub async fn audio_stream_hls_real_assets(
-        _server_addr: std::net::SocketAddr,
-        hls_settings: stream_download_hls::HlsSettings,
-        storage_root: Option<std::path::PathBuf>,
-        per_file_delay: Option<HashMap<String, Duration>>,
-    ) -> (AudioDecodeStream, AudioAssetsServerFixture) {
-        let per_file_delay = per_file_delay.unwrap_or_default();
-
-        // Start an isolated server per test invocation (analogous to the HLS fixture server).
-        let server = AudioAssetsServerFixture::start(per_file_delay).await;
-        let url = server.hls_master_url();
-
-        let stream = AudioDecodeStream::new_hls(
-            url,
-            hls_settings,
-            AudioDecodeOptions::default(),
-            storage_root,
-        )
-        .await
-        .expect("failed to create AudioDecodeStream(HLS)");
-
-        (stream, server)
-    }
-
-    /// Construct an `AudioDecodeStream` for the real HLS assets served by an audio-specific server,
-    /// but with a helper to mutate the provided `HlsSettings` before stream creation.
-    ///
-    /// This is intended for tests that need to configure ABR (e.g. `abr_initial_variant_index`)
-    /// without repeating boilerplate at call sites.
-    pub async fn audio_stream_hls_real_assets_with_hls_settings(
-        server_addr: std::net::SocketAddr,
-        mut hls_settings: HlsSettings,
-        mutate_hls_settings: impl FnOnce(&mut HlsSettings),
-        storage_root: Option<std::path::PathBuf>,
-        per_file_delay: Option<HashMap<String, Duration>>,
-    ) -> (
-        stream_download_audio::AudioDecodeStream,
-        AudioAssetsServerFixture,
-    ) {
-        let _ = server_addr;
-        mutate_hls_settings(&mut hls_settings);
-
-        Self::audio_stream_hls_real_assets(server_addr, hls_settings, storage_root, per_file_delay)
-            .await
-    }
-
     /// Drain ordered controls and PCM for up to `timeout`, returning what was observed.
     ///
     /// NOTE:

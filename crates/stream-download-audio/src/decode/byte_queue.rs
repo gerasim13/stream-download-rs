@@ -52,10 +52,6 @@ impl Inner {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.buffered == 0
-    }
-
     fn pop_front_if_fully_consumed(&mut self) {
         if let Some(front) = self.queue.front() {
             if self.front_off >= front.len() {
@@ -63,19 +59,6 @@ impl Inner {
                 self.front_off = 0;
             }
         }
-    }
-
-    fn set_error(&mut self, err: io::Error) {
-        // Keep the first error; it's generally the most informative root cause.
-        if self.error.is_none() {
-            self.error = Some(err);
-        }
-        // On error we also consider the stream closed.
-        self.closed = true;
-        // Drop buffered data to ensure readers unblock and observe the error quickly.
-        self.queue.clear();
-        self.front_off = 0;
-        self.buffered = 0;
     }
 }
 
@@ -128,33 +111,6 @@ impl ByteQueue {
             shared: self.shared.clone(),
         }
     }
-
-    /// Close the queue (EOF).
-    ///
-    /// This unblocks any waiting readers/writers. After close:
-    /// - `Read` will return `Ok(0)` once buffered data is drained.
-    pub fn close(&self) {
-        let mut guard = self.shared.mu.lock().unwrap();
-        guard.closed = true;
-        self.shared.cv_not_empty.notify_all();
-        self.shared.cv_not_full.notify_all();
-    }
-
-    /// Set a fatal error and close the queue.
-    ///
-    /// Readers will observe the error on the next `read`.
-    pub fn fail(&self, err: io::Error) {
-        let mut guard = self.shared.mu.lock().unwrap();
-        guard.set_error(err);
-        self.shared.cv_not_empty.notify_all();
-        self.shared.cv_not_full.notify_all();
-    }
-
-    /// Current buffered bytes (best-effort snapshot).
-    pub fn buffered_len(&self) -> usize {
-        let guard = self.shared.mu.lock().unwrap();
-        guard.buffered
-    }
 }
 
 /// A clonable writer handle for [`ByteQueue`].
@@ -171,7 +127,7 @@ impl ByteQueueWriter {
     /// Returns:
     /// - `Ok(())` on success
     /// - `Err` if the queue is closed or an error was set
-    pub fn push(&self, mut bytes: Bytes) -> io::Result<()> {
+    pub fn push(&self, bytes: Bytes) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -196,7 +152,10 @@ impl ByteQueueWriter {
 
             if full && guard.buffered > 0 {
                 // Wait until there's room.
+                drop(guard);
+                let mut guard = self.shared.mu.lock().unwrap();
                 guard = self.shared.cv_not_full.wait(guard).unwrap();
+                drop(guard);
                 continue;
             }
 
@@ -216,28 +175,12 @@ impl ByteQueueWriter {
         self.shared.cv_not_empty.notify_all();
         self.shared.cv_not_full.notify_all();
     }
-
-    /// Set a fatal error and close the queue.
-    pub fn fail(&self, err: io::Error) {
-        let mut guard = self.shared.mu.lock().unwrap();
-        guard.set_error(err);
-        self.shared.cv_not_empty.notify_all();
-        self.shared.cv_not_full.notify_all();
-    }
 }
 
 /// A blocking reader handle for [`ByteQueue`].
 #[derive(Debug)]
 pub struct ByteQueueReader {
     shared: Arc<Shared>,
-}
-
-impl ByteQueueReader {
-    /// Returns true if `close()` was called and all buffered bytes have been drained.
-    pub fn is_fully_closed(&self) -> bool {
-        let guard = self.shared.mu.lock().unwrap();
-        guard.closed && guard.is_empty()
-    }
 }
 
 impl Read for ByteQueueReader {
@@ -286,7 +229,10 @@ impl Read for ByteQueueReader {
             }
 
             // Wait for data or close/error.
+            drop(guard);
+            let mut guard = self.shared.mu.lock().unwrap();
             guard = self.shared.cv_not_empty.wait(guard).unwrap();
+            drop(guard);
         }
     }
 }

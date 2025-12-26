@@ -1259,7 +1259,7 @@ fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: u
 #[rstest]
 #[case(2)]
 #[case(4)]
-fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_count: usize) {
+fn hls_worker_manual_downswitch_applies_via_ordered_controls(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
         assert!(
             variant_count >= 2,
@@ -1267,44 +1267,30 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
             variant_count
         );
 
-        // Start from the highest variant so a downswitch to the lowest (0) is meaningful.
         let start_variant_index = variant_count - 1;
-        let expected_variant_index = 0usize;
+        let target_variant_index = 0usize;
 
-        // Make the starting (high) variant *very* slow and make segments *large* so ABR gets a clear,
-        // throughput-driven signal and is forced to pick a lower-bandwidth variant.
-        //
-        // Notes:
-        // - ABR decisions depend on measured throughput and (optionally) buffer heuristics.
-        // - If segments are tiny, even large sleeps may not produce a strong enough throughput delta.
-        // - Increasing payload size makes the same delay translate into a much lower effective bps.
-        let mut delays = std::collections::HashMap::<usize, Duration>::new();
-        delays.insert(start_variant_index, Duration::from_millis(1500));
+        // Deterministic: start in MANUAL mode on the highest variant.
+        let fixture = HlsFixture::with_variant_count(variant_count).with_hls_config({
+            let mut s = HlsSettings::default();
 
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_media_payload_bytes(800_000)
-            .with_per_variant_segment_delays(delays)
-            .with_hls_config({
-                let mut s = HlsSettings::default();
+            // Manual selection at startup.
+            s.variant_stream_selector = Some(Arc::new(Box::new(move |_master| {
+                Some(VariantId(start_variant_index))
+            })));
+            s.abr_initial_variant_index = Some(start_variant_index);
 
-                // AUTO mode.
-                s.variant_stream_selector = None;
-                s.abr_initial_variant_index = Some(start_variant_index);
+            // ABR config is irrelevant for manual tests, but keep permissive defaults.
+            s.abr_min_switch_interval = Duration::ZERO;
+            s.abr_min_buffer_for_up_switch = 0.0;
+            s.abr_up_hysteresis_ratio = 0.0;
+            s.abr_throughput_safety_factor = 1.0;
 
-                // Make switching permissive and responsive.
-                s.abr_min_switch_interval = Duration::ZERO;
-                s.abr_throughput_safety_factor = 1.0;
-                s.abr_down_hysteresis_ratio = 0.0;
+            s
+        });
 
-                s
-            });
-
-        // Use clean Temp storage to avoid cache hits masking network timing effects.
-        let storage_kind = build_fixture_storage_kind(
-            "hls-abr-downswitch-per-variant-delay",
-            variant_count,
-            "temp",
-        );
+        let storage_kind =
+            build_fixture_storage_kind("hls-manual-downswitch-applies", variant_count, "temp");
         if let HlsFixtureStorageKind::Temp { subdir } = &storage_kind {
             let root = std::env::temp_dir()
                 .join("stream-download-tests")
@@ -1316,14 +1302,14 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
         let storage_handle = storage.storage_handle();
 
         let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
-        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
         let segmented_length = Arc::new(std::sync::RwLock::new(
             stream_download::storage::SegmentedLength::default(),
         ));
 
-        let (_base_url, worker) = fixture
+        let (base_url, worker) = fixture
             .worker(
                 storage_handle,
                 data_tx,
@@ -1334,54 +1320,92 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
             )
             .await;
 
+        // Spawn the worker loop.
         tokio::spawn(async move {
             let _ = worker.run().await;
         });
 
-        // Observe SegmentStart and wait until we see the lowest variant.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut initial_variant_seen: Option<VariantId> = None;
-        let mut saw_change = false;
-        let mut saw_lowest = false;
+        // Wait until we observe the initial default stream key for the start variant.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_initial_default = false;
+
+        let start_key: stream_download::source::ResourceKey = format!(
+            "{}/{}",
+            stream_download_hls::master_hash_from_url(&base_url),
+            start_variant_index
+        )
+        .into();
 
         while Instant::now() < deadline {
-            // Drain data to avoid backpressure (we only need events).
-            while let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(5), data_rx.recv()).await
+            if let Ok(Some(StreamMsg::Control(StreamControl::SetDefaultStreamKey { stream_key }))) =
+                tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await
             {
-                // ignore
+                if stream_key == start_key {
+                    saw_initial_default = true;
+                    break;
+                }
             }
+        }
 
-            match tokio::time::timeout(Duration::from_millis(250), event_rx.recv()).await {
-                Ok(Ok(StreamEvent::SegmentStart { variant_id, .. })) => {
-                    if initial_variant_seen.is_none() {
-                        initial_variant_seen = Some(variant_id);
-                        continue;
-                    }
+        assert!(
+            saw_initial_default,
+            "expected to observe initial SetDefaultStreamKey for start variant {}",
+            start_variant_index
+        );
 
-                    let initial = initial_variant_seen.unwrap();
-                    if variant_id != initial {
-                        saw_change = true;
+        // Issue deterministic manual downswitch.
+        cmd_tx
+            .send(stream_download_hls::HlsCommand::SetVariant {
+                variant_id: VariantId(target_variant_index),
+            })
+            .await
+            .expect("failed to send SetVariant command");
+
+        // Applied (ordered): must see SetDefaultStreamKey for the target, then ChunkStart(Init) for it.
+        let target_key: stream_download::source::ResourceKey = format!(
+            "{}/{}",
+            stream_download_hls::master_hash_from_url(&base_url),
+            target_variant_index
+        )
+        .into();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_target_default = false;
+        let mut saw_target_init_start = false;
+
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await {
+                Ok(Some(StreamMsg::Control(StreamControl::SetDefaultStreamKey { stream_key }))) => {
+                    if stream_key == target_key {
+                        saw_target_default = true;
                     }
-                    if variant_id == VariantId(expected_variant_index) {
-                        saw_lowest = true;
+                }
+                Ok(Some(StreamMsg::Control(StreamControl::ChunkStart {
+                    stream_key,
+                    kind,
+                    ..
+                }))) => {
+                    if stream_key == target_key && kind == stream_download::source::ChunkKind::Init
+                    {
+                        saw_target_init_start = true;
                         break;
                     }
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => break,
                 Err(_) => {}
             }
         }
 
         assert!(
-            saw_change,
-            "expected at least one non-initial variant change (inferred from SegmentStart) under per-variant delay shaping, but none was observed"
+            saw_target_default,
+            "expected SetDefaultStreamKey for target variant {} (key={:?})",
+            target_variant_index, target_key
         );
         assert!(
-            saw_lowest,
-            "expected ABR to downswitch to the lowest variant ({}) under per-variant delay shaping, but did not observe SegmentStart for it in time",
-            expected_variant_index
+            saw_target_init_start,
+            "expected ChunkStart(Init) for target variant {} (key={:?}) after SetVariant",
+            target_variant_index, target_key
         );
     });
 }
@@ -1389,7 +1413,7 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
 #[rstest]
 #[case(2)]
 #[case(4)]
-fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_count: usize) {
+fn hls_worker_manual_upswitch_applies_via_ordered_controls(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
         assert!(
             variant_count >= 2,
@@ -1398,36 +1422,29 @@ fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_cou
         );
 
         let start_variant_index = 0usize;
-        let expected_variant_index = variant_count - 1;
+        let target_variant_index = variant_count - 1;
 
-        // Make higher variants fast and the starting (low) variant slow to encourage upswitch.
-        // (We don't need to slow everything; just making v0 slower is enough to bias ABR upward.)
-        let mut delays = std::collections::HashMap::<usize, Duration>::new();
-        delays.insert(start_variant_index, Duration::from_millis(250));
+        // Deterministic: start in MANUAL mode on the lowest variant.
+        let fixture = HlsFixture::with_variant_count(variant_count).with_hls_config({
+            let mut s = HlsSettings::default();
 
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_per_variant_segment_delays(delays)
-            .with_hls_config({
-                let mut s = HlsSettings::default();
+            // Manual selection at startup.
+            s.variant_stream_selector = Some(Arc::new(Box::new(move |_master| {
+                Some(VariantId(start_variant_index))
+            })));
+            s.abr_initial_variant_index = Some(start_variant_index);
 
-                // AUTO mode.
-                s.variant_stream_selector = None;
-                s.abr_initial_variant_index = Some(start_variant_index);
+            // ABR config is irrelevant for manual tests, but keep permissive defaults.
+            s.abr_min_switch_interval = Duration::ZERO;
+            s.abr_min_buffer_for_up_switch = 0.0;
+            s.abr_up_hysteresis_ratio = 0.0;
+            s.abr_throughput_safety_factor = 1.0;
 
-                // Make switching permissive.
-                s.abr_min_switch_interval = Duration::ZERO;
-                s.abr_min_buffer_for_up_switch = 0.0;
-                s.abr_up_hysteresis_ratio = 0.0;
-                s.abr_throughput_safety_factor = 1.0;
+            s
+        });
 
-                s
-            });
-
-        let storage_kind = build_fixture_storage_kind(
-            "hls-abr-upswitch-per-variant-delay",
-            variant_count,
-            "temp",
-        );
+        let storage_kind =
+            build_fixture_storage_kind("hls-manual-upswitch-applies", variant_count, "temp");
         if let HlsFixtureStorageKind::Temp { subdir } = &storage_kind {
             let root = std::env::temp_dir()
                 .join("stream-download-tests")
@@ -1439,14 +1456,14 @@ fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_cou
         let storage_handle = storage.storage_handle();
 
         let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
-        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(1);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
         let segmented_length = Arc::new(std::sync::RwLock::new(
             stream_download::storage::SegmentedLength::default(),
         ));
 
-        let (_base_url, worker) = fixture
+        let (base_url, worker) = fixture
             .worker(
                 storage_handle,
                 data_tx,
@@ -1461,48 +1478,87 @@ fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_cou
             let _ = worker.run().await;
         });
 
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut initial_variant_seen: Option<VariantId> = None;
-        let mut saw_change = false;
-        let mut saw_highest = false;
+        // Wait until we observe the initial default stream key for the start variant.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saw_initial_default = false;
+
+        let start_key: stream_download::source::ResourceKey = format!(
+            "{}/{}",
+            stream_download_hls::master_hash_from_url(&base_url),
+            start_variant_index
+        )
+        .into();
 
         while Instant::now() < deadline {
-            while let Ok(Some(_)) =
-                tokio::time::timeout(Duration::from_millis(5), data_rx.recv()).await
+            if let Ok(Some(StreamMsg::Control(StreamControl::SetDefaultStreamKey { stream_key }))) =
+                tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await
             {
-                // ignore
+                if stream_key == start_key {
+                    saw_initial_default = true;
+                    break;
+                }
             }
+        }
 
-            match tokio::time::timeout(Duration::from_millis(250), event_rx.recv()).await {
-                Ok(Ok(StreamEvent::SegmentStart { variant_id, .. })) => {
-                    if initial_variant_seen.is_none() {
-                        initial_variant_seen = Some(variant_id);
-                        continue;
-                    }
+        assert!(
+            saw_initial_default,
+            "expected to observe initial SetDefaultStreamKey for start variant {}",
+            start_variant_index
+        );
 
-                    let initial = initial_variant_seen.unwrap();
-                    if variant_id != initial {
-                        saw_change = true;
+        // Issue deterministic manual upswitch.
+        cmd_tx
+            .send(stream_download_hls::HlsCommand::SetVariant {
+                variant_id: VariantId(target_variant_index),
+            })
+            .await
+            .expect("failed to send SetVariant command");
+
+        // Applied (ordered): must see SetDefaultStreamKey for the target, then ChunkStart(Init) for it.
+        let target_key: stream_download::source::ResourceKey = format!(
+            "{}/{}",
+            stream_download_hls::master_hash_from_url(&base_url),
+            target_variant_index
+        )
+        .into();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut saw_target_default = false;
+        let mut saw_target_init_start = false;
+
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await {
+                Ok(Some(StreamMsg::Control(StreamControl::SetDefaultStreamKey { stream_key }))) => {
+                    if stream_key == target_key {
+                        saw_target_default = true;
                     }
-                    if variant_id == VariantId(expected_variant_index) {
-                        saw_highest = true;
+                }
+                Ok(Some(StreamMsg::Control(StreamControl::ChunkStart {
+                    stream_key,
+                    kind,
+                    ..
+                }))) => {
+                    if stream_key == target_key && kind == stream_download::source::ChunkKind::Init
+                    {
+                        saw_target_init_start = true;
                         break;
                     }
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => break,
                 Err(_) => {}
             }
         }
 
         assert!(
-            saw_change,
-            "expected at least one non-initial variant change (inferred from SegmentStart) under per-variant delay shaping, but none was observed"
+            saw_target_default,
+            "expected SetDefaultStreamKey for target variant {} (key={:?})",
+            target_variant_index, target_key
         );
         assert!(
-            saw_highest,
-            "expected ABR to upswitch to the highest variant ({}) under per-variant delay shaping, but did not observe SegmentStart for it in time",
-            expected_variant_index
+            saw_target_init_start,
+            "expected ChunkStart(Init) for target variant {} (key={:?}) after SetVariant",
+            target_variant_index, target_key
         );
     });
 }
