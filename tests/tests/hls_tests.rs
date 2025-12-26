@@ -1052,6 +1052,202 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
 }
 
 #[rstest]
+#[case("memory")]
+fn hls_vod_completes_and_fetches_all_segments_slq_a1(#[case] storage: &str) {
+    SERVER_RT.block_on(async {
+        // Deterministic "VOD completion" regression test at the HLS layer.
+        //
+        // It validates two things:
+        // 1) The worker progresses through the entire media playlist for the selected variant
+        //    (all segments are fetched, according to fixture request counters).
+        // 2) The ordered data channel eventually closes (so `HlsStream::poll_next` can yield `None`).
+        //
+        // We use the fixture's mock mode with a fixed shape (2 variants, 12 segments). In mock mode:
+        // - media playlists are `/v{variant}.m3u8`
+        // - init is `/init/v{variant}.bin`
+        // - media segments are `/seg/v{variant}_{i}.bin` for `i in 0..segments_per_variant`
+        let variant_count = 2usize;
+        let segments_per_variant = 12usize;
+
+        // Force manual startup on variant 0 for determinism.
+        let fixture = HlsFixture::new(variant_count, segments_per_variant, Duration::ZERO)
+            .with_hls_config(
+                HlsSettings::default().variant_stream_selector(move |_| Some(VariantId(0))),
+            );
+
+        let storage_kind = build_fixture_storage_kind("hls-vod-completes", variant_count, storage);
+
+        // Drain the worker until the ordered channel closes (or timeout).
+        let fixture_for_asserts = fixture.clone();
+        let saw_channel_close = fixture
+            .run_worker_collecting(8192, storage_kind, |mut data_rx, _events| {
+                Box::pin(async move {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+
+                    while Instant::now() < deadline {
+                        match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await
+                        {
+                            Ok(Some(_msg)) => {
+                                // Drain ordered messages; we only care that the worker can complete.
+                            }
+                            Ok(None) => {
+                                // Channel closed => `HlsStream` would yield `None`.
+                                return true;
+                            }
+                            Err(_) => {
+                                // Keep waiting until deadline.
+                            }
+                        }
+                    }
+
+                    false
+                })
+            })
+            .await;
+
+        assert!(
+            saw_channel_close,
+            "expected HLS ordered data channel to close for VOD within timeout"
+        );
+
+        // Assert all expected resources for variant 0 were fetched.
+        //
+        // NOTE: Fixture request counters are keyed by paths like "/seg/v0_0.bin".
+        let v = 0usize;
+
+        // Master and variant playlist should be fetched at least once.
+        assert!(
+            fixture_for_asserts
+                .request_count_for("/master.m3u8")
+                .unwrap_or(0)
+                > 0,
+            "expected master playlist to be fetched"
+        );
+        assert!(
+            fixture_for_asserts
+                .request_count_for(&format!("/v{}.m3u8", v))
+                .unwrap_or(0)
+                > 0,
+            "expected media playlist for variant {} to be fetched",
+            v
+        );
+
+        // Init is format/container-dependent (e.g. TS has no init). In mock fixture mode,
+        // we only require that all media segments are fetched; init may legitimately be absent.
+        let _ = v;
+
+        // All media segments should be fetched at least once.
+        for i in 0..segments_per_variant {
+            let path = format!("/seg/v{}_{}.bin", v, i);
+            assert!(
+                fixture_for_asserts.request_count_for(&path).unwrap_or(0) > 0,
+                "expected VOD segment to be fetched: {}",
+                path
+            );
+        }
+    });
+}
+
+#[rstest]
+#[case("memory")]
+fn hls_vod_real_assets_fetches_all_segments_and_stream_closes(#[case] storage: &str) {
+    SERVER_RT.block_on(async {
+        // Real-assets VOD completion test (uses the repo `assets/hls` directory).
+        //
+        // Goal:
+        // - Ensure the HLS worker can iterate an ENDLIST VOD playlist to completion against the real files.
+        // - Ensure the ordered output channel closes (so `HlsStream::poll_next` can yield `None`).
+        // - Ensure all expected segment files for the selected variant were requested.
+        //
+        // This test exists to distinguish "HLS layer can't complete VOD" from "audio layer stalls".
+
+        let assets_root = std::path::PathBuf::from("../assets/hls");
+        let variant_count = 4usize;
+
+        // Force manual startup on variant 0 for determinism.
+        let fixture = HlsFixture::with_variant_count(variant_count)
+            .with_segment_delay(Duration::ZERO)
+            .with_real_dir(assets_root)
+            .with_hls_config(
+                HlsSettings::default().variant_stream_selector(move |_| Some(VariantId(0))),
+            );
+
+        let storage_kind =
+            build_fixture_storage_kind("hls-vod-real-assets", variant_count, storage);
+
+        let fixture_for_asserts = fixture.clone();
+        let saw_channel_close = fixture
+            .run_worker_collecting(8192, storage_kind, |mut data_rx, _events| {
+                Box::pin(async move {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+
+                    while Instant::now() < deadline {
+                        match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await
+                        {
+                            Ok(Some(_msg)) => {
+                                // drain
+                            }
+                            Ok(None) => return true,
+                            Err(_) => {}
+                        }
+                    }
+
+                    false
+                })
+            })
+            .await;
+
+        assert!(
+            saw_channel_close,
+            "expected HLS ordered data channel to close for real-assets VOD within timeout"
+        );
+
+        // Variant 0 corresponds to the "slq-a1" playlist in repo assets:
+        // - playlist: /hls/index-slq-a1.m3u8
+        // - init:     /hls/init-slq-a1.mp4
+        // - segments: /hls/segment-1-slq-a1.m4s .. /hls/segment-37-slq-a1.m4s
+        //
+        // We assert these were requested at least once.
+        // In `HlsFixture` the router records request counters as paths starting with `/`,
+        // and in RealDir mode the router strips the leading `hls/` prefix from the incoming URL
+        // and serves files from `root/` directly.
+        //
+        // So requests that look like `/hls/master.m3u8` on the wire are counted as `/master.m3u8`
+        // in the fixture's counters.
+        assert!(
+            fixture_for_asserts
+                .request_count_for("/master.m3u8")
+                .unwrap_or(0)
+                > 0,
+            "expected master playlist to be fetched"
+        );
+        assert!(
+            fixture_for_asserts
+                .request_count_for("/index-slq-a1.m3u8")
+                .unwrap_or(0)
+                > 0,
+            "expected variant 0 media playlist to be fetched"
+        );
+        assert!(
+            fixture_for_asserts
+                .request_count_for("/init-slq-a1.mp4")
+                .unwrap_or(0)
+                > 0,
+            "expected variant 0 init to be fetched"
+        );
+
+        for i in 1..=37usize {
+            let p = format!("/segment-{}-slq-a1.m4s", i);
+            assert!(
+                fixture_for_asserts.request_count_for(&p).unwrap_or(0) > 0,
+                "expected VOD segment to be fetched: {}",
+                p
+            );
+        }
+    });
+}
+
+#[rstest]
 #[case(1, "persistent")]
 #[case(1, "temp")]
 #[case(1, "memory")]

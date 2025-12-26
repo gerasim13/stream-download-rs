@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +71,9 @@ impl AudioFixture {
 
     /// Master playlist filename inside `HLS_ASSETS_DIR`.
     pub const HLS_MASTER: &'static str = "master.m3u8";
+
+    /// A small progressive MP3 asset shipped with the repo (served by this fixture).
+    pub const MP3_ASSET: &'static str = "music.mp3";
 
     /// Stream chunk size used by throttling.
     const THROTTLE_CHUNK_BYTES: usize = 16 * 1024;
@@ -150,6 +153,10 @@ impl AudioFixture {
         .expect("failed to build HLS master URL")
     }
 
+    pub fn mp3_url(&self) -> Url {
+        self.url_for(Self::MP3_ASSET)
+    }
+
     /// Current request sequence counter value (monotonically increasing).
     ///
     /// This is intended to be used as a "watermark" for correlating player events with requests.
@@ -163,6 +170,15 @@ impl AudioFixture {
     /// e.g. `"hls/master.m3u8"`.
     pub async fn request_log_snapshot(&self) -> Vec<RequestEntry> {
         self.request_log.lock().await.clone()
+    }
+
+    /// Snapshot of requested asset paths as a set (order-independent).
+    pub async fn requested_paths_set(&self) -> HashSet<String> {
+        self.request_log_snapshot()
+            .await
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
     }
 
     /// Wait until a specific asset path is observed in the request log or until timeout.
@@ -210,6 +226,86 @@ impl AudioFixture {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         None
+    }
+
+    /// Assert that all expected HLS VOD segment files for a given variant suffix were requested.
+    ///
+    /// This is a deterministic "played to the end" assertion for VOD playlists:
+    /// if all segment URLs were requested by the HTTP layer, then the pipeline iterated the entire
+    /// playlist (even if the audio pipeline does not yet emit a clean EOF).
+    ///
+    /// Example suffixes (as used in assets):
+    /// - "slq-a1"
+    /// - "smq-a1"
+    /// - "shq-a1"
+    /// - "slossless-a1"
+    ///
+    /// `segment_count` is the expected number of media segments (e.g. 37 for the provided assets).
+    pub async fn assert_hls_vod_all_segments_requested(
+        &self,
+        variant_suffix: &str,
+        segment_count: usize,
+        timeout: Duration,
+    ) {
+        let expected_last = format!(
+            "{}/segment-{}-{}.m4s",
+            Self::HLS_ASSETS_DIR,
+            segment_count,
+            variant_suffix
+        );
+
+        let ok = self.wait_until_requested(&expected_last, timeout).await;
+        assert!(
+            ok,
+            "timed out waiting for last segment to be requested: {}",
+            expected_last
+        );
+
+        let requested = self.requested_paths_set().await;
+
+        // Require init and media playlist too (best-effort sanity).
+        let init = format!("{}/init-{}.mp4", Self::HLS_ASSETS_DIR, variant_suffix);
+        assert!(
+            requested.contains(&init),
+            "expected init to be requested: {}",
+            init
+        );
+
+        // Verify all segments 1..=segment_count requested.
+        let mut missing: Vec<String> = Vec::new();
+        for i in 1..=segment_count {
+            let seg = format!(
+                "{}/segment-{}-{}.m4s",
+                Self::HLS_ASSETS_DIR,
+                i,
+                variant_suffix
+            );
+            if !requested.contains(&seg) {
+                missing.push(seg);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "missing {} expected segments (first few: {:?})",
+            missing.len(),
+            missing.iter().take(10).collect::<Vec<_>>()
+        );
+    }
+
+    /// Construct an `AudioDecodeStream` for progressive HTTP MP3 served by this fixture's server.
+    pub async fn audio_stream_http_mp3(
+        &self,
+        storage_root: Option<std::path::PathBuf>,
+        opts: Option<AudioDecodeOptions>,
+    ) -> AudioDecodeStream {
+        let url = self.mp3_url();
+        let _ = storage_root; // reserved for future storage wiring for HTTP path
+        let opts = opts.unwrap_or_else(AudioDecodeOptions::default);
+
+        AudioDecodeStream::new_http(url, opts)
+            .await
+            .expect("failed to create AudioDecodeStream(HTTP MP3)")
     }
 
     /// Construct an `AudioDecodeStream` for the real HLS assets served by this fixture's server.

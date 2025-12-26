@@ -1172,7 +1172,17 @@ impl HlsStreamWorker {
                     self.process_descriptor(desc, &mut last_variant_id).await?;
                 }
                 Ok(crate::manager::NextSegmentDescResult::EndOfStream) => {
-                    tracing::trace!("HLS stream: end of stream");
+                    tracing::trace!("HLS stream: end of stream (closing data channel)");
+                    // IMPORTANT:
+                    // We must close the data channel so `HlsStream::poll_next` can return `Poll::Ready(None)`.
+                    //
+                    // Without this, consumers (including the audio layer) can hang forever:
+                    // `HlsStream` is implemented as a wrapper around `mpsc::Receiver<StreamMsg>`, and
+                    // `poll_next` returns `None` only when the receiver is closed (all senders dropped).
+                    //
+                    // `self.data_sender` is held by this worker; dropping it here guarantees the
+                    // receiver observes closure after any buffered messages are drained.
+                    drop(self.data_sender);
                     break;
                 }
                 Ok(crate::manager::NextSegmentDescResult::NeedsRefresh { wait }) => {

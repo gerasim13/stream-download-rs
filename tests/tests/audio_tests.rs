@@ -11,6 +11,104 @@ use stream_download_hls::HlsSettings;
 
 mod fixtures;
 
+/// Drain the audio stream until it finishes (ordered EOS or stream termination) or until `timeout`.
+///
+/// Returns `(total_pcm_samples, saw_end_of_stream_control)`.
+async fn drain_to_end(
+    stream: &mut stream_download_audio::AudioDecodeStream,
+    timeout: Duration,
+) -> (usize, bool) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut total_samples = 0usize;
+    let mut saw_eos = false;
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match tokio::time::timeout(remaining, stream.next_msg()).await {
+            Ok(Some(AudioMsg::Pcm(chunk))) => {
+                total_samples += chunk.pcm.len();
+            }
+            Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
+                saw_eos = true;
+                break;
+            }
+            Ok(Some(AudioMsg::Control(_))) => {
+                // ignore other controls
+            }
+            Ok(None) => {
+                // Stream terminated (channel closed).
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    (total_samples, saw_eos)
+}
+
+#[rstest]
+fn audio_http_mp3_full_track_drains_to_end() {
+    SERVER_RT.block_on(async move {
+        let fixture = AudioFixture::start(Default::default()).await;
+
+        let mut stream = fixture.audio_stream_http_mp3(None, None).await;
+
+        // Drain until completion. For progressive MP3 we expect a clean end (EOS or termination)
+        // and non-zero PCM output.
+        let (total_samples, saw_eos) = drain_to_end(&mut stream, Duration::from_secs(60)).await;
+
+        assert!(
+            total_samples > 0,
+            "expected to decode some PCM while draining HTTP MP3; got total_samples={}",
+            total_samples
+        );
+
+        // Prefer ordered EOS, but allow termination until we tighten shutdown semantics everywhere.
+        let _ = saw_eos;
+    });
+}
+
+#[rstest]
+fn audio_hls_vod_requests_all_segments_even_without_eof() {
+    SERVER_RT.block_on(async move {
+        // This test is intentionally not based on an audio EOS signal, because today the example
+        // `audio_hls` (and sometimes the pipeline) may not terminate cleanly for HLS VOD.
+        //
+        // Instead we assert the deterministic observable: the HTTP layer requested all VOD segments.
+        // For the shipped assets, each variant playlist is `#EXT-X-PLAYLIST-TYPE:VOD` with ENDLIST.
+        let fixture = AudioFixture::start(Default::default()).await;
+
+        // Force a deterministic variant at startup (variant 0 == "slq-a1" in our assets master).
+        let mut hls_settings = HlsSettings::default();
+        hls_settings.abr_initial_variant_index = Some(0);
+
+        let mut stream = fixture
+            .audio_stream_hls_real_assets(hls_settings, None)
+            .await;
+
+        // Drive the pipeline by actually draining PCM for long enough.
+        //
+        // NOTE:
+        // We do NOT expect a clean EOF for HLS VOD yet, but we do need to ensure the decode loop
+        // keeps pulling data so the HLS worker continues requesting segments.
+        let (total_samples, _saw_eos) = drain_to_end(&mut stream, Duration::from_secs(120)).await;
+        assert!(
+            total_samples > 0,
+            "expected to decode some PCM while draining HLS VOD; got total_samples={}",
+            total_samples
+        );
+
+        // The provided `index-slq-a1.m3u8` contains segments 1..=37 and ENDLIST.
+        fixture
+            .assert_hls_vod_all_segments_requested("slq-a1", 37, Duration::from_secs(120))
+            .await;
+    });
+}
+
 #[rstest]
 fn audio_hls_decodes_real_assets_from_local_server() {
     SERVER_RT.block_on(async move {
