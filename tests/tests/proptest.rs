@@ -2,7 +2,7 @@ use std::io::Read;
 use std::num::NonZeroUsize;
 use std::{fs, io};
 
-use fixtures::{SERVER_RT, music_path, server_addr};
+use fixtures::setup::{SERVER_RT, music_path, server_addr};
 use proptest::prelude::*;
 use stream_download::storage::bounded::BoundedStorageProvider;
 use stream_download::storage::memory::MemoryStorageProvider;

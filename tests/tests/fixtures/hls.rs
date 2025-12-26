@@ -20,7 +20,8 @@ use stream_download::storage::{
 use stream_download::{Settings, StreamDownload};
 use stream_download_hls::{
     AbrConfig, AbrController, HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream,
-    HlsStreamParams, HlsStreamWorker, ResourceDownloader, VariantId, master_hash_from_url,
+    HlsStreamParams, HlsStreamWorker, KeyProcessorCallback, ResourceDownloader, VariantId,
+    master_hash_from_url,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -29,8 +30,6 @@ use aes::Aes128;
 use aes::cipher::BlockEncryptMut;
 use cbc::Encryptor;
 use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
-
-use stream_download_hls::KeyProcessorCallback;
 
 /// Fixture can either serve fully in-memory blobs (mock mode) or serve real files from a directory
 /// (real-media mode).
@@ -65,40 +64,6 @@ enum FixtureContent {
 pub struct BoxedStorageProvider {
     inner: BoxedStorageProviderInner,
     capacity: Option<usize>,
-}
-
-impl HlsFixture {
-    pub fn with_real_dir(mut self, root: std::path::PathBuf) -> Self {
-        self.content = FixtureContent::RealDir {
-            root: Arc::new(root),
-        };
-        self.aes128 = None;
-        self
-    }
-
-    fn mock_blobs(&self) -> Option<&Arc<HashMap<String, Bytes>>> {
-        match &self.content {
-            FixtureContent::Mock { blobs, .. } => Some(blobs),
-            FixtureContent::RealDir { .. } => None,
-        }
-    }
-
-    fn mock_media_payload_bytes(&self) -> Option<usize> {
-        match &self.content {
-            FixtureContent::Mock {
-                media_payload_bytes,
-                ..
-            } => *media_payload_bytes,
-            FixtureContent::RealDir { .. } => None,
-        }
-    }
-
-    fn real_root(&self) -> Option<&std::path::PathBuf> {
-        match &self.content {
-            FixtureContent::RealDir { root } => Some(root.as_ref()),
-            FixtureContent::Mock { .. } => None,
-        }
-    }
 }
 
 enum BoxedStorageProviderInner {
@@ -441,6 +406,38 @@ impl HlsFixture {
             media_payload_bytes,
         };
         self
+    }
+
+    pub fn with_real_dir(mut self, root: std::path::PathBuf) -> Self {
+        self.content = FixtureContent::RealDir {
+            root: Arc::new(root),
+        };
+        self.aes128 = None;
+        self
+    }
+
+    fn mock_blobs(&self) -> Option<&Arc<HashMap<String, Bytes>>> {
+        match &self.content {
+            FixtureContent::Mock { blobs, .. } => Some(blobs),
+            FixtureContent::RealDir { .. } => None,
+        }
+    }
+
+    fn mock_media_payload_bytes(&self) -> Option<usize> {
+        match &self.content {
+            FixtureContent::Mock {
+                media_payload_bytes,
+                ..
+            } => *media_payload_bytes,
+            FixtureContent::RealDir { .. } => None,
+        }
+    }
+
+    fn real_root(&self) -> Option<&std::path::PathBuf> {
+        match &self.content {
+            FixtureContent::RealDir { root } => Some(root.as_ref()),
+            FixtureContent::Mock { .. } => None,
+        }
     }
 
     fn refresh_blobs_from_config(mut self) -> Self {

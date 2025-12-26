@@ -1,35 +1,15 @@
-//! Unified HLS integration tests.
-//!
-//! This file combines:
-//! - cache warmup test (2 runs against same storage_root)
-//! - worker-level checks (chunk boundaries / manual selection behavior)
-//! - manager-level checks (master parsing / select_variant affects fetched bytes)
-//! - deterministic ABR switching test (downswitch) via controlled fixture latency
-//!
-//! All tests use a local in-memory HLS fixture server (no external network).
-//!
-//! Notes:
-//! - We intentionally do NOT decode audio.
-//! - These tests validate: variant discovery, manual selection behavior, ABR switching, and that the stream
-//!   produces bytes consistently (including after cache warmup).
-//!
-//! Additional storage assertions:
-//! - Persistent file-tree storage should create files on disk after reading.
-//! - Memory stream storage should NOT create segment files on disk (resource cache may still touch disk).
-
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use fixtures::hls::{HlsFixture, HlsFixtureStorageKind};
+use fixtures::setup::SERVER_RT;
 use futures_util::StreamExt;
 use rstest::rstest;
-use tokio::sync::mpsc;
-
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, StreamEvent, VariantId};
-
-use fixtures::hls::{HlsFixture, HlsFixtureStorageKind};
+use tokio::sync::mpsc;
 
 mod fixtures;
 
@@ -176,7 +156,7 @@ async fn read_first_n_bytes_via_worker(
 #[case("temp")]
 #[case("memory")]
 fn hls_aes128_drm_decrypts_media_segments_for_all_storage_backends(#[case] storage: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
@@ -226,7 +206,7 @@ fn hls_aes128_drm_decrypts_media_segments_for_all_storage_backends(#[case] stora
 fn hls_aes128_drm_fixed_zero_iv_decrypts_media_segments_for_all_storage_backends(
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
@@ -272,7 +252,7 @@ fn hls_aes128_drm_fixed_zero_iv_decrypts_media_segments_for_all_storage_backends
 #[case("temp")]
 #[case("memory")]
 fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] storage: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         // We verify two knobs end-to-end:
@@ -347,7 +327,7 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
 #[case("temp")]
 #[case("memory")]
 fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         // Plain AES-128 (no key processor callback). We read enough bytes to span multiple segments,
@@ -405,7 +385,7 @@ fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
     expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
 )]
 fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_persistent() {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         let mut required = HashMap::new();
@@ -448,7 +428,7 @@ fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_persistent() 
     expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
 )]
 fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_temp() {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         let mut required = HashMap::new();
@@ -488,7 +468,7 @@ fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_temp() {
     expected = "missing/invalid key request header: x-drm-token: abc123 (got <missing>)"
 )]
 fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_memory() {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         let mut required = HashMap::new();
@@ -532,7 +512,7 @@ fn hls_aes128_drm_fails_when_required_key_request_headers_not_sent_memory() {
 #[case("memory")]
 #[should_panic(expected = "HTTP status client error (404 Not Found)")]
 fn hls_base_url_default_segment_urls_404_when_segments_are_remapped(#[case] storage: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         // When the fixture serves variant playlists / init / keys / segments ONLY under a derived prefix,
@@ -618,7 +598,7 @@ fn hls_base_url_default_segment_urls_404_when_segments_are_remapped(#[case] stor
 #[case("memory", "a/b")]
 #[case("memory", "a/b/c")]
 fn hls_base_url_override_makes_segment_remap_work(#[case] storage: &str, #[case] prefix: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         // We want to validate that:
@@ -703,7 +683,7 @@ fn hls_base_url_override_makes_segment_remap_work(#[case] storage: &str, #[case]
 #[case("temp")]
 #[case("memory")]
 fn hls_aes128_drm_succeeds_when_key_headers_not_required_and_not_sent(#[case] storage: &str) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
         // Server does NOT require headers (None), and client does NOT send any.
@@ -769,7 +749,7 @@ fn hls_cache_warmup_produces_bytes_twice_on_same_storage_root(
     #[case] v0_delay: Duration,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(v0_delay);
 
@@ -941,7 +921,7 @@ fn hls_manager_parses_exact_variant_count_from_master(
     #[case] variant_count: usize,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture =
             HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
@@ -1023,7 +1003,7 @@ fn hls_worker_manual_selection_emits_only_selected_variant_chunks(
     #[case] variant_idx: u64,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         // Use 4 variants so we can parameterize across multiple variant selections.
         let fixture = HlsFixture::with_variant_count(4)
             .with_segment_delay(Duration::ZERO)
@@ -1085,7 +1065,7 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
     #[case] variant_count: usize,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO);
 
@@ -1128,7 +1108,7 @@ fn hls_worker_auto_starts_with_variant0_first_chunkstart(
 #[case(2)]
 #[case(4)]
 fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count).with_abr_config(|cfg| {
             cfg.abr_min_switch_interval = Duration::ZERO;
             cfg.abr_down_switch_buffer = 5.0;
@@ -1188,7 +1168,7 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
 #[case(2)]
 #[case(4)]
 fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: usize) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
             .with_abr_config(|cfg| {
@@ -1290,7 +1270,7 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
 #[case(2)]
 #[case(4)]
 fn hls_worker_auto_upswitches_mid_stream_without_restarting(#[case] variant_count: usize) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::from_millis(200))
             .with_media_payload_bytes(800_000)
@@ -1411,7 +1391,7 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
     #[case] to_variant: usize,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         assert!(
             from_variant < variant_count && to_variant < variant_count && from_variant != to_variant,
             "invalid parameterization: variant_count={variant_count} from_variant={from_variant} to_variant={to_variant}"
@@ -1550,7 +1530,7 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
     #[case] expected_prefix: &str,
     #[case] storage: &str,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture =
             HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
         let storage_kind = build_fixture_storage_kind("hls-read-seek-e2e", variant_count, storage);
@@ -1597,7 +1577,7 @@ fn hls_streamdownload_read_seek_returns_expected_bytes_at_known_offsets(
 fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes(
     #[case] variant_count: usize,
 ) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture =
             HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
         let storage_kind =
@@ -1643,7 +1623,7 @@ fn hls_streamdownload_seek_across_segment_boundary_reads_contiguous_bytes(
 #[case(2)]
 #[case(4)]
 fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count: usize) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture =
             HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
@@ -1678,7 +1658,7 @@ fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count
 #[case(2)]
 #[case(4)]
 fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] variant_count: usize) {
-    fixtures::SERVER_RT.block_on(async {
+    SERVER_RT.block_on(async {
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO);
 

@@ -4,7 +4,7 @@ use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::time::Duration;
 use std::{fs, io};
 
-use fixtures::{
+use fixtures::setup::{
     ASSETS, Command, ErrorTestStorageProvider, SERVER_RT, TestClient, music_path, server_addr,
 };
 use opendal::{Operator, services};
