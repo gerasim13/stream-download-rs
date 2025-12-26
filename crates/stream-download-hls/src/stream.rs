@@ -3,6 +3,10 @@
 //! [`HlsStream`] spawns a background [`HlsStreamWorker`] and exposes ordered [`StreamMsg`] items
 //! (data + control). Chunk boundaries are emitted as `StreamControl` messages.
 //!
+//! This stream also exposes a **command channel** for runtime control:
+//! - seek (byte position)
+//! - manual variant selection (by `VariantId`)
+//!
 //! Detailed architecture notes live in `crates/stream-download-hls/README.md`.
 
 use std::io;
@@ -55,6 +59,31 @@ pub enum StreamEvent {
     },
 }
 
+/// Runtime control commands for [`HlsStream`].
+///
+/// This is a unified command channel so callers can control playback without
+/// reaching into worker internals.
+///
+/// Notes:
+/// - Commands are best-effort: if the worker has shut down, the send fails.
+/// - Ordering: commands are not ordered relative to `StreamMsg` items; consumers
+///   should observe applied effects via ordered boundaries (`StreamControl`) and/or
+///   out-of-band `StreamEvent` (best-effort).
+#[derive(Clone, Debug)]
+pub enum HlsCommand {
+    /// Seek to an absolute byte position in the concatenated logical stream.
+    Seek { position: u64 },
+
+    /// Manually select a variant. This is intended for "manual mode".
+    ///
+    /// The worker/controller should switch to the requested variant and continue streaming
+    /// from a time-aligned segment boundary.
+    SetVariant { variant_id: VariantId },
+
+    /// Clear manual selection and return to AUTO (ABR-controlled) selection.
+    ClearVariantOverride,
+}
+
 /// Parameters for creating an [`HlsStream`].
 #[derive(Debug, Clone)]
 pub struct HlsStreamParams {
@@ -84,8 +113,8 @@ impl HlsStreamParams {
 pub struct HlsStream {
     /// Receiver for ordered stream messages (data + control).
     data_receiver: mpsc::Receiver<StreamMsg>,
-    /// Sender for seek commands to the worker loop.
-    seek_sender: mpsc::Sender<u64>,
+    /// Sender for unified commands to the worker loop.
+    cmd_sender: mpsc::Sender<HlsCommand>,
     /// Cancellation token for shutdown.
     cancel_token: CancellationToken,
     /// Background worker task handle.
@@ -118,7 +147,7 @@ impl HlsStream {
         // Create channels for data and commands (bounded data channel provides backpressure).
         let buffer_size = settings.prefetch_buffer_size;
         let (data_sender, data_receiver) = mpsc::channel::<StreamMsg>(buffer_size);
-        let (seek_sender, seek_receiver) = mpsc::channel(1);
+        let (cmd_sender, cmd_receiver) = mpsc::channel::<HlsCommand>(8);
         let cancel_token = CancellationToken::new();
 
         // Event broadcast channel (out-of-band metadata).
@@ -137,7 +166,7 @@ impl HlsStream {
             settings,
             storage_handle,
             data_sender,
-            seek_receiver,
+            cmd_receiver,
             cancel_token.clone(),
             event_sender.clone(),
             master_hash,
@@ -147,7 +176,7 @@ impl HlsStream {
 
         Self::new_with_worker(
             data_receiver,
-            seek_sender,
+            cmd_sender,
             cancel_token,
             event_sender,
             segmented_length,
@@ -160,7 +189,7 @@ impl HlsStream {
     /// The provided `worker` must be wired to the channels and cancellation token passed here.
     pub fn new_with_worker(
         data_receiver: mpsc::Receiver<StreamMsg>,
-        seek_sender: mpsc::Sender<u64>,
+        cmd_sender: mpsc::Sender<HlsCommand>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
@@ -183,7 +212,7 @@ impl HlsStream {
 
         Ok(Self {
             data_receiver,
-            seek_sender,
+            cmd_sender,
             cancel_token,
             streaming_task,
             event_sender,
@@ -196,14 +225,30 @@ impl HlsStream {
         self.event_sender.subscribe()
     }
 
-    /// Seeks to an absolute byte offset in the concatenated stream.
+    /// Sends a unified command to the worker.
     #[inline(always)]
-    async fn seek_internal(&self, position: u64) -> Result<(), HlsError> {
-        self.seek_sender
-            .send(position)
+    async fn send_cmd(&self, cmd: HlsCommand) -> Result<(), HlsError> {
+        self.cmd_sender
+            .send(cmd)
             .await
             .map_err(|_| HlsError::SeekFailed)?;
         Ok(())
+    }
+
+    /// Seeks to an absolute byte offset in the concatenated stream.
+    #[inline(always)]
+    async fn seek_internal(&self, position: u64) -> Result<(), HlsError> {
+        self.send_cmd(HlsCommand::Seek { position }).await
+    }
+
+    /// Manually selects a variant.
+    pub async fn set_variant(&self, variant_id: VariantId) -> Result<(), HlsError> {
+        self.send_cmd(HlsCommand::SetVariant { variant_id }).await
+    }
+
+    /// Clears manual variant selection and returns to AUTO (ABR-controlled) selection.
+    pub async fn clear_variant_override(&self) -> Result<(), HlsError> {
+        self.send_cmd(HlsCommand::ClearVariantOverride).await
     }
 }
 

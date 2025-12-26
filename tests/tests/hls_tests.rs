@@ -1200,7 +1200,7 @@ fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: u
         let storage_handle = storage.storage_handle();
 
         let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
-        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
         let segmented_length = Arc::new(std::sync::RwLock::new(
@@ -1211,7 +1211,7 @@ fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: u
             .worker(
                 storage_handle,
                 data_tx,
-                seek_rx,
+                cmd_rx,
                 cancel.clone(),
                 event_tx,
                 segmented_length,
@@ -1316,7 +1316,7 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
         let storage_handle = storage.storage_handle();
 
         let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
-        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
         let segmented_length = Arc::new(std::sync::RwLock::new(
@@ -1327,7 +1327,7 @@ fn hls_worker_abr_downswitches_under_per_variant_delay_shaping(#[case] variant_c
             .worker(
                 storage_handle,
                 data_tx,
-                seek_rx,
+                cmd_rx,
                 cancel.clone(),
                 event_tx,
                 segmented_length,
@@ -1439,7 +1439,7 @@ fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_cou
         let storage_handle = storage.storage_handle();
 
         let (data_tx, mut data_rx) = mpsc::channel::<StreamMsg>(64);
-        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(1);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<StreamEvent>(64);
         let segmented_length = Arc::new(std::sync::RwLock::new(
@@ -1450,7 +1450,7 @@ fn hls_worker_abr_upswitches_under_per_variant_delay_shaping(#[case] variant_cou
             .worker(
                 storage_handle,
                 data_tx,
-                seek_rx,
+                cmd_rx,
                 cancel.clone(),
                 event_tx,
                 segmented_length,

@@ -1,8 +1,8 @@
 use std::error::Error;
+use std::time::Duration;
 
 use rodio::{OutputStreamBuilder, Sink};
-use stream_download::storage::temp::TempStorageProvider;
-use stream_download_audio::{AudioSettings, AudioStream, RodioSourceAdapter};
+use stream_download_audio::{AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -18,30 +18,31 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_file(true)
         .init();
 
-    // Build audio stream for HTTP source (MP3/AAC/FLAC etc.)
+    // Progressive HTTP audio (MP3/AAC/FLAC etc.)
     let url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3".parse()?;
-    let storage = TempStorageProvider::new();
-    let audio_settings = AudioSettings::default();
-    let stream_settings = stream_download::Settings::default();
-    
-    let stream = AudioStream::new_http(
-        url,
-        storage,
-        audio_settings,
-        stream_settings,
-    )
-    .await;
+
+    // Decoder/buffering options.
+    // NOTE: these are meaningful units (bytes + samples), not arbitrary fixed sizes.
+    let opts = AudioDecodeOptions::default();
+
+    println!("Creating AudioDecodeStream (HTTP)...");
+    let stream = AudioDecodeStream::new_http(url, opts).await?;
+    println!("AudioDecodeStream created.");
 
     // Setup rodio output
     let stream_handle =
         OutputStreamBuilder::open_default_stream().expect("open default audio stream");
     let sink = Sink::connect_new(&stream_handle.mixer());
 
-    // Adapt AudioStream into a rodio Source and play
+    // Adapt AudioDecodeStream into a rodio Source and play.
     let source = RodioSourceAdapter::new(stream);
     sink.append(source);
     sink.play();
-    sink.sleep_until_end();
+
+    // Keep the process alive for a while.
+    // If you want a blocking wait-until-end behavior, you'll need an EOS signal from the adapter,
+    // or poll `sink.empty()` in a loop.
+    tokio::time::sleep(Duration::from_secs(60)).await;
 
     Ok(())
 }

@@ -1,254 +1,260 @@
-//! Rodio integration for `stream-download-audio`.
+//! Rodio adapter for `AudioDecodeStream`.
 //!
-//! This adapter is intentionally built on top of the **new ordered** `AudioMsg` stream API.
-//! There is no legacy pull-based wrapper.
+//! `rodio::Source` is a pull-based, synchronous iterator API. Our decoding pipeline (`AudioDecodeStream`)
+//! is an async stream that yields ordered `AudioMsg` items:
+//! - `AudioMsg::Pcm(PcmChunk { pcm: Vec<f32>, spec })`
+//! - `AudioMsg::Control(AudioControl::...)`
 //!
-//! Design
-//! ------
-//! - Owns an `AudioStream<P>` and spawns a background thread.
-//! - The thread continuously pulls ordered `AudioMsg` items from the stream and forwards PCM to
-//!   the rodio `Source` iterator via a bounded channel (backpressure).
-//! - The iterator (`RodioSourceAdapter`) never blocks in `next()`; if no PCM is available yet it
-//!   yields silence (0.0) to keep rodio’s mixer running smoothly.
+//! This adapter bridges the two by:
+//! - spawning a background thread with a small Tokio runtime,
+//! - draining `AudioDecodeStream` into a bounded synchronous channel of PCM chunks,
+//! - implementing `rodio::Source<Item = f32>` by pulling from that channel.
 //!
-//! Notes
-//! -----
-//! - Rodio expects a stable sample rate and channel count. We capture these from the first
-//!   `AudioFrame` observed and then keep them constant for the lifetime of the adapter.
-//! - If the audio stream reports `AudioControl::EndOfStream`, the adapter will eventually stop
-//!   producing samples (returns `None`), which allows `sink.sleep_until_end()` to complete.
+//! Notes / tradeoffs:
+//! - Rodio assumes a fixed output sample rate and channel count for a given `Source`. In practice,
+//!   HLS codec switches may still keep the *same* PCM spec. If the spec changes mid-stream, this
+//!   adapter will currently terminate playback (by stopping the PCM feed) because rodio cannot
+//!   dynamically change format on a single `Source`.
+//! - This adapter intentionally focuses on correctness and simplicity for examples.
 //!
-//! Requirements
-//! ------------
-//! This module is feature-gated behind `stream-download-audio`'s `rodio` feature.
+//! Usage (examples):
+//! ```text
+//! let audio = AudioDecodeStream::new_hls(...).await?;
+//! let source = RodioSourceAdapter::new(audio);
+//! sink.append(source);
+//! ```
 
-#![cfg(feature = "rodio")]
-
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use rodio::Source;
 
-use crate::api::{AudioControl, AudioMsg, AudioSpec};
-use crate::{AudioStream, StorageProvider};
+use crate::{AudioControl, AudioDecodeStream, AudioMsg, AudioSpec};
 
-/// How the adapter should behave when no PCM is immediately available.
+/// Default buffering for the rodio bridge.
 ///
-/// Rodio's `Source` is a synchronous iterator. If we block there, we can stall the mixer.
-/// The default behavior is to yield silence when empty.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EmptyBehavior {
-    /// Yield zeros when no PCM is ready.
-    YieldSilence,
-    /// Sleep briefly and try again (still yields silence if nothing arrives).
-    ///
-    /// This reduces busy looping at the cost of slightly higher latency.
-    SleepAndYieldSilence(Duration),
+/// - `MAX_CHUNKS`: how many PCM chunks we buffer ahead (not samples).
+/// - If you want finer control, extend the adapter to accept options.
+const MAX_CHUNKS: usize = 32;
+
+/// A bounded synchronous queue of PCM chunks used between:
+/// - async decoder thread -> rodio pull thread.
+struct PcmQueue {
+    inner: Mutex<PcmQueueInner>,
+    cv_not_empty: Condvar,
+    cv_not_full: Condvar,
 }
 
-impl Default for EmptyBehavior {
-    fn default() -> Self {
-        Self::SleepAndYieldSilence(Duration::from_millis(2))
+struct PcmQueueInner {
+    q: VecDeque<PcmChunkOwned>,
+    closed: bool,
+    // Fixed spec once established.
+    spec: Option<AudioSpec>,
+}
+
+#[derive(Clone)]
+struct PcmChunkOwned {
+    spec: AudioSpec,
+    pcm: Arc<Vec<f32>>,
+}
+
+impl PcmQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PcmQueueInner {
+                q: VecDeque::new(),
+                closed: false,
+                spec: None,
+            }),
+            cv_not_empty: Condvar::new(),
+            cv_not_full: Condvar::new(),
+        }
+    }
+
+    fn close(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.closed = true;
+        self.cv_not_empty.notify_all();
+        self.cv_not_full.notify_all();
+    }
+
+    /// Push a PCM chunk (blocking).
+    fn push(&self, chunk: PcmChunkOwned) {
+        let mut g = self.inner.lock().unwrap();
+
+        // Establish fixed spec on first chunk.
+        if g.spec.is_none() {
+            g.spec = Some(chunk.spec);
+        }
+
+        // If spec changes mid-stream, close the queue to end playback deterministically.
+        if g.spec != Some(chunk.spec) {
+            g.closed = true;
+            self.cv_not_empty.notify_all();
+            self.cv_not_full.notify_all();
+            return;
+        }
+
+        while !g.closed && g.q.len() >= MAX_CHUNKS {
+            g = self.cv_not_full.wait(g).unwrap();
+        }
+
+        if g.closed {
+            return;
+        }
+
+        g.q.push_back(chunk);
+        self.cv_not_empty.notify_one();
+    }
+
+    /// Pop the next PCM chunk (blocking). Returns `None` on EOF/closed.
+    fn pop(&self) -> Option<PcmChunkOwned> {
+        let mut g = self.inner.lock().unwrap();
+
+        loop {
+            if let Some(chunk) = g.q.pop_front() {
+                self.cv_not_full.notify_one();
+                return Some(chunk);
+            }
+
+            if g.closed {
+                return None;
+            }
+
+            g = self.cv_not_empty.wait(g).unwrap();
+        }
+    }
+
+    fn spec(&self) -> Option<AudioSpec> {
+        let g = self.inner.lock().unwrap();
+        g.spec
     }
 }
 
-/// A `rodio::Source<Item = f32>` backed by an `AudioStream<P>`.
-///
-/// This adapter converts the ordered `AudioMsg` stream into interleaved `f32` samples for rodio.
-pub struct RodioSourceAdapter<P: StorageProvider> {
-    // We keep spec stable for rodio. It's filled after we observe the first frame.
+/// Adapter that turns an `AudioDecodeStream` into a `rodio::Source<Item = f32>`.
+pub struct RodioSourceAdapter {
+    queue: Arc<PcmQueue>,
+
+    // Current chunk being drained.
+    cur: Option<PcmChunkOwned>,
+    cur_idx: usize,
+
+    // Fixed output spec once known.
     spec: AudioSpec,
 
-    // Pending PCM interleaved samples for Iterator::next()
-    pending: Vec<f32>,
-    cursor: usize,
-
-    // Channel fed by background thread.
-    rx: mpsc::Receiver<Vec<f32>>,
-
-    // End-of-stream flag set by background thread.
-    eof: Arc<std::sync::atomic::AtomicBool>,
-
-    // Behavior when empty
-    empty_behavior: EmptyBehavior,
-
-    // Keep the thread handle alive for the lifetime of the adapter.
-    _thread: Option<std::thread::JoinHandle<()>>,
-
-    // We keep the stream in an Arc/Mutex only to move it into a thread easily and to allow future
-    // extensions. Access happens only inside the spawned thread currently.
-    _inner: Arc<Mutex<AudioStream<P>>>,
+    // If true, no more samples will be produced.
+    done: bool,
 }
 
-impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
-    /// Create a new `RodioSourceAdapter` from an `AudioStream`.
-    ///
-    /// This spawns a background thread that pulls `AudioMsg` from the stream and forwards PCM to
-    /// the adapter.
-    ///
-    /// # Panics
-    /// Panics if the adapter can't determine an initial `AudioSpec` within the timeout.
-    /// (This should not happen for normal streams.)
-    pub fn new(stream: AudioStream<P>) -> Self {
-        Self::new_with_behavior(stream, EmptyBehavior::default())
-    }
+impl RodioSourceAdapter {
+    /// Create a new `RodioSourceAdapter` and start draining the async stream in a background thread.
+    pub fn new(mut stream: AudioDecodeStream) -> Self {
+        let queue = Arc::new(PcmQueue::new());
+        let queue_bg = queue.clone();
 
-    /// Create a new adapter with a custom empty-buffer behavior.
-    pub fn new_with_behavior(stream: AudioStream<P>, empty_behavior: EmptyBehavior) -> Self {
-        // Bounded queue to prevent unbounded growth if rodio is slow.
-        // Each message is a batch of interleaved PCM samples.
-        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(16);
-
-        let inner = Arc::new(Mutex::new(stream));
-
-        // Determine initial spec by pulling the first audio frame on the background thread,
-        // then sending it through a one-shot channel.
-        let (spec_tx, spec_rx) = mpsc::sync_channel::<AudioSpec>(1);
-
-        let eof = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let eof_thread = eof.clone();
-        let inner_thread = inner.clone();
-
-        let thread = std::thread::spawn(move || {
-            // Create a tokio runtime in this thread so we can await the async `AudioStream`.
-            // (Rodio `Source` is sync; we bridge via this runtime + channel.)
+        // Spawn background worker thread with a tiny Tokio runtime.
+        thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
                 Ok(rt) => rt,
-                Err(e) => {
-                    tracing::error!("RodioSourceAdapter: failed to build tokio runtime: {}", e);
-                    eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(_) => {
+                    queue_bg.close();
                     return;
                 }
             };
 
             rt.block_on(async move {
-                // Pull messages from the audio stream and forward PCM batches to rodio.
-                // We also capture the first `AudioSpec` we see.
-                let mut sent_spec = false;
-
-                // We need to own a mutable reference to the stream to call `.next().await`.
-                // The stream itself implements `Stream<Item = AudioMsg>`.
-                let mut stream_guard = inner_thread
-                    .lock()
-                    .expect("RodioSourceAdapter: inner stream mutex poisoned");
-
-                loop {
-                    // Use the dedicated async API; it does not require `AudioStream<P>: Unpin`.
-                    let msg = stream_guard.next_msg().await;
+                while let Some(msg) = stream.next_msg().await {
                     match msg {
-                        Some(AudioMsg::Frame(frame)) => {
-                            if !sent_spec {
-                                // First frame determines rodio output spec.
-                                let _ = spec_tx.send(frame.spec);
-                                sent_spec = true;
+                        AudioMsg::Pcm(chunk) => {
+                            // Skip empty chunks (harmless).
+                            if chunk.pcm.is_empty() {
+                                continue;
                             }
-
-                            // Backpressure: block when rodio is behind.
-                            if tx.send(frame.pcm).is_err() {
-                                // Consumer dropped; stop thread.
-                                tracing::info!(
-                                    "RodioSourceAdapter: PCM consumer dropped; stopping"
-                                );
+                            queue_bg.push(PcmChunkOwned {
+                                spec: chunk.spec,
+                                pcm: Arc::new(chunk.pcm),
+                            });
+                        }
+                        AudioMsg::Control(ctrl) => match ctrl {
+                            AudioControl::EndOfStream => {
                                 break;
                             }
-                        }
-                        Some(AudioMsg::Control(AudioControl::FormatChanged { spec })) => {
-                            // Rodio requires stable spec; ignore further format changes.
-                            // We still want to set initial spec if we haven't yet.
-                            if !sent_spec {
-                                let _ = spec_tx.send(spec);
-                                sent_spec = true;
-                            }
-                        }
-                        Some(AudioMsg::Control(AudioControl::EndOfStream)) => {
-                            eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
-                            break;
-                        }
-                        None => {
-                            // Stream ended/dropped.
-                            eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
-                            break;
-                        }
+                            // We intentionally ignore boundaries/events here; the audio samples are what matters for rodio.
+                            _ => {}
+                        },
                     }
                 }
+
+                queue_bg.close();
             });
         });
 
-        // Wait for initial spec to be reported.
-        // Keep this small; if stream can't produce spec quickly it likely won't play anyway.
-        let spec = match spec_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(spec) => spec,
-            Err(_) => {
-                // Default fallback; but per our contract we panic because rodio needs stable spec.
-                // If you want a non-panicking behavior, change this to a Result-returning ctor.
-                panic!("RodioSourceAdapter: failed to determine initial AudioSpec from stream");
-            }
+        // Default spec until first PCM arrives. Rodio requires a spec immediately for `Source`.
+        // We'll update `spec` after first chunk, but to keep invariants simple, we choose a sane default.
+        // The queue will lock the actual spec on first PCM chunk; if it differs, we update lazily.
+        let default_spec = AudioSpec {
+            sample_rate: 48_000,
+            channels: 2,
         };
 
         Self {
-            spec,
-            pending: Vec::with_capacity(4096),
-            cursor: 0,
-            rx,
-            eof,
-            empty_behavior,
-            _thread: Some(thread),
-            _inner: inner,
+            queue,
+            cur: None,
+            cur_idx: 0,
+            spec: default_spec,
+            done: false,
         }
     }
 
-    fn refill(&mut self) {
-        self.pending.clear();
-        self.cursor = 0;
-
-        match self.rx.try_recv() {
-            Ok(chunk) => {
-                self.pending = chunk;
-            }
-            Err(mpsc::TryRecvError::Empty) => {
-                // Nothing available right now.
-                match self.empty_behavior {
-                    EmptyBehavior::YieldSilence => {}
-                    EmptyBehavior::SleepAndYieldSilence(d) => std::thread::sleep(d),
-                }
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                // Producer stopped; we'll check eof in `next()`.
-            }
+    fn ensure_spec(&mut self) {
+        if let Some(s) = self.queue.spec() {
+            self.spec = s;
         }
     }
 }
 
-impl<P: StorageProvider + 'static> Iterator for RodioSourceAdapter<P> {
+impl Iterator for RodioSourceAdapter {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor >= self.pending.len() {
-            self.refill();
+        if self.done {
+            return None;
         }
 
-        if self.cursor < self.pending.len() {
-            let s = self.pending[self.cursor];
-            self.cursor += 1;
-            return Some(s);
-        }
+        self.ensure_spec();
 
-        // No buffered PCM right now.
-        if self.eof.load(std::sync::atomic::Ordering::Relaxed) {
-            // End-of-stream: stop producing samples.
-            None
-        } else {
-            // Keep rodio alive by yielding silence.
-            Some(0.0)
+        loop {
+            // Ensure we have a current chunk.
+            if self.cur.is_none() {
+                self.cur = self.queue.pop();
+                self.cur_idx = 0;
+
+                if self.cur.is_none() {
+                    self.done = true;
+                    return None;
+                }
+            }
+
+            let cur = self.cur.as_ref().expect("cur must exist");
+            if self.cur_idx < cur.pcm.len() {
+                let v = cur.pcm[self.cur_idx];
+                self.cur_idx += 1;
+                return Some(v);
+            } else {
+                // Exhausted current chunk, fetch next.
+                self.cur = None;
+                self.cur_idx = 0;
+                continue;
+            }
         }
     }
 }
 
-impl<P: StorageProvider + 'static> Source for RodioSourceAdapter<P> {
+impl Source for RodioSourceAdapter {
     fn current_span_len(&self) -> Option<usize> {
         None
     }
@@ -261,7 +267,7 @@ impl<P: StorageProvider + 'static> Source for RodioSourceAdapter<P> {
         self.spec.sample_rate
     }
 
-    fn total_duration(&self) -> Option<Duration> {
+    fn total_duration(&self) -> Option<std::time::Duration> {
         None
     }
 }

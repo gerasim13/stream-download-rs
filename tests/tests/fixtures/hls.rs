@@ -870,7 +870,7 @@ impl HlsFixture {
         &self,
         storage_handle: stream_download::storage::StorageHandle,
         data_tx: mpsc::Sender<stream_download::source::StreamMsg>,
-        seek_rx: mpsc::Receiver<u64>,
+        cmd_rx: mpsc::Receiver<stream_download_hls::HlsCommand>,
         cancel: CancellationToken,
         event_tx: broadcast::Sender<stream_download_hls::StreamEvent>,
         segmented_length: Arc<std::sync::RwLock<stream_download::storage::SegmentedLength>>,
@@ -893,7 +893,7 @@ impl HlsFixture {
             storage_handle,
             abr_cfg,
             data_tx,
-            seek_rx,
+            cmd_rx,
             cancel,
             event_tx,
             master_hash,
@@ -920,7 +920,7 @@ impl HlsFixture {
         T: Send + 'static,
     {
         let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(data_channel_capacity);
-        let (_seek_tx, seek_rx) = mpsc::channel::<u64>(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel::<stream_download_hls::HlsCommand>(16);
         let cancel = CancellationToken::new();
         let (event_tx, event_rx) = broadcast::channel(16);
 
@@ -931,7 +931,7 @@ impl HlsFixture {
             .worker(
                 storage_handle,
                 data_tx,
-                seek_rx,
+                cmd_rx,
                 cancel.clone(),
                 event_tx.clone(),
                 Arc::new(std::sync::RwLock::new(SegmentedLength::default())),

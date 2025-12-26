@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use crate::stream::HlsCommand;
+
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
@@ -27,11 +29,12 @@ use crate::stream::StreamEvent;
 
 #[cfg(feature = "aes-decrypt")]
 use crate::Aes128CbcMiddleware;
+use crate::parser::VariantId;
 use crate::{AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware};
 
 enum RaceOutcome<T> {
     Completed(T),
-    Seek(u64),
+    Cmd(HlsCommand),
     ChannelClosed,
 }
 
@@ -60,7 +63,7 @@ struct SegmentContext {
 
 pub struct HlsStreamWorker {
     data_sender: mpsc::Sender<StreamMsg>,
-    seek_receiver: mpsc::Receiver<u64>,
+    cmd_receiver: mpsc::Receiver<HlsCommand>,
     cancel_token: CancellationToken,
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
     controller: AbrController<HlsManager>,
@@ -211,6 +214,41 @@ impl HlsStreamWorker {
         Ok(())
     }
 
+    /// Apply a manual variant override.
+    ///
+    /// This switches the ABR controller into MANUAL mode and locks to the requested variant.
+    /// The underlying `HlsManager` is asked to `select_variant`, which will cause subsequent
+    /// descriptors to be produced for the requested variant (time-aligned segment index).
+    ///
+    /// Important: we do not try to "instantly" splice mid-segment; switching is applied on the
+    /// next descriptor/segment boundary.
+    #[instrument(skip(self), fields(variant_id = ?variant_id))]
+    async fn apply_set_variant(&mut self, variant_id: VariantId) -> Result<(), HlsError> {
+        self.controller
+            .set_manual(variant_id)
+            .await
+            .map_err(|_| HlsError::SeekFailed)?;
+
+        // After switching variants, reset retry delay and any pending skip math so the new
+        // variant can start cleanly at the next segment boundary.
+        self.retry_delay = Self::INITIAL_RETRY_DELAY;
+        self.bytes_to_skip = 0;
+
+        Ok(())
+    }
+
+    /// Clear manual variant override and return to AUTO (ABR) selection mode.
+    #[instrument(skip(self))]
+    async fn apply_clear_variant_override(&mut self) -> Result<(), HlsError> {
+        self.controller.set_auto();
+
+        // Similar to manual switch: reset retry delay and skip math.
+        self.retry_delay = Self::INITIAL_RETRY_DELAY;
+        self.bytes_to_skip = 0;
+
+        Ok(())
+    }
+
     /// Compute segment size for skip math, probing when unknown.
     #[instrument(skip(self, desc))]
     async fn compute_segment_size(
@@ -349,9 +387,9 @@ impl HlsStreamWorker {
     /// Handle live refresh wait with cancellation and seek support.
     #[instrument(skip(self), fields(wait = ?wait))]
     async fn handle_needs_refresh(&mut self, wait: std::time::Duration) -> Result<(), HlsError> {
-        match Self::race_with_seek(
+        match Self::race_with_cmd(
             &self.cancel_token,
-            &mut self.seek_receiver,
+            &mut self.cmd_receiver,
             tokio::time::sleep(wait),
         )
         .await?
@@ -359,12 +397,27 @@ impl HlsStreamWorker {
             RaceOutcome::Completed(_) => {
                 tracing::trace!("HLS stream: live refresh wait completed");
             }
-            RaceOutcome::Seek(position) => {
-                tracing::trace!("HLS streaming loop: received seek during wait");
-                self.apply_seek_position(position).await?;
-            }
+            RaceOutcome::Cmd(cmd) => match cmd {
+                crate::stream::HlsCommand::Seek { position } => {
+                    tracing::trace!("HLS streaming loop: received seek during wait");
+                    self.apply_seek_position(position).await?;
+                }
+                crate::stream::HlsCommand::SetVariant { variant_id } => {
+                    tracing::trace!(
+                        "HLS streaming loop: received SetVariant({:?}) during wait",
+                        variant_id
+                    );
+                    self.apply_set_variant(variant_id).await?;
+                }
+                crate::stream::HlsCommand::ClearVariantOverride => {
+                    tracing::trace!(
+                        "HLS streaming loop: received ClearVariantOverride during wait"
+                    );
+                    self.apply_clear_variant_override().await?;
+                }
+            },
             RaceOutcome::ChannelClosed => {
-                // Seek channel closed; continue loop
+                // Command channel closed; continue loop.
             }
         }
         Ok(())
@@ -386,10 +439,10 @@ impl HlsStreamWorker {
         Ok(())
     }
 
-    #[instrument(skip(cancel, seeks, fut))]
-    async fn race_with_seek<F, T>(
+    #[instrument(skip(cancel, cmds, fut))]
+    async fn race_with_cmd<F, T>(
         cancel: &CancellationToken,
-        seeks: &mut mpsc::Receiver<u64>,
+        cmds: &mut mpsc::Receiver<crate::stream::HlsCommand>,
         fut: F,
     ) -> Result<RaceOutcome<T>, HlsError>
     where
@@ -401,13 +454,15 @@ impl HlsStreamWorker {
             _ = cancel.cancelled() => {
                 return Err(HlsError::Cancelled);
             }
-            seek = seeks.recv() => {
-                if let Some(mut position) = seek {
-                    // Coalesce burst seeks: drain pending messages to keep only the latest position
-                    while let Ok(next) = seeks.try_recv() {
-                        position = next;
+            cmd = cmds.recv() => {
+                if let Some(cmd) = cmd {
+                    // Coalesce burst commands: drain pending messages and keep only the latest command.
+                    // This mirrors the old seek coalescing behavior.
+                    let mut last = cmd;
+                    while let Ok(next) = cmds.try_recv() {
+                        last = next;
                     }
-                    Ok(RaceOutcome::Seek(position))
+                    Ok(RaceOutcome::Cmd(last))
                 } else {
                     Ok(RaceOutcome::ChannelClosed)
                 }
@@ -419,24 +474,39 @@ impl HlsStreamWorker {
         res
     }
 
-    /// Pump bytes from a segment stream to downstream with backpressure, cancellation and seek handling.
+    /// Pump bytes from a segment stream to downstream with backpressure, cancellation and command handling.
     #[instrument(skip(self, stream))]
     async fn pump_stream_chunks(&mut self, mut stream: HlsByteStream) -> Result<u64, HlsError> {
         let mut gathered_len: u64 = 0;
 
         loop {
             let next_fut = futures_util::StreamExt::next(&mut stream);
-            match Self::race_with_seek(&self.cancel_token, &mut self.seek_receiver, next_fut)
-                .await?
-            {
-                RaceOutcome::Seek(position) => {
-                    tracing::trace!("HLS streaming loop: received seek during streaming");
-                    self.apply_seek_position(position).await?;
-                    // break to apply new position on next iteration
+            match Self::race_with_cmd(&self.cancel_token, &mut self.cmd_receiver, next_fut).await? {
+                RaceOutcome::Cmd(cmd) => {
+                    match cmd {
+                        crate::stream::HlsCommand::Seek { position } => {
+                            tracing::trace!("HLS streaming loop: received seek during streaming");
+                            self.apply_seek_position(position).await?;
+                        }
+                        crate::stream::HlsCommand::SetVariant { variant_id } => {
+                            tracing::trace!(
+                                "HLS streaming loop: received SetVariant({:?}) during streaming",
+                                variant_id
+                            );
+                            self.apply_set_variant(variant_id).await?;
+                        }
+                        crate::stream::HlsCommand::ClearVariantOverride => {
+                            tracing::trace!(
+                                "HLS streaming loop: received ClearVariantOverride during streaming"
+                            );
+                            self.apply_clear_variant_override().await?;
+                        }
+                    }
+                    // break to apply new state on next iteration
                     break;
                 }
                 RaceOutcome::ChannelClosed => {
-                    tracing::trace!("HLS stream: seek channel closed");
+                    tracing::trace!("HLS stream: command channel closed");
                     break;
                 }
                 RaceOutcome::Completed(item) => {
@@ -899,7 +969,7 @@ impl HlsStreamWorker {
         settings: Arc<crate::HlsSettings>,
         storage_handle: StorageHandle,
         data_sender: mpsc::Sender<StreamMsg>,
-        seek_receiver: mpsc::Receiver<u64>,
+        cmd_receiver: mpsc::Receiver<HlsCommand>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         master_hash: String,
@@ -952,7 +1022,7 @@ impl HlsStreamWorker {
             storage_handle,
             abr_config,
             data_sender,
-            seek_receiver,
+            cmd_receiver,
             cancel_token,
             event_sender,
             master_hash,
@@ -969,7 +1039,7 @@ impl HlsStreamWorker {
         storage_handle: StorageHandle,
         abr_config: AbrConfig,
         data_sender: mpsc::Sender<StreamMsg>,
-        seek_receiver: mpsc::Receiver<u64>,
+        cmd_receiver: mpsc::Receiver<HlsCommand>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
         master_hash: String,
@@ -1036,7 +1106,7 @@ impl HlsStreamWorker {
 
         Ok(Self {
             data_sender,
-            seek_receiver,
+            cmd_receiver,
             cancel_token,
             storage_handle,
             segmented_length,
@@ -1045,7 +1115,7 @@ impl HlsStreamWorker {
             bytes_to_skip: 0,
             retry_delay: Self::INITIAL_RETRY_DELAY,
             event_sender: event_sender.clone(),
-            master_hash: Arc::<str>::from(master_hash),
+            master_hash: master_hash.into(),
         })
     }
 
@@ -1056,21 +1126,39 @@ impl HlsStreamWorker {
         loop {
             // Get the next descriptor (ABR decision happens inside the controller).
             // Keep this as a single call to avoid overlapping mutable borrows of `self.controller`.
-            let next_desc = match Self::race_with_seek(
+            let next_desc = match Self::race_with_cmd(
                 &self.cancel_token,
-                &mut self.seek_receiver,
+                &mut self.cmd_receiver,
                 self.controller.next_segment_descriptor_nonblocking(),
             )
             .await?
             {
                 RaceOutcome::Completed(result) => result,
-                RaceOutcome::Seek(position) => {
-                    tracing::trace!("HLS streaming loop: received seek to position {}", position);
-                    self.apply_seek_position(position).await?;
+                RaceOutcome::Cmd(cmd) => {
+                    match cmd {
+                        HlsCommand::Seek { position } => {
+                            tracing::trace!(
+                                "HLS streaming loop: received seek to position {}",
+                                position
+                            );
+                            self.apply_seek_position(position).await?;
+                        }
+                        HlsCommand::SetVariant { variant_id } => {
+                            tracing::trace!(
+                                "HLS streaming loop: received SetVariant({:?})",
+                                variant_id
+                            );
+                            self.apply_set_variant(variant_id).await?;
+                        }
+                        HlsCommand::ClearVariantOverride => {
+                            tracing::trace!("HLS streaming loop: received ClearVariantOverride");
+                            self.apply_clear_variant_override().await?;
+                        }
+                    }
                     continue;
                 }
                 RaceOutcome::ChannelClosed => {
-                    tracing::trace!("HLS stream: seek channel closed");
+                    tracing::trace!("HLS stream: command channel closed");
                     break;
                 }
             };
@@ -1090,7 +1178,6 @@ impl HlsStreamWorker {
                 Ok(crate::manager::NextSegmentDescResult::NeedsRefresh { wait }) => {
                     // Live stream needs to wait for new segments
                     // Use select! for proper cancellation during wait
-                    // no pre-reserved permit to drop
                     self.handle_needs_refresh(wait).await?;
                 }
                 Err(e) => {

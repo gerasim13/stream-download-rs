@@ -32,7 +32,7 @@ pub use crate::parser::{
 };
 pub use crate::settings::HlsSettings;
 pub use crate::storage::SegmentedStorageProvider;
-pub use crate::stream::StreamEvent;
+pub use crate::stream::{HlsCommand, StreamEvent};
 
 /// File-tree (persistent) segment storage helper (deterministic naming/layout).
 pub use crate::storage::hls_factory::HlsFileTreeSegmentFactory;

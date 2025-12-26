@@ -7,10 +7,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use reqwest::Url;
 
-use stream_download_audio::{
-    AbrVariantChangeReason, AudioControl, AudioMsg, AudioSettings, AudioStream,
-    DecoderLifecycleReason, PlayerEvent,
-};
+use stream_download_audio::{AudioControl, AudioDecodeOptions, AudioDecodeStream, AudioMsg};
 use stream_download_hls::HlsSettings;
 
 #[derive(Debug, Clone)]
@@ -19,45 +16,35 @@ pub struct RequestEntry {
     pub path: String,
 }
 
-/// Summary of what an audio test observed while driving an `AudioStream`.
+/// Summary of what an audio test observed while driving an `AudioDecodeStream`.
+///
+/// This is intentionally **ordered-only**: we do not rely on out-of-band events for deterministic
+/// assertions (same philosophy as `stream-download-hls`).
 #[derive(Debug)]
 pub struct AudioObserveResult {
+    /// Observed ordered `AudioControl::FormatChanged`.
     pub saw_format_changed: bool,
 
-    /// Observed HLS variant indices as derived from ordered `AudioMsg::Frame` origins.
+    /// Observed ordered decoder initialization / re-initialization reasons.
     ///
-    /// This is the primary "applied switch" signal in the new model: if frames arrive tagged with
-    /// `AudioOrigin::Hls { variant, .. }`, we know the pipeline is actually decoding that variant.
-    pub observed_hls_variants_from_frames: Vec<usize>,
+    /// This is the strongest signal that the audio layer actually rebuilt the decoder when an
+    /// init epoch changed (e.g. manual/ABR variant switch that changes codec).
+    pub decoder_initialized_reasons: Vec<stream_download_audio::DecoderLifecycleReason>,
 
-    /// Observed `PlayerEvent::VariantChanged` (HLS ABR decision).
-    pub saw_variant_changed: bool,
+    /// Ordered HLS init boundaries (by variant index).
+    pub ordered_hls_init_starts: Vec<usize>,
+    pub ordered_hls_init_ends: Vec<usize>,
 
-    /// Observed `PlayerEvent::HlsSegmentStart` (HLS media boundary).
-    pub saw_hls_segment_start: bool,
+    /// Ordered HLS segment boundaries (by variant index + best-effort sequence).
+    pub ordered_hls_segment_starts: Vec<(usize, u64)>,
+    pub ordered_hls_segment_ends: Vec<(usize, u64)>,
 
-    /// Full history of ABR decisions as observed from player events (including `Initial`).
-    pub variant_changed_events: Vec<(Option<usize>, usize, AbrVariantChangeReason)>,
-
-    /// Full history of HLS media boundaries as observed from player events.
-    pub hls_segment_starts: Vec<(usize, u64)>,
-
-    /// The `to` variant from the first observed `PlayerEvent::VariantChanged` (may be initial).
-    pub variant_changed_to: Option<usize>,
-
-    /// Snapshot of the audio assets server request sequence counter at the moment we first
-    /// observed `PlayerEvent::VariantChanged` ("decision" watermark).
-    pub variant_changed_at_request_seq: Option<usize>,
-
-    /// Observed `PlayerEvent::DecoderInitialized` (decoder lifecycle event).
-    pub saw_decoder_initialized: bool,
-
-    /// If `DecoderInitialized` was observed, the last reason seen.
-    pub last_decoder_init_reason: Option<DecoderLifecycleReason>,
-
+    /// Observed ordered `AudioControl::EndOfStream` (or the stream terminated).
     pub saw_end_of_stream: bool,
+
+    /// Any pipeline error captured by the driver loop (best-effort).
     pub error_message: Option<String>,
-    pub last_event: Option<PlayerEvent>,
+    /// Total decoded PCM samples observed (interleaved).
     pub total_samples: usize,
 }
 
@@ -296,7 +283,8 @@ async fn throttled_assets_get(
 /// Organize audio integration tests in the same style as the HLS tests:
 /// - centralize knowledge about fixture asset paths
 /// - provide a single place to build URLs
-/// - provide a single place to create `AudioStream` and to drive it while collecting observations
+/// - provide a single place to create `AudioDecodeStream`
+/// - provide deterministic helpers to wait for ordered controls / PCM thresholds
 pub struct AudioFixture;
 
 impl AudioFixture {
@@ -316,167 +304,130 @@ impl AudioFixture {
         .expect("failed to build HLS master URL")
     }
 
-    /// Construct an `AudioStream` for the real HLS assets served by an audio-specific server.
+    /// Construct an `AudioDecodeStream` for the real HLS assets served by an audio-specific server.
     ///
     /// This avoids global throttling shared across tests.
     ///
-    /// Returns both the `AudioStream` and the `AudioAssetsServerFixture` so tests can make strict
+    /// Returns both the `AudioDecodeStream` and the `AudioAssetsServerFixture` so tests can make strict
     /// assertions about the request sequence (e.g. that after ABR switch we fetch segments from
     /// the new variant).
     pub async fn audio_stream_hls_real_assets(
         _server_addr: std::net::SocketAddr,
-        audio_settings: AudioSettings,
         hls_settings: stream_download_hls::HlsSettings,
         storage_root: Option<std::path::PathBuf>,
         per_file_delay: Option<HashMap<String, Duration>>,
-    ) -> (
-        AudioStream<stream_download::storage::temp::TempStorageProvider>,
-        AudioAssetsServerFixture,
-    ) {
+    ) -> (AudioDecodeStream, AudioAssetsServerFixture) {
         let per_file_delay = per_file_delay.unwrap_or_default();
 
         // Start an isolated server per test invocation (analogous to the HLS fixture server).
         let server = AudioAssetsServerFixture::start(per_file_delay).await;
         let url = server.hls_master_url();
 
-        let stream = AudioStream::<stream_download::storage::temp::TempStorageProvider>::new_hls(
+        let stream = AudioDecodeStream::new_hls(
             url,
-            storage_root,
-            audio_settings,
             hls_settings,
+            AudioDecodeOptions::default(),
+            storage_root,
         )
-        .await;
+        .await
+        .expect("failed to create AudioDecodeStream(HLS)");
 
         (stream, server)
     }
 
-    /// Construct an `AudioStream` for the real HLS assets served by an audio-specific server,
+    /// Construct an `AudioDecodeStream` for the real HLS assets served by an audio-specific server,
     /// but with a helper to mutate the provided `HlsSettings` before stream creation.
     ///
     /// This is intended for tests that need to configure ABR (e.g. `abr_initial_variant_index`)
     /// without repeating boilerplate at call sites.
     pub async fn audio_stream_hls_real_assets_with_hls_settings(
         server_addr: std::net::SocketAddr,
-        audio_settings: AudioSettings,
         mut hls_settings: HlsSettings,
         mutate_hls_settings: impl FnOnce(&mut HlsSettings),
         storage_root: Option<std::path::PathBuf>,
         per_file_delay: Option<HashMap<String, Duration>>,
     ) -> (
-        AudioStream<stream_download::storage::temp::TempStorageProvider>,
+        stream_download_audio::AudioDecodeStream,
         AudioAssetsServerFixture,
     ) {
+        let _ = server_addr;
         mutate_hls_settings(&mut hls_settings);
 
-        Self::audio_stream_hls_real_assets(
-            server_addr,
-            audio_settings,
-            hls_settings,
-            storage_root,
-            per_file_delay,
-        )
-        .await
+        Self::audio_stream_hls_real_assets(server_addr, hls_settings, storage_root, per_file_delay)
+            .await
     }
 
-    /// Drain events and PCM for up to `timeout`, returning what was observed.
+    /// Drain ordered controls and PCM for up to `timeout`, returning what was observed.
     ///
-    /// This helper is intentionally "black-box": tests should not have to re-implement
-    /// the same event+PCM polling loops. Assertions should remain in the test code.
+    /// NOTE:
+    /// - This rewrite intentionally ignores out-of-band events and relies on ordered controls only.
+    /// - This is the whole point: strict tests must use ordered protocol signals, like `stream-download-hls`.
     pub async fn drive_and_observe(
-        stream: &mut AudioStream<stream_download::storage::temp::TempStorageProvider>,
+        stream: &mut stream_download_audio::AudioDecodeStream,
         timeout: Duration,
         min_samples: usize,
-        request_seq_watermark: impl Fn() -> usize,
+        _request_seq_watermark: impl Fn() -> usize,
     ) -> AudioObserveResult {
         let deadline = Instant::now() + timeout;
 
-        let events = stream.subscribe_events();
-
         let mut saw_format_changed = false;
 
-        let mut observed_hls_variants_from_frames: Vec<usize> = Vec::new();
-
-        let mut saw_variant_changed = false;
-        let mut variant_changed_to: Option<usize> = None;
-        let mut variant_changed_at_request_seq: Option<usize> = None;
-
-        let mut variant_changed_events: Vec<(Option<usize>, usize, AbrVariantChangeReason)> =
+        let mut decoder_initialized_reasons: Vec<stream_download_audio::DecoderLifecycleReason> =
             Vec::new();
-        let mut hls_segment_starts: Vec<(usize, u64)> = Vec::new();
 
-        let mut saw_hls_segment_start = false;
-
-        let mut saw_decoder_initialized = false;
-        let mut last_decoder_init_reason: Option<DecoderLifecycleReason> = None;
-
-        let mut saw_end = false;
-        let mut error_message: Option<String> = None;
-        let mut last_event: Option<PlayerEvent> = None;
+        let mut ordered_hls_init_starts: Vec<usize> = Vec::new();
+        let mut ordered_hls_init_ends: Vec<usize> = Vec::new();
+        let mut ordered_hls_segment_starts: Vec<(usize, u64)> = Vec::new();
+        let mut ordered_hls_segment_ends: Vec<(usize, u64)> = Vec::new();
 
         let mut total_samples = 0usize;
 
+        let mut saw_end = false;
+        let error_message: Option<String> = None;
+
         while Instant::now() < deadline {
-            // Drain events opportunistically.
-            loop {
-                match events.try_recv() {
-                    Ok(Some(ev)) => {
-                        match &ev {
-                            PlayerEvent::FormatChanged { .. } => saw_format_changed = true,
-                            PlayerEvent::VariantChanged { from, to, reason } => {
-                                saw_variant_changed = true;
-
-                                variant_changed_events.push((*from, *to, *reason));
-
-                                if variant_changed_to.is_none() {
-                                    variant_changed_to = Some(*to);
-                                }
-
-                                if variant_changed_at_request_seq.is_none() {
-                                    variant_changed_at_request_seq = Some(request_seq_watermark());
-                                }
-                            }
-                            PlayerEvent::HlsSegmentStart { variant, sequence } => {
-                                saw_hls_segment_start = true;
-                                hls_segment_starts.push((*variant, *sequence));
-                            }
-                            PlayerEvent::DecoderInitialized { reason, .. } => {
-                                saw_decoder_initialized = true;
-                                last_decoder_init_reason = Some(*reason);
-                            }
-                            PlayerEvent::Error { message } => error_message = Some(message.clone()),
-                            PlayerEvent::EndOfStream => saw_end = true,
-                            _ => {}
-                        }
-                        last_event = Some(ev);
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
 
-            // Consume ordered audio messages (frames + control).
-            match stream.next_msg().await {
-                Some(AudioMsg::Frame(frame)) => {
-                    // Record applied HLS variant as observed from ordered frame metadata.
-                    if let stream_download_audio::AudioOrigin::Hls { variant, .. } = frame.origin {
-                        observed_hls_variants_from_frames.push(variant);
-                    }
-
-                    total_samples += frame.pcm.len();
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Pcm(chunk))) => {
+                    total_samples += chunk.pcm.len();
                     if total_samples >= min_samples {
                         break;
                     }
                 }
-                Some(AudioMsg::Control(AudioControl::EndOfStream)) => {
+                Ok(Some(AudioMsg::Control(AudioControl::DecoderInitialized { reason }))) => {
+                    decoder_initialized_reasons.push(reason);
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::FormatChanged { .. }))) => {
+                    saw_format_changed = true;
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsInitStart { id }))) => {
+                    ordered_hls_init_starts.push(id.variant);
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsInitEnd { id }))) => {
+                    ordered_hls_init_ends.push(id.variant);
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsSegmentStart { id }))) => {
+                    ordered_hls_segment_starts.push((id.variant, id.sequence.unwrap_or(0)));
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::HlsSegmentEnd { id }))) => {
+                    ordered_hls_segment_ends.push((id.variant, id.sequence.unwrap_or(0)));
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
                     saw_end = true;
                     break;
                 }
-                Some(AudioMsg::Control(_)) => {
-                    // Other ordered controls currently don't affect the generic driver loop.
-                }
-                None => {
-                    // Producer/decoder has stopped; treat as end-of-stream for the driver.
+                Ok(None) => {
+                    // Stream terminated (channel closed). Treat as end-of-stream for the driver.
                     saw_end = true;
+                    break;
+                }
+                Err(_elapsed) => {
+                    // Timed out waiting for the next message; return what we observed so far.
+                    // IMPORTANT: do NOT treat this as end-of-stream.
                     break;
                 }
             }
@@ -484,19 +435,82 @@ impl AudioFixture {
 
         AudioObserveResult {
             saw_format_changed,
-            observed_hls_variants_from_frames,
-            saw_variant_changed,
-            saw_hls_segment_start,
-            variant_changed_events,
-            hls_segment_starts,
-            variant_changed_to,
-            variant_changed_at_request_seq,
-            saw_decoder_initialized,
-            last_decoder_init_reason,
+            decoder_initialized_reasons,
+            ordered_hls_init_starts,
+            ordered_hls_init_ends,
+            ordered_hls_segment_starts,
+            ordered_hls_segment_ends,
             saw_end_of_stream: saw_end,
             error_message,
-            last_event,
             total_samples,
         }
+    }
+
+    /// Wait until an ordered control matching `pred` is observed, or `timeout` elapses.
+    ///
+    /// Returns the matched control on success.
+    pub async fn wait_for_control(
+        stream: &mut AudioDecodeStream,
+        timeout: Duration,
+        mut pred: impl FnMut(&AudioControl) -> bool,
+    ) -> Option<AudioControl> {
+        let deadline = Instant::now() + timeout;
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Control(ctrl))) => {
+                    if pred(&ctrl) {
+                        return Some(ctrl);
+                    }
+                }
+                Ok(Some(AudioMsg::Pcm(_chunk))) => {
+                    // Ignore PCM while waiting for a specific control.
+                }
+                Ok(None) => return None,
+                Err(_elapsed) => break,
+            }
+        }
+
+        None
+    }
+
+    /// Wait until at least `min_samples` PCM samples are observed (interleaved) or `timeout` elapses.
+    ///
+    /// Returns the number of samples observed.
+    pub async fn wait_for_pcm_samples(
+        stream: &mut AudioDecodeStream,
+        timeout: Duration,
+        min_samples: usize,
+    ) -> usize {
+        let deadline = Instant::now() + timeout;
+        let mut total_samples = 0usize;
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Pcm(chunk))) => {
+                    total_samples += chunk.pcm.len();
+                    if total_samples >= min_samples {
+                        break;
+                    }
+                }
+                Ok(Some(AudioMsg::Control(_))) => {
+                    // Ignore controls while waiting for PCM.
+                }
+                Ok(None) => break,
+                Err(_elapsed) => break,
+            }
+        }
+
+        total_samples
     }
 }
