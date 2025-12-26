@@ -6,5 +6,4 @@
 //! The public API of the crate is exposed via `AudioDecodeStream`; these types are
 //! implementation details and may change freely.
 
-pub(crate) mod byte_queue;
 pub(crate) mod symphonia_decoder;

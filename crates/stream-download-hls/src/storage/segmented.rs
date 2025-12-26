@@ -810,20 +810,15 @@ where
             StreamControl::ChunkStart {
                 stream_key,
                 kind,
-                variant: _,
-                sequence: _,
                 reported_len,
                 filename_hint,
                 start_offset,
+                ..
             } => self.open_new_segment(stream_key, reported_len, kind, filename_hint, start_offset),
 
-            StreamControl::ChunkEnd {
-                stream_key: _,
-                kind: _,
-                variant: _,
-                sequence: _,
-                gathered_len,
-            } => self.finalize_current_segment(gathered_len),
+            StreamControl::ChunkEnd { gathered_len, .. } => {
+                self.finalize_current_segment(gathered_len)
+            }
 
             StreamControl::StoreResource { key, data } => self.store_resource(key, data),
 

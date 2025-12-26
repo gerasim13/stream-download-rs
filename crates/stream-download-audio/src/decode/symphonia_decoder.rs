@@ -12,7 +12,8 @@
 //! The async orchestration layer converts ordered init boundaries into **epochs**:
 //! - Initial epoch starts immediately (HTTP) or before first init (HLS).
 //! - On `HlsInitStart` we close the current epoch and start a new one.
-//! - The decoder thread receives `EpochMsg::StartEpoch` with a fresh epoch source.
+//! - The decoder thread receives `EpochMsg::StartEpochFromAsyncBytes` with a fresh per-epoch
+//!   bounded byte channel.
 //!
 //! This guarantees bytes from different init epochs never mix in Symphonia input.
 //!
@@ -39,7 +40,6 @@ use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptio
 use symphonia::core::meta::MetadataOptions;
 use symphonia::default::{get_codecs, get_probe};
 
-use crate::decode::byte_queue::ByteQueueReader;
 use crate::types::{AudioControl, AudioMsg, AudioSpec, DecoderLifecycleReason, PcmChunk};
 
 /// Per-epoch compressed bytes input.
@@ -50,21 +50,6 @@ pub type EpochBytesRx = mpsc::Receiver<bytes::Bytes>;
 
 /// Messages sent from the async orchestrator to the blocking decoder thread.
 pub enum EpochMsg {
-    /// Start a new decode epoch with a fresh bytestream source.
-    StartEpoch {
-        /// Seekable `MediaSource` for this epoch.
-        ///
-        /// Note: even for streaming sources, Symphonia requires `Seek`. We provide a minimal,
-        /// non-seekable implementation that supports only `SeekFrom::Current(0)`.
-        source: Box<dyn MediaSource + Send + Sync>,
-        /// Why we (re)initialized.
-        reason: DecoderLifecycleReason,
-        /// Desired output spec (informational for now).
-        output_spec: AudioSpec,
-        /// Preferred PCM chunk size in **sample-frames** (not samples).
-        pcm_chunk_frames: usize,
-    },
-
     /// Start a new decode epoch backed by an async byte channel.
     ///
     /// This allows the async pipeline to enforce backpressure via bounded `mpsc::Sender`,
@@ -72,7 +57,7 @@ pub enum EpochMsg {
     StartEpochFromAsyncBytes {
         /// Receiver side of the bounded async byte channel for this epoch.
         ///
-        /// The decoder thread will block on this receiver when it needs more bytes.
+        // The decoder thread will block on this receiver when it needs more bytes.
         bytes_rx: EpochBytesRx,
         /// Why we (re)initialized.
         reason: DecoderLifecycleReason,
@@ -101,19 +86,6 @@ pub fn spawn_decoder_thread(
 
         while let Ok(msg) = epoch_rx.recv() {
             match msg {
-                EpochMsg::StartEpoch {
-                    source,
-                    reason,
-                    output_spec,
-                    pcm_chunk_frames,
-                } => {
-                    if let Err(e) =
-                        runner.decode_epoch(source, reason, output_spec, pcm_chunk_frames)
-                    {
-                        tracing::error!("decoder epoch failed: {}", e);
-                        break;
-                    }
-                }
                 EpochMsg::StartEpochFromAsyncBytes {
                     bytes_rx,
                     reason,
@@ -344,57 +316,6 @@ fn push_generic_audio_as_f32_interleaved(
     }
 }
 
-/// A minimal `MediaSource` adapter around [`ByteQueueReader`].
-///
-/// Symphonia requires `Read + Seek`. Our bytestream is forward-only, so `seek` is unsupported
-/// except for `SeekFrom::Current(0)` (a "tell" request) which returns 0 (unknown position).
-pub struct ByteQueueMediaSource {
-    inner: ByteQueueReader,
-    /// Best-effort byte offset observed by this adapter.
-    ///
-    /// This is used to support `SeekFrom::Current(0)` (tell) which Symphonia's probe may rely on.
-    /// We do not support actual seeking, but reporting a monotonic position helps the probe avoid
-    /// treating the stream as permanently at offset 0.
-    pos: u64,
-}
-
-impl ByteQueueMediaSource {
-    pub fn new(inner: ByteQueueReader) -> Self {
-        Self { inner, pos: 0 }
-    }
-}
-
-impl Read for ByteQueueMediaSource {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.pos = self.pos.saturating_add(n as u64);
-        Ok(n)
-    }
-}
-
-impl Seek for ByteQueueMediaSource {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match pos {
-            // Symphonia uses this as a "tell". Return our best-effort monotonic offset.
-            SeekFrom::Current(0) => Ok(self.pos),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "byte-queue media source is not seekable",
-            )),
-        }
-    }
-}
-
-impl MediaSource for ByteQueueMediaSource {
-    fn is_seekable(&self) -> bool {
-        false
-    }
-
-    fn byte_len(&self) -> Option<u64> {
-        None
-    }
-}
-
 /// Blocking `MediaSource` adapter over a bounded async bytes channel.
 ///
 /// The async side sends compressed bytes into a `tokio::mpsc::Sender<Bytes>`.
@@ -499,13 +420,6 @@ impl MediaSource for AsyncBytesMediaSource {
     fn byte_len(&self) -> Option<u64> {
         None
     }
-}
-
-/// Convenience: convert a `ByteQueueReader` into a boxed `MediaSource` for epoch wiring.
-pub fn epoch_media_source_from_byte_queue(
-    reader: ByteQueueReader,
-) -> Box<dyn MediaSource + Send + Sync> {
-    Box::new(ByteQueueMediaSource::new(reader))
 }
 
 /// Convenience: convert a bounded async bytes receiver into a boxed `MediaSource` for epoch wiring.

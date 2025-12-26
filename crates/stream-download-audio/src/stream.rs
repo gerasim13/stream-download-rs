@@ -214,7 +214,7 @@ impl AudioDecodeStream {
                         // so bytes across init segments never mix (codec/container may change).
                         if matches!(ctrl, SourceControl::HlsInitStart { .. }) {
                             // Close current epoch to unblock decoder by dropping the sender.
-                            current_epoch_tx = None;
+                            drop(current_epoch_tx.take());
 
                             let cap = opts.max_buffered_bytes.get().max(1);
                             let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
@@ -257,7 +257,7 @@ impl AudioDecodeStream {
             //
             // This must run whether EOS was explicit or the source stream just terminated.
             // Close current epoch bytes (if any) so the decoder can observe EOF for the last epoch.
-            current_epoch_tx = None;
+            drop(current_epoch_tx.take());
 
             let _ = epoch_tx.send(EpochMsg::EndOfStream);
 
