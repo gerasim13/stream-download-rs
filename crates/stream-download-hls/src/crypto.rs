@@ -3,14 +3,8 @@
 //! Provides AES-128-CBC decryption middleware and related types behind the `aes-decrypt` feature.
 //! High-level usage notes live in `crates/stream-download-hls/README.md`.
 
-use crate::downloader::HlsByteStream;
-use crate::error::HlsError;
-use bytes::Bytes;
-
-/// Transforms raw key bytes fetched from a key server before they are used for decryption.
-pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
-
 use aes::Aes128;
+use bytes::Bytes;
 use bytes::BytesMut;
 use cbc::{
     Decryptor,
@@ -19,7 +13,12 @@ use cbc::{
 use futures_util::StreamExt;
 use tracing::trace;
 
+use crate::downloader::HlsByteStream;
+use crate::error::HlsError;
 use crate::manager::StreamMiddleware;
+
+/// Transforms raw key bytes fetched from a key server before they are used for decryption.
+pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
 
 /// AES-128-CBC decrypt middleware.
 ///
@@ -34,18 +33,6 @@ impl Aes128CbcMiddleware {
     /// Create a new AES-128-CBC middleware instance.
     pub fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
         Self { key, iv }
-    }
-
-    /// Update key material.
-    #[allow(unused)]
-    pub fn set_key(&mut self, key: [u8; 16]) {
-        self.key = key;
-    }
-
-    /// Update IV.
-    #[allow(unused)]
-    pub fn set_iv(&mut self, iv: [u8; 16]) {
-        self.iv = iv;
     }
 }
 

@@ -38,11 +38,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let source = RodioSourceAdapter::new(stream);
     sink.append(source);
     sink.play();
-
-    // Keep the process alive for a while.
-    // If you want a blocking wait-until-end behavior, you'll need an EOS signal from the adapter,
-    // or poll `sink.empty()` in a loop.
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    sink.sleep_until_end();
 
     Ok(())
 }

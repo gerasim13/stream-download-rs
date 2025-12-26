@@ -43,16 +43,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let stream_handle =
         OutputStreamBuilder::open_default_stream().expect("open default audio stream");
     let sink = Sink::connect_new(&stream_handle.mixer());
-    sink.set_volume(0.01);
+    sink.set_volume(0.05);
 
     println!("Creating RodioSourceAdapter...");
     let source = RodioSourceAdapter::new(stream);
     sink.append(source);
     sink.play();
-
-    // Keep the process alive.
-    // For production apps you should implement a proper shutdown signal / UI loop.
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    sink.sleep_until_end();
 
     Ok(())
 }

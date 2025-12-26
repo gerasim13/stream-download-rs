@@ -159,7 +159,7 @@ impl AudioSource for HlsAudioSource {
                 }
             };
 
-            let mut ctx = HlsControlContext::default();
+            // Stateless ordered control mapping (no context needed).
 
             loop {
                 if cancel.is_cancelled() {
@@ -199,7 +199,7 @@ impl AudioSource for HlsAudioSource {
                                     }
                                 }
                                 Some(Ok(StreamMsg::Control(c))) => {
-                                    if let Some(out) = ctx.map_control(c) {
+                                    if let Some(out) = map_stream_control_to_source_msg(c) {
                                         yield Ok(out);
                                     }
                                 }
@@ -223,7 +223,7 @@ impl AudioSource for HlsAudioSource {
                             }
                         }
                         Some(Ok(StreamMsg::Control(c))) => {
-                            if let Some(out) = ctx.map_control(c) {
+                            if let Some(out) = map_stream_control_to_source_msg(c) {
                                 yield Ok(out);
                             }
                         }
@@ -244,61 +244,52 @@ impl AudioSource for HlsAudioSource {
     }
 }
 
-/// Tracks ordered segmented identity as seen through ordered `StreamControl`.
+/// Map ordered `StreamControl` messages from `stream-download` into ordered `SourceMsg` boundaries.
 ///
-/// This is intentionally stateless: we require the upstream to populate neutral `variant` and `index`
-/// fields on `ChunkStart/ChunkEnd`. This avoids any reliance on `SetDefaultStreamKey` ordering.
-#[derive(Default)]
-struct HlsControlContext;
+/// This is intentionally stateless: we require the upstream to populate neutral `variant` and
+/// `sequence` fields on `ChunkStart/ChunkEnd`. This avoids any reliance on `SetDefaultStreamKey`
+/// ordering.
+fn map_stream_control_to_source_msg(ctrl: StreamControl) -> Option<SourceMsg> {
+    match ctrl {
+        // No-op: boundaries must be self-contained.
+        StreamControl::SetDefaultStreamKey { .. } => None,
 
-impl HlsControlContext {
-    fn map_control(&mut self, ctrl: StreamControl) -> Option<SourceMsg> {
-        match ctrl {
-            // No-op: boundaries must be self-contained.
-            StreamControl::SetDefaultStreamKey { .. } => None,
-
-            StreamControl::ChunkStart {
-                kind,
-                variant,
+        StreamControl::ChunkStart {
+            kind,
+            variant,
+            sequence,
+            ..
+        } => {
+            let variant = variant.expect("expected StreamControl::ChunkStart.variant to be set");
+            let id = HlsChunkId {
+                variant: variant as usize,
                 sequence,
-                ..
-            } => {
-                let variant =
-                    variant.expect("expected StreamControl::ChunkStart.variant to be set");
-                let id = HlsChunkId {
-                    variant: variant as usize,
-                    sequence,
-                };
+            };
 
-                match kind {
-                    ChunkKind::Init => Some(SourceMsg::Control(SourceControl::HlsInitStart { id })),
-                    ChunkKind::Media => {
-                        Some(SourceMsg::Control(SourceControl::HlsSegmentStart { id }))
-                    }
-                }
+            match kind {
+                ChunkKind::Init => Some(SourceMsg::Control(SourceControl::HlsInitStart { id })),
+                ChunkKind::Media => Some(SourceMsg::Control(SourceControl::HlsSegmentStart { id })),
             }
-
-            StreamControl::ChunkEnd {
-                kind,
-                variant,
-                sequence,
-                ..
-            } => {
-                let variant = variant.expect("expected StreamControl::ChunkEnd.variant to be set");
-                let id = HlsChunkId {
-                    variant: variant as usize,
-                    sequence,
-                };
-
-                match kind {
-                    ChunkKind::Init => Some(SourceMsg::Control(SourceControl::HlsInitEnd { id })),
-                    ChunkKind::Media => {
-                        Some(SourceMsg::Control(SourceControl::HlsSegmentEnd { id }))
-                    }
-                }
-            }
-
-            StreamControl::StoreResource { .. } => None,
         }
+
+        StreamControl::ChunkEnd {
+            kind,
+            variant,
+            sequence,
+            ..
+        } => {
+            let variant = variant.expect("expected StreamControl::ChunkEnd.variant to be set");
+            let id = HlsChunkId {
+                variant: variant as usize,
+                sequence,
+            };
+
+            match kind {
+                ChunkKind::Init => Some(SourceMsg::Control(SourceControl::HlsInitEnd { id })),
+                ChunkKind::Media => Some(SourceMsg::Control(SourceControl::HlsSegmentEnd { id })),
+            }
+        }
+
+        StreamControl::StoreResource { .. } => None,
     }
 }
