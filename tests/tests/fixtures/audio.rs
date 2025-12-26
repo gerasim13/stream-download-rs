@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -291,6 +292,150 @@ impl AudioFixture {
             missing.len(),
             missing.iter().take(10).collect::<Vec<_>>()
         );
+    }
+
+    /// Deterministic VOD "played to the end" assertion that works in both AUTO and fixed-variant modes.
+    ///
+    /// Requirements:
+    /// - We must have read all segments 1..=segment_count for the *actual* variant used.
+    /// - Segments must be *sequential* (no gaps).
+    /// - No repeats: each segment number must be requested exactly once.
+    ///
+    /// This does not care which variant was used (slq/smq/shq/slossless), only that playback reached
+    /// the end in-order without repeats.
+    ///
+    /// If `forced_variant_suffix` is `Some`, we assert only against that suffix.
+    /// If `None`, we auto-detect which suffix reached END by observing a request for segment `segment_count`.
+    pub async fn assert_hls_vod_completed_sequential_no_repeats(
+        &self,
+        segment_count: usize,
+        timeout: Duration,
+        forced_variant_suffix: Option<&str>,
+    ) {
+        let suffixes: [&str; 4] = ["slq-a1", "smq-a1", "shq-a1", "slossless-a1"];
+
+        let chosen_suffix: String = if let Some(s) = forced_variant_suffix {
+            s.to_string()
+        } else {
+            // Wait until we observe the last segment for any known suffix.
+            let candidates: Vec<String> = suffixes
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}/segment-{}-{}.m4s",
+                        Self::HLS_ASSETS_DIR,
+                        segment_count,
+                        s
+                    )
+                })
+                .collect();
+
+            let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+            let got = self
+                .wait_until_any_requested(&refs, timeout)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "timed out waiting for any last segment (segment_count={}): {:?}",
+                        segment_count, candidates
+                    )
+                });
+
+            // got is stored without a leading `/`; extract suffix from the path.
+            // Expected: "hls/segment-{N}-{suffix}.m4s"
+            let prefix = format!("{}/segment-{}-", Self::HLS_ASSETS_DIR, segment_count);
+            assert!(
+                got.starts_with(&prefix) && got.ends_with(".m4s"),
+                "unexpected last segment path format: {}",
+                got
+            );
+
+            got.trim_start_matches(&prefix)
+                .trim_end_matches(".m4s")
+                .to_string()
+        };
+
+        // Snapshot all requested paths and count segment number occurrences for the chosen suffix.
+        let snapshot = self.request_log_snapshot().await;
+
+        // segment_number -> count
+        let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+        for entry in snapshot {
+            // Only consider media segment files for this suffix:
+            // "hls/segment-{i}-{suffix}.m4s"
+            let p = entry.path;
+            let prefix = format!("{}/segment-", Self::HLS_ASSETS_DIR);
+            if !p.starts_with(&prefix) || !p.ends_with(".m4s") {
+                continue;
+            }
+
+            // Strip prefix: "{i}-{suffix}.m4s"
+            let rest = &p[prefix.len()..];
+            // Split on first '-' => (i, "{suffix}.m4s")
+            let Some((num_str, suffix_plus_ext)) = rest.split_once('-') else {
+                continue;
+            };
+
+            let Ok(n) = num_str.parse::<usize>() else {
+                continue;
+            };
+
+            let expected_tail = format!("{}.m4s", chosen_suffix);
+            if suffix_plus_ext != expected_tail {
+                continue;
+            }
+
+            *counts.entry(n).or_insert(0) += 1;
+        }
+
+        // Ensure we have *exactly once* for every segment 1..=segment_count, and no extras.
+        let mut missing: Vec<usize> = Vec::new();
+        let mut repeats: Vec<(usize, usize)> = Vec::new();
+        for i in 1..=segment_count {
+            match counts.get(&i).copied().unwrap_or(0) {
+                0 => missing.push(i),
+                1 => {}
+                c => repeats.push((i, c)),
+            }
+        }
+
+        let extras: Vec<usize> = counts
+            .keys()
+            .copied()
+            .filter(|n| *n == 0 || *n > segment_count)
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "VOD completion failed for suffix '{}': missing segments (count={}): {:?}",
+            chosen_suffix,
+            missing.len(),
+            missing
+        );
+        assert!(
+            repeats.is_empty(),
+            "VOD completion failed for suffix '{}': repeated segments: {:?}",
+            chosen_suffix,
+            repeats
+        );
+        assert!(
+            extras.is_empty(),
+            "VOD completion failed for suffix '{}': unexpected segment numbers requested: {:?}",
+            chosen_suffix,
+            extras
+        );
+
+        // Best-effort sanity: init was fetched for the chosen suffix (for fMP4 variants).
+        let init = format!("{}/init-{}.mp4", Self::HLS_ASSETS_DIR, chosen_suffix);
+        let requested = self.requested_paths_set().await;
+        if chosen_suffix.ends_with("a1") {
+            assert!(
+                requested.contains(&init),
+                "expected init to be requested for completed VOD suffix '{}': {}",
+                chosen_suffix,
+                init
+            );
+        }
     }
 
     /// Construct an `AudioDecodeStream` for progressive HTTP MP3 served by this fixture's server.

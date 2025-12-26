@@ -1,6 +1,6 @@
 //! Symphonia-based decoder thread (Symphonia v0.6 / dev-0.6 aligned).
 //!
-//! This module provides the blocking decoder side of the new `stream-download-audio` architecture.
+//! This module provides the blocking decoder side of the `stream-download-audio` architecture.
 //!
 //! ## Why this exists
 //! - HTTP/HLS sources are async and yield ordered `SourceMsg` (bytes + boundaries).
@@ -15,13 +15,6 @@
 //! - The decoder thread receives `EpochMsg::StartEpoch` with a fresh epoch source.
 //!
 //! This guarantees bytes from different init epochs never mix in Symphonia input.
-//!
-//! ## Symphonia v0.6 API notes (verified against symphonia-core `formats::probe::Probe::probe`)
-//! - `get_probe().probe(&Hint, MediaSourceStream, FormatOptions, MetadataOptions)`
-//!   returns `Box<dyn FormatReader>`.
-//! - `get_codecs().make_audio_decoder(&AudioCodecParameters, &AudioDecoderOptions)`
-//!   returns `Box<dyn AudioDecoder>`.
-//! - `AudioDecoder::decode(&Packet)` returns `GenericAudioBufferRef<'_>`.
 //!
 //! ## Output contract
 //! The decoder thread emits ordered `AudioMsg` to a bounded `tokio::mpsc::Sender<AudioMsg>`:
@@ -49,6 +42,12 @@ use symphonia::default::{get_codecs, get_probe};
 use crate::decode::byte_queue::ByteQueueReader;
 use crate::types::{AudioControl, AudioMsg, AudioSpec, DecoderLifecycleReason, PcmChunk};
 
+/// Per-epoch compressed bytes input.
+///
+/// The async side should send compressed `Bytes` into a bounded `tokio::mpsc::Sender`.
+/// The decoder thread reads them via a blocking `Read` adapter.
+pub type EpochBytesRx = mpsc::Receiver<bytes::Bytes>;
+
 /// Messages sent from the async orchestrator to the blocking decoder thread.
 pub enum EpochMsg {
     /// Start a new decode epoch with a fresh bytestream source.
@@ -58,6 +57,23 @@ pub enum EpochMsg {
         /// Note: even for streaming sources, Symphonia requires `Seek`. We provide a minimal,
         /// non-seekable implementation that supports only `SeekFrom::Current(0)`.
         source: Box<dyn MediaSource + Send + Sync>,
+        /// Why we (re)initialized.
+        reason: DecoderLifecycleReason,
+        /// Desired output spec (informational for now).
+        output_spec: AudioSpec,
+        /// Preferred PCM chunk size in **sample-frames** (not samples).
+        pcm_chunk_frames: usize,
+    },
+
+    /// Start a new decode epoch backed by an async byte channel.
+    ///
+    /// This allows the async pipeline to enforce backpressure via bounded `mpsc::Sender`,
+    /// avoiding any blocking writes in async contexts.
+    StartEpochFromAsyncBytes {
+        /// Receiver side of the bounded async byte channel for this epoch.
+        ///
+        /// The decoder thread will block on this receiver when it needs more bytes.
+        bytes_rx: EpochBytesRx,
         /// Why we (re)initialized.
         reason: DecoderLifecycleReason,
         /// Desired output spec (informational for now).
@@ -91,6 +107,20 @@ pub fn spawn_decoder_thread(
                     output_spec,
                     pcm_chunk_frames,
                 } => {
+                    if let Err(e) =
+                        runner.decode_epoch(source, reason, output_spec, pcm_chunk_frames)
+                    {
+                        tracing::error!("decoder epoch failed: {}", e);
+                        break;
+                    }
+                }
+                EpochMsg::StartEpochFromAsyncBytes {
+                    bytes_rx,
+                    reason,
+                    output_spec,
+                    pcm_chunk_frames,
+                } => {
+                    let source = epoch_media_source_from_async_bytes(bytes_rx);
                     if let Err(e) =
                         runner.decode_epoch(source, reason, output_spec, pcm_chunk_frames)
                     {
@@ -365,9 +395,122 @@ impl MediaSource for ByteQueueMediaSource {
     }
 }
 
+/// Blocking `MediaSource` adapter over a bounded async bytes channel.
+///
+/// The async side sends compressed bytes into a `tokio::mpsc::Sender<Bytes>`.
+/// The decoder thread blocks waiting for new chunks when it needs more data.
+/// EOF is signaled by closing the sender (receiver yields `None`).
+pub struct AsyncBytesMediaSource {
+    inner: EpochBytesRx,
+    front: Option<bytes::Bytes>,
+    front_off: usize,
+    pos: u64,
+}
+
+impl AsyncBytesMediaSource {
+    pub fn new(inner: EpochBytesRx) -> Self {
+        Self {
+            inner,
+            front: None,
+            front_off: 0,
+            pos: 0,
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<bool> {
+        if self.front.is_some() {
+            return Ok(true);
+        }
+
+        // Block until we receive the next chunk or EOF.
+        //
+        // NOTE: This runs on the decoder thread (spawn_blocking), so blocking is acceptable.
+        match self.inner.blocking_recv() {
+            Some(b) => {
+                if b.is_empty() {
+                    // Skip empty chunks.
+                    return Ok(self.refill()?);
+                }
+                self.front = Some(b);
+                self.front_off = 0;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+impl Read for AsyncBytesMediaSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        if !self.refill()? {
+            return Ok(0);
+        }
+
+        let Some(front) = self.front.as_ref() else {
+            return Ok(0);
+        };
+
+        let start = self.front_off.min(front.len());
+        let avail = front.len().saturating_sub(start);
+        if avail == 0 {
+            self.front = None;
+            self.front_off = 0;
+            return self.read(buf);
+        }
+
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&front.slice(start..start + n));
+
+        self.front_off = self.front_off.saturating_add(n);
+        self.pos = self.pos.saturating_add(n as u64);
+
+        if let Some(f) = self.front.as_ref() {
+            if self.front_off >= f.len() {
+                self.front = None;
+                self.front_off = 0;
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+impl Seek for AsyncBytesMediaSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match pos {
+            SeekFrom::Current(0) => Ok(self.pos),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "async-bytes media source is not seekable",
+            )),
+        }
+    }
+}
+
+impl MediaSource for AsyncBytesMediaSource {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// Convenience: convert a `ByteQueueReader` into a boxed `MediaSource` for epoch wiring.
 pub fn epoch_media_source_from_byte_queue(
     reader: ByteQueueReader,
 ) -> Box<dyn MediaSource + Send + Sync> {
     Box::new(ByteQueueMediaSource::new(reader))
+}
+
+/// Convenience: convert a bounded async bytes receiver into a boxed `MediaSource` for epoch wiring.
+pub fn epoch_media_source_from_async_bytes(
+    bytes_rx: EpochBytesRx,
+) -> Box<dyn MediaSource + Send + Sync> {
+    Box::new(AsyncBytesMediaSource::new(bytes_rx))
 }

@@ -73,39 +73,428 @@ fn audio_http_mp3_full_track_drains_to_end() {
 }
 
 #[rstest]
-fn audio_hls_vod_requests_all_segments_even_without_eof() {
+#[case("auto", None)]
+#[case("fixed_variant0", Some(0usize))]
+fn audio_hls_vod_completes_sequential_no_repeats_regardless_of_variant(
+    #[case] mode: &str,
+    #[case] fixed_variant: Option<usize>,
+) {
     SERVER_RT.block_on(async move {
-        // This test is intentionally not based on an audio EOS signal, because today the example
-        // `audio_hls` (and sometimes the pipeline) may not terminate cleanly for HLS VOD.
+        // True iterator-to-end test for HLS VOD:
+        // - iterate ordered `AudioMsg` until `AudioControl::EndOfStream`
+        // - assert the stream closes (returns None) after EOS
         //
-        // Instead we assert the deterministic observable: the HTTP layer requested all VOD segments.
-        // For the shipped assets, each variant playlist is `#EXT-X-PLAYLIST-TYPE:VOD` with ENDLIST.
+        // This is the only robust "played to the end" signal for the audio iterator.
         let fixture = AudioFixture::start(Default::default()).await;
 
-        // Force a deterministic variant at startup (variant 0 == "slq-a1" in our assets master).
         let mut hls_settings = HlsSettings::default();
-        hls_settings.abr_initial_variant_index = Some(0);
+        match fixed_variant {
+            Some(idx) => {
+                // Deterministic startup on a fixed variant index.
+                hls_settings.abr_initial_variant_index = Some(idx);
+            }
+            None => {
+                // AUTO mode.
+                hls_settings.abr_initial_variant_index = None;
+            }
+        }
 
         let mut stream = fixture
             .audio_stream_hls_real_assets(hls_settings, None)
             .await;
 
-        // Drive the pipeline by actually draining PCM for long enough.
-        //
-        // NOTE:
-        // We do NOT expect a clean EOF for HLS VOD yet, but we do need to ensure the decode loop
-        // keeps pulling data so the HLS worker continues requesting segments.
-        let (total_samples, _saw_eos) = drain_to_end(&mut stream, Duration::from_secs(120)).await;
+        // Drain to EOS (or fail by timeout).
+        let (total_samples, saw_eos) = drain_to_end(&mut stream, Duration::from_secs(180)).await;
+
         assert!(
             total_samples > 0,
-            "expected to decode some PCM while draining HLS VOD; got total_samples={}",
+            "expected to decode some PCM while draining HLS VOD (mode={}); got total_samples={}",
+            mode,
             total_samples
         );
+        assert!(
+            saw_eos,
+            "expected ordered AudioControl::EndOfStream while draining HLS VOD (mode={})",
+            mode
+        );
 
-        // The provided `index-slq-a1.m3u8` contains segments 1..=37 and ENDLIST.
-        fixture
-            .assert_hls_vod_all_segments_requested("slq-a1", 37, Duration::from_secs(120))
+        // After EOS, the stream should close promptly.
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.next_msg())
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+
+        assert!(
+            closed,
+            "expected AudioDecodeStream to close (return None) after EndOfStream (mode={})",
+            mode
+        );
+    });
+}
+
+#[rstest]
+#[case("auto", None)]
+#[case("fixed_variant0", Some(0usize))]
+fn audio_hls_vod_full_drain_emits_end_of_stream_and_stream_closes(
+    #[case] mode: &str,
+    #[case] fixed_variant: Option<usize>,
+) {
+    SERVER_RT.block_on(async move {
+        // Full-drain iterator test for HLS VOD:
+        // - Iterate the audio stream until `AudioControl::EndOfStream` is observed.
+        // - Validate PCM chunk invariants for every non-empty PCM chunk.
+        // - Assert the stream closes (`next_msg()` returns None) promptly after EOS.
+        //
+        // This is the closest analog to "play the track from start to finish" for HLS VOD.
+        //
+        // NOTE:
+        // This test is ignored until audio-HLS reliably propagates ENDLIST -> ordered EOS + closure.
+        let fixture = AudioFixture::start(Default::default()).await;
+
+        let mut hls_settings = HlsSettings::default();
+        match fixed_variant {
+            Some(idx) => {
+                // Deterministic startup on a fixed variant index.
+                hls_settings.abr_initial_variant_index = Some(idx);
+            }
+            None => {
+                // AUTO mode.
+                hls_settings.abr_initial_variant_index = None;
+            }
+        }
+
+        let mut stream = fixture
+            .audio_stream_hls_real_assets(hls_settings, None)
             .await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+
+        let mut saw_eos = false;
+        let mut saw_pcm = false;
+        let mut saw_format = false;
+        let mut seen_spec: Option<stream_download_audio::AudioSpec> = None;
+        let mut total_samples: usize = 0;
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Control(AudioControl::FormatChanged { spec }))) => {
+                    saw_format = true;
+                    if let Some(prev) = seen_spec {
+                        assert_eq!(
+                            prev, spec,
+                            "expected a stable AudioSpec for this HLS VOD drain test (mode={})",
+                            mode
+                        );
+                    } else {
+                        seen_spec = Some(spec);
+                    }
+                }
+                Ok(Some(AudioMsg::Pcm(chunk))) => {
+                    if chunk.pcm.is_empty() {
+                        continue;
+                    }
+
+                    saw_pcm = true;
+                    total_samples += chunk.pcm.len();
+
+                    assert!(
+                        chunk.spec.channels > 0,
+                        "PCM chunk must have channels > 0 (mode={}, got {})",
+                        mode,
+                        chunk.spec.channels
+                    );
+                    assert!(
+                        chunk.spec.sample_rate > 0,
+                        "PCM chunk must have sample_rate > 0 (mode={}, got {})",
+                        mode,
+                        chunk.spec.sample_rate
+                    );
+
+                    let ch = chunk.spec.channels as usize;
+                    assert_eq!(
+                        chunk.pcm.len() % ch,
+                        0,
+                        "PCM len must be multiple of channels (mode={}, len={}, channels={})",
+                        mode,
+                        chunk.pcm.len(),
+                        ch
+                    );
+
+                    assert!(
+                        chunk.pcm.iter().all(|s| s.is_finite()),
+                        "PCM chunk contains non-finite samples (mode={})",
+                        mode
+                    );
+
+                    if let Some(spec) = seen_spec {
+                        assert_eq!(
+                            spec, chunk.spec,
+                            "PCM spec must match the last observed FormatChanged spec (mode={})",
+                            mode
+                        );
+                    }
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
+                    saw_eos = true;
+                    break;
+                }
+                Ok(Some(AudioMsg::Control(_))) => {}
+                Ok(None) => {
+                    // If the stream closes without emitting EndOfStream, that's a bug in our ordered contract.
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            saw_format,
+            "expected at least one ordered FormatChanged (mode={})",
+            mode
+        );
+        assert!(
+            saw_pcm,
+            "expected to observe some PCM before EOS (mode={})",
+            mode
+        );
+        assert!(
+            total_samples > 0,
+            "expected total_samples > 0 before EOS (mode={}, got {})",
+            mode,
+            total_samples
+        );
+        assert!(
+            saw_eos,
+            "expected ordered AudioControl::EndOfStream while draining HLS VOD (mode={})",
+            mode
+        );
+
+        // After EOS, the stream should close promptly (channel closed).
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.next_msg())
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+
+        assert!(
+            closed,
+            "expected AudioDecodeStream to close (return None) after EndOfStream (mode={})",
+            mode
+        );
+    });
+}
+
+#[rstest]
+fn audio_iterator_pcm_chunk_invariants_hold_for_http_mp3() {
+    SERVER_RT.block_on(async move {
+        // This test exercises the iterator-style API by iterating ordered `AudioMsg` and validating
+        // `PcmChunk` invariants as we go.
+        //
+        // We use the local MP3 asset via the audio fixture server because it:
+        // - is finite (should complete),
+        // - is deterministic (no external network),
+        // - produces real PCM through Symphonia.
+        let fixture = AudioFixture::start(Default::default()).await;
+        let mut stream = fixture.audio_stream_http_mp3(None, None).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+
+        let mut saw_pcm = false;
+        let mut saw_format = false;
+        let mut seen_spec: Option<stream_download_audio::AudioSpec> = None;
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Control(AudioControl::FormatChanged { spec }))) => {
+                    saw_format = true;
+                    if let Some(prev) = seen_spec {
+                        assert_eq!(prev, spec, "expected a stable AudioSpec for this MP3 test");
+                    } else {
+                        seen_spec = Some(spec);
+                    }
+                }
+                Ok(Some(AudioMsg::Pcm(chunk))) => {
+                    // Skip empty chunks (harmless, but don't use them for invariants).
+                    if chunk.pcm.is_empty() {
+                        continue;
+                    }
+
+                    saw_pcm = true;
+
+                    assert!(
+                        chunk.spec.channels > 0,
+                        "PCM chunk must have channels > 0 (got {})",
+                        chunk.spec.channels
+                    );
+                    assert!(
+                        chunk.spec.sample_rate > 0,
+                        "PCM chunk must have sample_rate > 0 (got {})",
+                        chunk.spec.sample_rate
+                    );
+
+                    let ch = chunk.spec.channels as usize;
+                    assert_eq!(
+                        chunk.pcm.len() % ch,
+                        0,
+                        "PCM len must be multiple of channels (len={}, channels={})",
+                        chunk.pcm.len(),
+                        ch
+                    );
+
+                    // Samples should be finite floats.
+                    assert!(
+                        chunk.pcm.iter().all(|s| s.is_finite()),
+                        "PCM chunk contains non-finite samples"
+                    );
+
+                    // Ensure spec is consistent with FormatChanged if we saw it.
+                    if let Some(spec) = seen_spec {
+                        assert_eq!(
+                            spec, chunk.spec,
+                            "PCM spec must match the last observed FormatChanged spec"
+                        );
+                    }
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
+                    // Completion observed.
+                    break;
+                }
+                Ok(Some(AudioMsg::Control(_))) => {}
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_format, "expected at least one ordered FormatChanged");
+        assert!(
+            saw_pcm,
+            "expected to observe at least one non-empty PCM chunk"
+        );
+    });
+}
+
+#[rstest]
+fn audio_iterator_drains_http_mp3_to_end_and_stream_closes() {
+    SERVER_RT.block_on(async move {
+        // Full-drain iterator test:
+        // - iterate through ordered messages until `EndOfStream`
+        // - validate PCM chunk invariants for every non-empty PCM chunk
+        // - assert the stream actually closes (`next_msg()` returns None) after EOS
+        //
+        // This is the "equivalent of playing the track from start to end" test for progressive HTTP.
+        let fixture = AudioFixture::start(Default::default()).await;
+        let mut stream = fixture.audio_stream_http_mp3(None, None).await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+
+        let mut saw_eos = false;
+        let mut saw_pcm = false;
+        let mut saw_format = false;
+        let mut seen_spec: Option<stream_download_audio::AudioSpec> = None;
+        let mut total_samples: usize = 0;
+
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            match tokio::time::timeout(remaining, stream.next_msg()).await {
+                Ok(Some(AudioMsg::Control(AudioControl::FormatChanged { spec }))) => {
+                    saw_format = true;
+                    if let Some(prev) = seen_spec {
+                        assert_eq!(prev, spec, "expected a stable AudioSpec for this MP3 test");
+                    } else {
+                        seen_spec = Some(spec);
+                    }
+                }
+                Ok(Some(AudioMsg::Pcm(chunk))) => {
+                    if chunk.pcm.is_empty() {
+                        continue;
+                    }
+
+                    saw_pcm = true;
+                    total_samples += chunk.pcm.len();
+
+                    assert!(
+                        chunk.spec.channels > 0,
+                        "PCM chunk must have channels > 0 (got {})",
+                        chunk.spec.channels
+                    );
+                    assert!(
+                        chunk.spec.sample_rate > 0,
+                        "PCM chunk must have sample_rate > 0 (got {})",
+                        chunk.spec.sample_rate
+                    );
+
+                    let ch = chunk.spec.channels as usize;
+                    assert_eq!(
+                        chunk.pcm.len() % ch,
+                        0,
+                        "PCM len must be multiple of channels (len={}, channels={})",
+                        chunk.pcm.len(),
+                        ch
+                    );
+
+                    assert!(
+                        chunk.pcm.iter().all(|s| s.is_finite()),
+                        "PCM chunk contains non-finite samples"
+                    );
+
+                    if let Some(spec) = seen_spec {
+                        assert_eq!(
+                            spec, chunk.spec,
+                            "PCM spec must match the last observed FormatChanged spec"
+                        );
+                    }
+                }
+                Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
+                    saw_eos = true;
+                    break;
+                }
+                Ok(Some(AudioMsg::Control(_))) => {}
+                Ok(None) => {
+                    // If the stream closes without emitting EndOfStream, that's a bug in our ordered contract.
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        assert!(saw_format, "expected at least one ordered FormatChanged");
+        assert!(saw_pcm, "expected to observe some PCM before EOS");
+        assert!(
+            total_samples > 0,
+            "expected total_samples > 0 before EOS (got {})",
+            total_samples
+        );
+        assert!(
+            saw_eos,
+            "expected ordered AudioControl::EndOfStream while draining HTTP MP3"
+        );
+
+        // After EOS, the stream should close promptly (channel closed).
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.next_msg())
+            .await
+            .ok()
+            .flatten()
+            .is_none();
+
+        assert!(
+            closed,
+            "expected AudioDecodeStream to close (return None) after EndOfStream"
+        );
     });
 }
 

@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::decode::byte_queue::ByteQueue;
 use crate::decode::symphonia_decoder::{self, EpochMsg};
 use crate::source::{self, BoxAudioSource, SourceControl, SourceMsg};
 use crate::types::{
@@ -58,16 +57,33 @@ impl AudioSource {
 /// - Backpressure:
 ///   - output is delivered through a bounded channel sized in *decoded samples* (not bytes),
 ///     so slow consumers will naturally slow down decode.
+/// - Shutdown / completion:
+///   - When the upstream source ends (`SourceMsg::EndOfStream` or source stream terminates),
+///     the audio pipeline must reliably terminate and close this stream:
+///       - an ordered `AudioControl::EndOfStream` is emitted by the decoder thread
+///       - then the stream returns `None` (channel closed)
 ///
 /// # Notes
-/// This is intentionally a **skeleton** that will be filled in during the rewrite:
-/// - the old `AudioStream` / `PipelineRunner` approach is removed.
-/// - this type becomes the primary API for tests and production adapters (rodio/cpal).
-/// Iterator-style (async `Stream`) audio decoder.
+/// This type owns a single background streaming task (similar to `stream-download-hls::HlsStream`)
+/// that orchestrates:
+/// - reading the upstream source stream
+/// - managing init epochs
+/// - running the blocking Symphonia decoder thread
+///
+/// This ensures that when upstream completes, we always close internal channels and do not hang.
 pub struct AudioDecodeStream {
     rx: mpsc::Receiver<AudioMsg>,
     cmd_tx: mpsc::Sender<AudioCommand>,
     cancel: CancellationToken,
+    streaming_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AudioDecodeStream {
+    fn drop(&mut self) {
+        // Mirror `HlsStream` behavior: cancellation on drop and abort if still running.
+        self.cancel.cancel();
+        self.streaming_task.abort();
+    }
 }
 
 impl AudioDecodeStream {
@@ -118,8 +134,12 @@ impl AudioDecodeStream {
             drop(cmd_rx);
         }
 
+        // Spawn a single "streaming task" (HlsStream-style owner) that:
+        // - reads the source
+        // - manages epochs
+        // - guarantees shutdown/closure on upstream completion
         let cancel_bg = cancel.clone();
-        tokio::spawn(async move {
+        let streaming_task = tokio::spawn(async move {
             let mut s = src.into_stream();
 
             // IMPORTANT:
@@ -132,19 +152,23 @@ impl AudioDecodeStream {
             // HLS init boundary (HLS).
             let mut epoch_started = false;
 
-            // Current epoch byte queue (created eagerly, but the decoder won't see it until we
-            // explicitly start the epoch).
-            let mut current_epoch = ByteQueue::new(opts.max_buffered_bytes.get());
-            let mut current_writer = current_epoch.writer();
+            // Current epoch bounded async byte channel.
+            //
+            // Backpressure is enforced by bounded `mpsc`, so we never block inside this async task.
+            // EOF for the epoch is signaled by dropping the sender.
+            let mut current_epoch_tx: Option<mpsc::Sender<bytes::Bytes>> = None;
 
             let output_spec = AudioSpec {
                 sample_rate: opts.target_sample_rate,
                 channels: opts.target_channels,
             };
 
+            // Track whether we observed an explicit EOS message.
+            // Even if not, the source stream termination (`None`) must be treated as EOS.
+            let mut saw_source_eos = false;
+
             while let Some(item) = s.next().await {
                 if cancel_bg.is_cancelled() {
-                    current_writer.close();
                     break;
                 }
 
@@ -153,21 +177,29 @@ impl AudioDecodeStream {
                         // Lazily start the initial epoch on the first bytes.
                         if !epoch_started {
                             epoch_started = true;
-                            let _ = epoch_tx.send(EpochMsg::StartEpoch {
-                                source: symphonia_decoder::epoch_media_source_from_byte_queue(
-                                    current_epoch.reader(),
-                                ),
+
+                            let cap = opts.max_buffered_bytes.get().max(1);
+                            let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
+
+                            current_epoch_tx = Some(tx);
+
+                            let _ = epoch_tx.send(EpochMsg::StartEpochFromAsyncBytes {
+                                bytes_rx: rx,
                                 reason: DecoderLifecycleReason::Initial,
                                 output_spec,
                                 pcm_chunk_frames: opts.pcm_chunk_frames.get(),
                             });
                         }
 
-                        // Backpressure is enforced by the bounded ByteQueue.
-                        // NOTE: `push` is blocking; we will move this to a dedicated blocking task
-                        // or make the queue async-aware as a follow-up.
-                        if let Err(_e) = current_writer.push(bytes) {
-                            current_writer.close();
+                        if let Some(tx) = current_epoch_tx.as_mut() {
+                            if !bytes.is_empty() {
+                                // Bounded async send => backpressure without blocking the runtime.
+                                if tx.send(bytes).await.is_err() {
+                                    break;
+                                }
+                            }
+                        } else {
+                            // No epoch yet and no bytes channel (should be unreachable).
                             break;
                         }
                     }
@@ -181,11 +213,12 @@ impl AudioDecodeStream {
                         // When we observe a new init start, we must start a new compressed-byte epoch
                         // so bytes across init segments never mix (codec/container may change).
                         if matches!(ctrl, SourceControl::HlsInitStart { .. }) {
-                            // Close current epoch to unblock decoder, then start a new one.
-                            current_writer.close();
+                            // Close current epoch to unblock decoder by dropping the sender.
+                            current_epoch_tx = None;
 
-                            current_epoch = ByteQueue::new(opts.max_buffered_bytes.get());
-                            current_writer = current_epoch.writer();
+                            let cap = opts.max_buffered_bytes.get().max(1);
+                            let (tx, rx) = mpsc::channel::<bytes::Bytes>(cap);
+                            current_epoch_tx = Some(tx);
 
                             // Start (or switch) decoder epoch for the new init.
                             //
@@ -199,10 +232,8 @@ impl AudioDecodeStream {
                                 DecoderLifecycleReason::Initial
                             };
 
-                            let _ = epoch_tx.send(EpochMsg::StartEpoch {
-                                source: symphonia_decoder::epoch_media_source_from_byte_queue(
-                                    current_epoch.reader(),
-                                ),
+                            let _ = epoch_tx.send(EpochMsg::StartEpochFromAsyncBytes {
+                                bytes_rx: rx,
                                 reason,
                                 output_spec,
                                 pcm_chunk_frames: opts.pcm_chunk_frames.get(),
@@ -210,24 +241,53 @@ impl AudioDecodeStream {
                         }
                     }
                     Ok(SourceMsg::EndOfStream) => {
-                        current_writer.close();
+                        saw_source_eos = true;
                         break;
                     }
                     Err(_e) => {
                         // TODO: propagate a structured ordered error control once we define it.
-                        current_writer.close();
                         break;
                     }
                 }
             }
 
-            // Notify decoder thread that no more epochs will arrive.
+            // IMPORTANT shutdown sequence (HlsStream-style):
+            // - close the current epoch input so Symphonia can observe EOF and finish
+            // - notify decoder no more epochs will arrive
+            //
+            // This must run whether EOS was explicit or the source stream just terminated.
+            // Close current epoch bytes (if any) so the decoder can observe EOF for the last epoch.
+            current_epoch_tx = None;
+
             let _ = epoch_tx.send(EpochMsg::EndOfStream);
 
-            // Best-effort ordered termination signal is emitted by the decoder thread.
+            // Do NOT await the decoder task here.
+            //
+            // Rationale (mirrors `stream-download-hls::HlsStream` behavior):
+            // - The streaming task must never block indefinitely during shutdown.
+            // - Upstream completion (or cancellation) must always lead to closing the output channel,
+            //   so consumers observing `AudioDecodeStream` are not left hanging.
+            // - The decoder thread is responsible for emitting the ordered `AudioControl::EndOfStream`
+            //   once it observes EOF on its epoch input and/or receives `EpochMsg::EndOfStream`.
+            //
+            // If the decoder thread were to hang (e.g. due to a Symphonia probe/read edge case),
+            // awaiting it here would prevent `msg_tx` from being dropped and would deadlock consumers.
+            //
+            // The `Drop` impl cancels and aborts the streaming task; the decoder thread will naturally
+            // stop once it observes EOF (epoch sender dropped) and/or the epoch channel ends.
+            let _ = saw_source_eos;
+
+            // Finally, close the ordered output channel by dropping the last sender handle.
+            // This guarantees `AudioDecodeStream` eventually yields `None` after EOS.
+            drop(msg_tx);
         });
 
-        Ok(Self { rx, cmd_tx, cancel })
+        Ok(Self {
+            rx,
+            cmd_tx,
+            cancel,
+            streaming_task,
+        })
     }
 
     /// Create a decoder stream for progressive HTTP audio.
