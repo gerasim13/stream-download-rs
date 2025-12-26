@@ -1,13 +1,17 @@
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
+use futures_util::Stream;
 use kanal;
 use stream_download::storage::StorageProvider;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 use url::Url;
 
-use crate::api::{AudioOptions, AudioProcessor, AudioSpec, PlayerEvent, SampleSource};
+use crate::api::{AudioMsg, AudioOptions, AudioProcessor, AudioSpec, PlayerEvent};
 use crate::backends::{HlsPacketProducer, HttpPacketProducer, PacketProducer, ProducerCommand};
 use crate::pipeline::PipelineRunner;
 use crate::settings::AudioSettings;
@@ -39,19 +43,21 @@ impl EventHub {
     }
 }
 
-/// High-level audio stream backed by a lock-free ring buffer.
+/// High-level audio stream.
 ///
-/// This type implements `SampleSource` and is intended to be fed by a background
-/// pipeline (I/O, decode, resample, effects).
+/// NOTE: legacy pull-based `SampleSource` wiring is intentionally removed.
+/// The primary consumption API is an ordered stream (see `api.rs`), and this type is driven by a
+/// background pipeline (I/O, decode, resample, effects).
 ///
 /// Generic over `StorageProvider` to allow flexible storage backends.
 /// Note: HLS backend currently manages its own storage internally.
 pub struct AudioStream<P: StorageProvider> {
     spec: Arc<Mutex<AudioSpec>>,
-    runner: PipelineRunner,
     events: Arc<EventHub>,
-    /// Command channel to send seek/flush commands to producer task (sync sender for use from SampleSource)
-    command_tx: Option<kanal::Sender<ProducerCommand>>,
+    /// Ordered decoded output (frames + control). This is the primary consumption channel.
+    ///
+    /// NOTE: `tokio::sync::mpsc::Receiver` is not clonable; consumers should have exactly one owner.
+    msg_rx: mpsc::Receiver<AudioMsg>,
     _phantom: PhantomData<P>,
 }
 
@@ -74,12 +80,15 @@ impl<P: StorageProvider> AudioStream<P> {
         let events = Arc::new(EventHub::new());
 
         let byte_capacity = 8usize;
-        let pcm_capacity = opts
-            .ring_capacity_frames
+        // Bounded, ordered message buffer capacity.
+        // Keep this relatively small to provide backpressure like `stream-download-hls`.
+        let msg_capacity = opts
+            .frame_buffer_capacity_frames
             .saturating_mul(opts.target_channels as usize)
             .max(1);
 
-        let mut runner = PipelineRunner::new(byte_capacity, pcm_capacity);
+        let mut runner = PipelineRunner::new(byte_capacity, msg_capacity);
+        let msg_rx = runner.msg_rx.take().expect("msg_rx already taken");
 
         // Wire events from pipeline to this AudioStream's EventHub.
         let events_clone = events.clone();
@@ -94,12 +103,15 @@ impl<P: StorageProvider> AudioStream<P> {
                 as Arc<dyn Fn(PlayerEvent) + Send + Sync>)
         });
 
-        // Create command channel for seek support if enabled
-        // Use async receiver (for producer task) and sync sender (for AudioStream::seek)
-        let (command_tx, command_rx) = if enable_seek {
-            let (tx_async, rx_async) = kanal::unbounded_async::<ProducerCommand>();
-            let tx_sync = tx_async.clone_sync(); // Clone sync sender for use in seek()
-            (Some(tx_sync), Some(rx_async))
+        // Create command channel for seek support if enabled.
+        //
+        // NOTE: The legacy pull-based API (and seek wiring on `AudioStream`) was removed during the
+        // ordered `AudioMsg` stream redesign. We still keep the producer-side command receiver so
+        // the backend can support seek in the future, but we intentionally do not retain the
+        // command sender in `AudioStream` for now.
+        let (_command_tx, command_rx) = if enable_seek {
+            let (_tx_async, rx_async) = kanal::unbounded_async::<ProducerCommand>();
+            (Some(()), Some(rx_async))
         } else {
             (None, None)
         };
@@ -127,9 +139,8 @@ impl<P: StorageProvider> AudioStream<P> {
 
         Self {
             spec,
-            runner,
             events,
-            command_tx,
+            msg_rx,
             _phantom: PhantomData,
         }
     }
@@ -154,7 +165,7 @@ impl<P: StorageProvider> AudioStream<P> {
             selection_mode: crate::api::SelectionMode::Auto,
             target_sample_rate: audio_settings.target_sample_rate,
             target_channels: audio_settings.target_channels,
-            ring_capacity_frames: audio_settings.ring_capacity_frames,
+            frame_buffer_capacity_frames: audio_settings.ring_capacity_frames,
             abr_min_switch_interval: std::time::Duration::from_secs(4),
             abr_up_hysteresis_ratio: 0.15,
         };
@@ -173,18 +184,30 @@ impl<P: StorageProvider> AudioStream<P> {
         *self.spec.lock().unwrap()
     }
 
-    /// Internal: pop up to `out.len()` samples into `out`, returning the count.
-    pub fn pop_chunk(&mut self, out: &mut [f32]) -> usize {
-        self.runner.pop_chunk(out)
+    /// Async receive of the next ordered audio message (frame/control).
+    ///
+    /// This is the recommended consumption API.
+    pub async fn next_msg(&mut self) -> Option<AudioMsg> {
+        self.msg_rx.recv().await
     }
 
-    /// Clear the PCM buffer.
-    ///
-    /// This is useful when seeking to avoid playing stale audio.
-    pub fn clear_buffer(&mut self) {
-        // Drain all samples from PCM ring buffer
-        let mut dummy = vec![0.0f32; 1024];
-        while self.runner.pop_chunk(&mut dummy) > 0 {}
+    /// Non-blocking attempt to receive the next ordered audio message.
+    pub fn try_recv(&mut self) -> Option<AudioMsg> {
+        self.msg_rx.try_recv().ok()
+    }
+}
+
+impl<P: StorageProvider> Stream for AudioStream<P> {
+    type Item = AudioMsg;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // SAFETY:
+        // - `AudioStream` does not implement a custom `Drop` that could move fields after being pinned.
+        // - We only project a pinned `&mut` to the `msg_rx` field to call `poll_recv`.
+        //
+        // If in the future `AudioStream` becomes `!Unpin` due to self-references, switch to a
+        // proper pin-projection crate (like `pin-project`) and annotate the struct.
+        unsafe { self.map_unchecked_mut(|s| &mut s.msg_rx) }.poll_recv(cx)
     }
 }
 
@@ -213,7 +236,7 @@ impl AudioStream<stream_download::storage::temp::TempStorageProvider> {
             selection_mode: crate::api::SelectionMode::Auto,
             target_sample_rate: audio_settings.target_sample_rate,
             target_channels: audio_settings.target_channels,
-            ring_capacity_frames: audio_settings.ring_capacity_frames,
+            frame_buffer_capacity_frames: audio_settings.ring_capacity_frames,
             abr_min_switch_interval: std::time::Duration::from_secs(4),
             abr_up_hysteresis_ratio: 0.15,
         };
@@ -229,45 +252,5 @@ impl AudioStream<stream_download::storage::temp::TempStorageProvider> {
         let producer = HlsPacketProducer::new(url, hls_settings, storage_root);
 
         Self::from_packet_producer(producer, opts, None, true, None).await // enable_seek=true
-    }
-}
-
-impl<P: StorageProvider> SampleSource for AudioStream<P> {
-    fn read_interleaved(&mut self, out: &mut [f32]) -> usize {
-        // Use synchronous pop since we're now using sync ringbuf
-        let n = self.pop_chunk(out);
-        // if n < out.len() {
-        //     trace!("AudioStream underrun: requested {}, got {}", out.len(), n);
-        // }
-        n
-    }
-
-    fn spec(&self) -> AudioSpec {
-        *self.spec.lock().unwrap()
-    }
-
-    fn seek(&mut self, to: std::time::Duration) -> std::io::Result<()> {
-        // Clear PCM buffer first to avoid playing stale audio
-        self.clear_buffer();
-
-        // Send seek command to producer task if command channel is available
-        if let Some(ref tx) = self.command_tx {
-            // Use sync send - no block_on needed!
-            tx.send(ProducerCommand::Seek(to)).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "failed to send seek command - producer task may have stopped",
-                )
-            })?;
-
-            tracing::info!("Seek command sent: {:?}", to);
-            Ok(())
-        } else {
-            // No command channel - seek not supported for this stream
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "seek not supported for this stream (command channel not initialized)",
-            ))
-        }
     }
 }

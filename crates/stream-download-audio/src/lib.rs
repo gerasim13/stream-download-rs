@@ -24,8 +24,8 @@ pub use stream_download_hls::{
 
 // Public API re-exports.
 pub use crate::api::{
-    AbrVariantChangeReason, AudioOptions, AudioProcessor, AudioSpec, DecoderLifecycleReason,
-    PlayerEvent, SampleSource, SelectionMode,
+    AbrVariantChangeReason, AudioControl, AudioFrame, AudioMsg, AudioOptions, AudioOrigin,
+    AudioProcessor, AudioSpec, DecoderLifecycleReason, PlayerEvent, SelectionMode,
 };
 pub use crate::settings::{AudioSettings, ResamplingQuality};
 pub use crate::stream::AudioStream;

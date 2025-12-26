@@ -8,7 +8,8 @@ use bytes::Bytes;
 use reqwest::Url;
 
 use stream_download_audio::{
-    AbrVariantChangeReason, AudioSettings, AudioStream, DecoderLifecycleReason, PlayerEvent,
+    AbrVariantChangeReason, AudioControl, AudioMsg, AudioSettings, AudioStream,
+    DecoderLifecycleReason, PlayerEvent,
 };
 use stream_download_hls::HlsSettings;
 
@@ -22,6 +23,12 @@ pub struct RequestEntry {
 #[derive(Debug)]
 pub struct AudioObserveResult {
     pub saw_format_changed: bool,
+
+    /// Observed HLS variant indices as derived from ordered `AudioMsg::Frame` origins.
+    ///
+    /// This is the primary "applied switch" signal in the new model: if frames arrive tagged with
+    /// `AudioOrigin::Hls { variant, .. }`, we know the pipeline is actually decoding that variant.
+    pub observed_hls_variants_from_frames: Vec<usize>,
 
     /// Observed `PlayerEvent::VariantChanged` (HLS ABR decision).
     pub saw_variant_changed: bool,
@@ -387,6 +394,8 @@ impl AudioFixture {
 
         let mut saw_format_changed = false;
 
+        let mut observed_hls_variants_from_frames: Vec<usize> = Vec::new();
+
         let mut saw_variant_changed = false;
         let mut variant_changed_to: Option<usize> = None;
         let mut variant_changed_at_request_seq: Option<usize> = None;
@@ -404,7 +413,6 @@ impl AudioFixture {
         let mut error_message: Option<String> = None;
         let mut last_event: Option<PlayerEvent> = None;
 
-        let mut pcm = vec![0.0f32; 4096];
         let mut total_samples = 0usize;
 
         while Instant::now() < deadline {
@@ -446,21 +454,37 @@ impl AudioFixture {
                 }
             }
 
-            // Pull PCM.
-            let n = stream.pop_chunk(&mut pcm);
-            if n > 0 {
-                total_samples += n;
-                if total_samples >= min_samples {
+            // Consume ordered audio messages (frames + control).
+            match stream.next_msg().await {
+                Some(AudioMsg::Frame(frame)) => {
+                    // Record applied HLS variant as observed from ordered frame metadata.
+                    if let stream_download_audio::AudioOrigin::Hls { variant, .. } = frame.origin {
+                        observed_hls_variants_from_frames.push(variant);
+                    }
+
+                    total_samples += frame.pcm.len();
+                    if total_samples >= min_samples {
+                        break;
+                    }
+                }
+                Some(AudioMsg::Control(AudioControl::EndOfStream)) => {
+                    saw_end = true;
                     break;
                 }
-            } else {
-                // Let producer/decoder make progress.
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                Some(AudioMsg::Control(_)) => {
+                    // Other ordered controls currently don't affect the generic driver loop.
+                }
+                None => {
+                    // Producer/decoder has stopped; treat as end-of-stream for the driver.
+                    saw_end = true;
+                    break;
+                }
             }
         }
 
         AudioObserveResult {
             saw_format_changed,
+            observed_hls_variants_from_frames,
             saw_variant_changed,
             saw_hls_segment_start,
             variant_changed_events,

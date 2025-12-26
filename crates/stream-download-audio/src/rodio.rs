@@ -1,123 +1,203 @@
+//! Rodio integration for `stream-download-audio`.
+//!
+//! This adapter is intentionally built on top of the **new ordered** `AudioMsg` stream API.
+//! There is no legacy pull-based wrapper.
+//!
+//! Design
+//! ------
+//! - Owns an `AudioStream<P>` and spawns a background thread.
+//! - The thread continuously pulls ordered `AudioMsg` items from the stream and forwards PCM to
+//!   the rodio `Source` iterator via a bounded channel (backpressure).
+//! - The iterator (`RodioSourceAdapter`) never blocks in `next()`; if no PCM is available yet it
+//!   yields silence (0.0) to keep rodio’s mixer running smoothly.
+//!
+//! Notes
+//! -----
+//! - Rodio expects a stable sample rate and channel count. We capture these from the first
+//!   `AudioFrame` observed and then keep them constant for the lifetime of the adapter.
+//! - If the audio stream reports `AudioControl::EndOfStream`, the adapter will eventually stop
+//!   producing samples (returns `None`), which allows `sink.sleep_until_end()` to complete.
+//!
+//! Requirements
+//! ------------
+//! This module is feature-gated behind `stream-download-audio`'s `rodio` feature.
+
+#![cfg(feature = "rodio")]
+
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rodio::Source;
 
-use crate::{AudioSpec, AudioStream, SampleSource, StorageProvider};
+use crate::api::{AudioControl, AudioMsg, AudioSpec};
+use crate::{AudioStream, StorageProvider};
 
-/// Rodio adapter that implements `rodio::Source<Item = f32>` by pulling from an `AudioStream`.
+/// How the adapter should behave when no PCM is immediately available.
 ///
-/// Notes:
-/// - Rodio expects a stable sample rate and channel count during the lifetime of a `Source`.
-///   We capture those at construction time from the `AudioStream`.
-/// - When the internal buffer is empty, this adapter yields silence to maintain continuity.
-///   This avoids busy-wait loops and underruns on the output device.
+/// Rodio's `Source` is a synchronous iterator. If we block there, we can stall the mixer.
+/// The default behavior is to yield silence when empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyBehavior {
+    /// Yield zeros when no PCM is ready.
+    YieldSilence,
+    /// Sleep briefly and try again (still yields silence if nothing arrives).
+    ///
+    /// This reduces busy looping at the cost of slightly higher latency.
+    SleepAndYieldSilence(Duration),
+}
+
+impl Default for EmptyBehavior {
+    fn default() -> Self {
+        Self::SleepAndYieldSilence(Duration::from_millis(2))
+    }
+}
+
+/// A `rodio::Source<Item = f32>` backed by an `AudioStream<P>`.
 ///
-/// Generic over `StorageProvider` to match `AudioStream<P>`.
-///
-/// Usage:
-/// ```ignore
-/// let stream = AudioStream::new_http(...).await?;
-/// let adapter = RodioSourceAdapter::new(stream);
-/// sink.append(adapter);
-/// ```
+/// This adapter converts the ordered `AudioMsg` stream into interleaved `f32` samples for rodio.
 pub struct RodioSourceAdapter<P: StorageProvider> {
-    inner: Arc<Mutex<AudioStream<P>>>,
-    cur_spec: AudioSpec,
+    // We keep spec stable for rodio. It's filled after we observe the first frame.
+    spec: AudioSpec,
 
-    // Background-refilled chunk queue.
-    rx: std::sync::mpsc::Receiver<Vec<f32>>,
-
-    // Small pending buffer to amortize locking cost by reading in chunks.
+    // Pending PCM interleaved samples for Iterator::next()
     pending: Vec<f32>,
     cursor: usize,
+
+    // Channel fed by background thread.
+    rx: mpsc::Receiver<Vec<f32>>,
+
+    // End-of-stream flag set by background thread.
+    eof: Arc<std::sync::atomic::AtomicBool>,
+
+    // Behavior when empty
+    empty_behavior: EmptyBehavior,
+
+    // Keep the thread handle alive for the lifetime of the adapter.
+    _thread: Option<std::thread::JoinHandle<()>>,
+
+    // We keep the stream in an Arc/Mutex only to move it into a thread easily and to allow future
+    // extensions. Access happens only inside the spawned thread currently.
+    _inner: Arc<Mutex<AudioStream<P>>>,
 }
 
 impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
     /// Create a new `RodioSourceAdapter` from an `AudioStream`.
     ///
-    /// The adapter takes ownership of the stream and wraps it internally for thread-safe access.
+    /// This spawns a background thread that pulls `AudioMsg` from the stream and forwards PCM to
+    /// the adapter.
     ///
-    /// # Arguments
-    /// * `stream` - AudioStream to adapt for rodio
+    /// # Panics
+    /// Panics if the adapter can't determine an initial `AudioSpec` within the timeout.
+    /// (This should not happen for normal streams.)
     pub fn new(stream: AudioStream<P>) -> Self {
-        tracing::info!("RodioSourceAdapter::new called");
+        Self::new_with_behavior(stream, EmptyBehavior::default())
+    }
+
+    /// Create a new adapter with a custom empty-buffer behavior.
+    pub fn new_with_behavior(stream: AudioStream<P>, empty_behavior: EmptyBehavior) -> Self {
+        // Bounded queue to prevent unbounded growth if rodio is slow.
+        // Each message is a batch of interleaved PCM samples.
+        let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(16);
+
         let inner = Arc::new(Mutex::new(stream));
-        let cur_spec = inner.lock().unwrap().spec();
-        tracing::info!(
-            "RodioSourceAdapter: current spec: sample_rate={}, channels={}",
-            cur_spec.sample_rate,
-            cur_spec.channels
-        );
 
-        // Spawn background refill thread which pulls PCM in chunks and sends to a channel.
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
-        let inner_cloned = Arc::clone(&inner);
-        std::thread::spawn(move || {
-            tracing::info!("RodioSourceAdapter: background refill thread started");
-            let chunk_len = 4096usize;
-            let mut total_samples = 0;
-            let mut total_reads = 0;
-            let mut zero_reads = 0;
-            let mut first_samples_logged = false;
-            loop {
-                let mut buf = vec![0.0f32; chunk_len];
-                // Pull from AudioStream; if no data right now, back off briefly to avoid busy spin.
-                let n = inner_cloned.lock().unwrap().read_interleaved(&mut buf);
-                total_reads += 1;
-                if n > 0 {
-                    total_samples += n;
+        // Determine initial spec by pulling the first audio frame on the background thread,
+        // then sending it through a one-shot channel.
+        let (spec_tx, spec_rx) = mpsc::sync_channel::<AudioSpec>(1);
 
-                    // Log first successful read
-                    if !first_samples_logged {
-                        tracing::info!(
-                            "RodioSourceAdapter: FIRST READ - got {} samples after {} reads ({} zero reads)",
-                            n,
-                            total_reads,
-                            zero_reads
-                        );
-                        first_samples_logged = true;
-                    }
+        let eof = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eof_thread = eof.clone();
+        let inner_thread = inner.clone();
 
-                    if total_samples % 40960 == 0 {
-                        // Log every ~1 second at 48kHz
-                        tracing::info!(
-                            "RodioSourceAdapter: read {} samples total ({} reads, {} zero reads)",
-                            total_samples,
-                            total_reads,
-                            zero_reads
-                        );
-                    }
-                    match tx.send(buf[..n].to_vec()) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!(
-                                "RodioSourceAdapter: failed to send chunk to main thread: {}",
-                                e
-                            );
+        let thread = std::thread::spawn(move || {
+            // Create a tokio runtime in this thread so we can await the async `AudioStream`.
+            // (Rodio `Source` is sync; we bridge via this runtime + channel.)
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!("RodioSourceAdapter: failed to build tokio runtime: {}", e);
+                    eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            rt.block_on(async move {
+                // Pull messages from the audio stream and forward PCM batches to rodio.
+                // We also capture the first `AudioSpec` we see.
+                let mut sent_spec = false;
+
+                // We need to own a mutable reference to the stream to call `.next().await`.
+                // The stream itself implements `Stream<Item = AudioMsg>`.
+                let mut stream_guard = inner_thread
+                    .lock()
+                    .expect("RodioSourceAdapter: inner stream mutex poisoned");
+
+                loop {
+                    // Use the dedicated async API; it does not require `AudioStream<P>: Unpin`.
+                    let msg = stream_guard.next_msg().await;
+                    match msg {
+                        Some(AudioMsg::Frame(frame)) => {
+                            if !sent_spec {
+                                // First frame determines rodio output spec.
+                                let _ = spec_tx.send(frame.spec);
+                                sent_spec = true;
+                            }
+
+                            // Backpressure: block when rodio is behind.
+                            if tx.send(frame.pcm).is_err() {
+                                // Consumer dropped; stop thread.
+                                tracing::info!(
+                                    "RodioSourceAdapter: PCM consumer dropped; stopping"
+                                );
+                                break;
+                            }
+                        }
+                        Some(AudioMsg::Control(AudioControl::FormatChanged { spec })) => {
+                            // Rodio requires stable spec; ignore further format changes.
+                            // We still want to set initial spec if we haven't yet.
+                            if !sent_spec {
+                                let _ = spec_tx.send(spec);
+                                sent_spec = true;
+                            }
+                        }
+                        Some(AudioMsg::Control(AudioControl::EndOfStream)) => {
+                            eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                        None => {
+                            // Stream ended/dropped.
+                            eof_thread.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
                     }
-                } else {
-                    zero_reads += 1;
-                    if zero_reads % 500 == 0 {
-                        tracing::warn!(
-                            "RodioSourceAdapter: {} consecutive zero reads from AudioStream",
-                            zero_reads
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-            }
-            tracing::info!("RodioSourceAdapter: background refill thread exiting");
+            });
         });
 
+        // Wait for initial spec to be reported.
+        // Keep this small; if stream can't produce spec quickly it likely won't play anyway.
+        let spec = match spec_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(spec) => spec,
+            Err(_) => {
+                // Default fallback; but per our contract we panic because rodio needs stable spec.
+                // If you want a non-panicking behavior, change this to a Result-returning ctor.
+                panic!("RodioSourceAdapter: failed to determine initial AudioSpec from stream");
+            }
+        };
+
         Self {
-            inner,
-            cur_spec,
-            rx,
+            spec,
             pending: Vec::with_capacity(4096),
             cursor: 0,
+            rx,
+            eof,
+            empty_behavior,
+            _thread: Some(thread),
+            _inner: inner,
         }
     }
 
@@ -125,9 +205,20 @@ impl<P: StorageProvider + 'static> RodioSourceAdapter<P> {
         self.pending.clear();
         self.cursor = 0;
 
-        // Non-blocking receive from background thread.
-        if let Ok(chunk) = self.rx.try_recv() {
-            self.pending = chunk;
+        match self.rx.try_recv() {
+            Ok(chunk) => {
+                self.pending = chunk;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Nothing available right now.
+                match self.empty_behavior {
+                    EmptyBehavior::YieldSilence => {}
+                    EmptyBehavior::SleepAndYieldSilence(d) => std::thread::sleep(d),
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Producer stopped; we'll check eof in `next()`.
+            }
         }
     }
 }
@@ -137,16 +228,21 @@ impl<P: StorageProvider + 'static> Iterator for RodioSourceAdapter<P> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor >= self.pending.len() {
-            // Non-blocking: single attempt to fetch a new chunk.
             self.refill();
         }
 
         if self.cursor < self.pending.len() {
             let s = self.pending[self.cursor];
             self.cursor += 1;
-            Some(s)
+            return Some(s);
+        }
+
+        // No buffered PCM right now.
+        if self.eof.load(std::sync::atomic::Ordering::Relaxed) {
+            // End-of-stream: stop producing samples.
+            None
         } else {
-            // No data available right now; emit silence without blocking.
+            // Keep rodio alive by yielding silence.
             Some(0.0)
         }
     }
@@ -158,11 +254,11 @@ impl<P: StorageProvider + 'static> Source for RodioSourceAdapter<P> {
     }
 
     fn channels(&self) -> u16 {
-        self.cur_spec.channels
+        self.spec.channels
     }
 
     fn sample_rate(&self) -> u32 {
-        self.cur_spec.sample_rate
+        self.spec.sample_rate
     }
 
     fn total_duration(&self) -> Option<Duration> {

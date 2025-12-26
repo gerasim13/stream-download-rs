@@ -195,24 +195,26 @@ fn audio_hls_abr_downswitch_under_network_shaping(
             obs.variant_changed_events
         );
 
-        // Applied: we must see HlsSegmentStart for at least one of the downswitch targets.
-        let applied = down_targets.iter().any(|t| {
-            obs.hls_segment_starts
-                .iter()
-                .any(|(variant, _seq)| variant == t)
-        });
+        // Applied (data-driven): we must see ordered frames tagged with at least one downswitch target.
+        //
+        // This avoids relying on out-of-band `PlayerEvent::HlsSegmentStart`, which is not ordered
+        // with PCM and can be missed/observed earlier/later than the actual decoded frames.
+        let applied = down_targets
+            .iter()
+            .any(|t| obs.observed_hls_variants_from_frames.iter().any(|v| v == t));
 
         assert!(
             applied,
-            "expected downswitch to be applied (HlsSegmentStart for a downswitch target). down_targets={:?} hls_segment_starts={:?} variant_changed_events={:?}",
+            "expected downswitch to be applied (observed frames from a downswitch target variant). down_targets={:?} observed_hls_variants_from_frames={:?} hls_segment_starts={:?} variant_changed_events={:?}",
             down_targets,
+            obs.observed_hls_variants_from_frames,
             obs.hls_segment_starts,
             obs.variant_changed_events
         );
     });
 }
 
-/// Upswitch: start from the lowest variant, make that variant's media segments slow, and assert that:
+/// Upswitch: start from a given (non-max) variant, make that variant's media segments slow, and assert that:
 /// - we observe at least one non-initial ABR decision to a *higher* variant
 /// - and that higher variant is actually applied (we see HlsSegmentStart for it)
 #[rstest]
@@ -226,15 +228,45 @@ fn audio_hls_abr_upswitch_under_network_shaping(#[case] start_variant_index: usi
         // - Under "fast network" conditions, ABR should eventually upswitch to some higher variant.
         //
         // NOTE:
-        // This test intentionally avoids adding artificial delays. Upswitch is triggered by the
-        // ABR throughput estimate improving beyond the current variant's bandwidth.
+        // This test uses deterministic per-file throttling to ensure the initially selected
+        // (lower) variant is "slow enough" to trigger an ABR upswitch, while higher variants are
+        // served fast. This avoids flakiness from relying on naturally improving throughput.
         assert!(
             start_variant_index < 3,
             "upswitch test requires a non-max start variant (got {})",
             start_variant_index
         );
 
-        let (mut stream, _server) = AudioFixture::audio_stream_hls_real_assets(
+        // Throttle only the *starting* variant's media segments (m4s) to deterministically force an
+        // upswitch decision, while leaving all other variants "fast".
+        //
+        // Assets naming convention in `../assets/hls/`:
+        // - segment-{N}-slq-a1.m4s
+        // - segment-{N}-smq-a1.m4s
+        // - segment-{N}-shq-a1.m4s
+        // - segment-{N}-slossless-a1.m4s
+        let start_variant_tag = match start_variant_index {
+            0 => "slq",
+            1 => "smq",
+            2 => "shq",
+            _ => unreachable!("upswitch test requires start_variant_index < 3"),
+        };
+
+        let mut per_file_delay: HashMap<String, Duration> = HashMap::new();
+
+        // Add a modest but consistent delay to the starting variant's segments.
+        // (Delay is applied per 16KB chunk by the assets server fixture.)
+        //
+        // We cover the first few segments; ABR should have enough samples to upswitch well before
+        // 90s elapse.
+        for n in 1..=12 {
+            per_file_delay.insert(
+                format!("hls/segment-{}-{}-a1.m4s", n, start_variant_tag),
+                Duration::from_millis(250),
+            );
+        }
+
+        let (mut stream, server) = AudioFixture::audio_stream_hls_real_assets(
             server_addr(),
             AudioSettings::default(),
             {
@@ -254,14 +286,14 @@ fn audio_hls_abr_upswitch_under_network_shaping(#[case] start_variant_index: usi
                 s
             },
             None,
-            None,
+            Some(per_file_delay),
         )
         .await;
 
         let obs = AudioFixture::drive_and_observe(
             &mut stream,
             Duration::from_secs(90),
-            16384,
+            262144,
             || 0usize,
         )
         .await;
@@ -303,28 +335,42 @@ fn audio_hls_abr_upswitch_under_network_shaping(#[case] start_variant_index: usi
             })
             .collect();
 
-        assert!(
-            !up_targets.is_empty(),
-            "expected at least one non-initial upswitch decision (VariantChanged.to > from) from start_variant_index={}. VariantChanged history={:?} hls_segment_starts={:?}",
-            start_variant_index,
-            obs.variant_changed_events,
-            obs.hls_segment_starts
-        );
+        if up_targets.is_empty() {
+            let request_seq = server.request_seq();
+            let request_log = server.request_log_snapshot().await;
 
-        // Applied: we must see HlsSegmentStart for at least one of the upswitch targets.
-        let applied = up_targets.iter().any(|t| {
-            obs.hls_segment_starts
-                .iter()
-                .any(|(variant, _seq)| variant == t)
-        });
+            panic!(
+                "expected at least one non-initial upswitch decision (VariantChanged.to > from) from start_variant_index={}. VariantChanged history={:?} hls_segment_starts={:?} server_request_seq={} server_request_log={:?}",
+                start_variant_index,
+                obs.variant_changed_events,
+                obs.hls_segment_starts,
+                request_seq,
+                request_log
+            );
+        }
 
-        assert!(
-            applied,
-            "expected upswitch to be applied (HlsSegmentStart for an upswitch target). start_variant_index={} up_targets={:?} hls_segment_starts={:?} variant_changed_events={:?}",
-            start_variant_index,
-            up_targets,
-            obs.hls_segment_starts,
-            obs.variant_changed_events
-        );
+        // Applied (data-driven): we must see ordered frames tagged with at least one upswitch target.
+        //
+        // This avoids relying on out-of-band `PlayerEvent::HlsSegmentStart`, which is not ordered
+        // with PCM and can be missed/observed earlier/later than the actual decoded frames.
+        let applied = up_targets
+            .iter()
+            .any(|t| obs.observed_hls_variants_from_frames.iter().any(|v| v == t));
+
+        if !applied {
+            let request_seq = server.request_seq();
+            let request_log = server.request_log_snapshot().await;
+
+            panic!(
+                "expected upswitch to be applied (observed frames from an upswitch target variant). start_variant_index={} up_targets={:?} observed_hls_variants_from_frames={:?} hls_segment_starts={:?} variant_changed_events={:?} server_request_seq={} server_request_log={:?}",
+                start_variant_index,
+                up_targets,
+                obs.observed_hls_variants_from_frames,
+                obs.hls_segment_starts,
+                obs.variant_changed_events,
+                request_seq,
+                request_log
+            );
+        }
     });
 }

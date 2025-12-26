@@ -1,9 +1,16 @@
 /*!
 Public API types and traits for the `stream-download-audio` crate.
 
-This module defines the stable, high-level interfaces exposed to users of the
-crate. Implementation details (pipeline, backends, adapters, etc.) live in
-separate modules; `lib.rs` should primarily re-export items from here.
+Design goals
+------------
+This crate follows the same high-level style as `stream-download-hls`:
+
+- **Ordered data stream**: callers consume an ordered stream of `AudioMsg` (PCM + control).
+- **Out-of-band events**: callers can subscribe to `PlayerEvent` for UI/telemetry/diagnostics.
+- **No legacy pull API**: the old `SampleSource`/ring-buffer pull model is removed.
+
+Implementation details (pipeline, backends, adapters, etc.) live in separate modules; `lib.rs`
+should primarily re-export items from here.
 */
 
 use std::time::Duration;
@@ -56,32 +63,71 @@ pub struct AudioSpec {
     pub channels: u16,
 }
 
-/// Trait representing a pull-based source of interleaved f32 PCM frames.
+/// Origin metadata for decoded audio.
 ///
-/// This is the lowest common denominator for integrating with custom players.
-pub trait SampleSource: Send {
-    /// Fill `out` with interleaved f32 samples. Returns the number of f32 written.
-    /// Implementations should be non-blocking or block for short periods.
-    fn read_interleaved(&mut self, out: &mut [f32]) -> usize;
+/// This is best-effort: some backends can provide rich provenance (e.g. HLS segment boundaries),
+/// while others may provide only coarse info or none at all.
+///
+/// The key requirement is that this metadata is **ordered with the PCM** (i.e., it describes where
+/// the audio *came from*), so tests can assert "switch applied" by observing frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioOrigin {
+    /// Decoded from an HLS media segment.
+    Hls {
+        /// Variant index (0-based).
+        variant: usize,
+        /// HLS media sequence number.
+        sequence: u64,
+    },
+    /// Decoded from a non-segmented HTTP resource.
+    ///
+    /// `byte_offset` is best-effort and may be `None` when not tracked.
+    Http { byte_offset: Option<u64> },
+    /// Backend did not provide origin metadata.
+    Unknown,
+}
 
-    /// Current PCM spec.
-    fn spec(&self) -> AudioSpec;
+/// Decoded PCM frame batch.
+///
+/// `pcm` is interleaved f32 samples.
+/// The `spec` describes the format of the samples in this frame batch.
+///
+/// `origin` is ordered with the samples and can be used for strict assertions in tests.
+#[derive(Debug, Clone)]
+pub struct AudioFrame {
+    pub pcm: Vec<f32>,
+    pub spec: AudioSpec,
+    pub origin: AudioOrigin,
+}
 
-    /// Optional seek for VOD sources. Default: unsupported.
-    fn seek(&mut self, _to: Duration) -> std::io::Result<()> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "seek not supported",
-        ))
-    }
+/// Ordered control messages emitted alongside audio frames.
+///
+/// These are part of the ordered `AudioMsg` stream (like `StreamControl` in `stream-download-hls`)
+/// and are intended for strict, deterministic consumer logic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioControl {
+    /// Output spec changed (e.g., after decoder initialization/probing).
+    FormatChanged { spec: AudioSpec },
 
-    /// Whether the source reached end-of-stream.
-    fn is_eof(&self) -> bool {
-        false
-    }
+    /// End of stream reached (no more frames will be emitted).
+    EndOfStream,
+}
+
+/// Ordered audio stream message (data + control).
+///
+/// This is the primary consumption API for `stream-download-audio`.
+#[derive(Debug, Clone)]
+pub enum AudioMsg {
+    /// Decoded audio samples.
+    Frame(AudioFrame),
+    /// Ordered control boundary.
+    Control(AudioControl),
 }
 
 /// High-level player events useful for UI/telemetry.
+///
+/// These events are out-of-band (not ordered with `AudioMsg`), and are best-effort.
+/// For deterministic testing/consumption logic prefer the ordered `AudioMsg` stream.
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Started,
@@ -97,43 +143,37 @@ pub enum PlayerEvent {
     },
 
     /// HLS init segment started for a specific variant.
-    ///
-    /// This is an "application" signal: once you observe this for `variant=to`, the pipeline has
-    /// actually transitioned into fetching/consuming the new variant's init/media boundaries.
     HlsInitStart {
         variant: usize,
     },
 
     /// HLS media segment started for a specific variant.
-    ///
-    /// This is the strongest signal for strict ABR assertions because it is emitted at segment
-    /// boundaries (i.e., when we actually start consuming media for that variant).
     HlsSegmentStart {
         variant: usize,
         sequence: u64,
     },
 
     /// Decoder lifecycle event (creation/recreation).
-    ///
-    /// This replaces the previous `VariantSwitched` event, which was ambiguous: it was emitted
-    /// during decoder initialization (often due to init changes) and did not strictly imply that
-    /// the underlying HLS variant selection had changed.
     DecoderInitialized {
         /// Variant index associated with the packet that triggered (re)initialization, if known.
         variant: Option<usize>,
         reason: DecoderLifecycleReason,
     },
 
+    /// Output format changed.
     FormatChanged {
         sample_rate: u32,
         channels: u16,
         codec: Option<String>,
         container: Option<String>,
     },
+
     BufferLevel {
         decoded_frames: usize,
     },
+
     EndOfStream,
+
     Error {
         message: String,
     },
@@ -155,8 +195,11 @@ pub struct AudioOptions {
     pub target_sample_rate: u32,
     /// Target output channels (e.g., 2 for stereo).
     pub target_channels: u16,
-    /// PCM ring buffer capacity in frames (frame = samples_per_channel for all channels).
-    pub ring_capacity_frames: usize,
+    /// Capacity of the ordered frame buffer in **frames** (not samples).
+    ///
+    /// This is analogous to `stream-download-hls::HlsSettings::prefetch_buffer_size`, but applies
+    /// to decoded audio frames (PCM) rather than bytes.
+    pub frame_buffer_capacity_frames: usize,
     /// Minimal interval between ABR switches when in Auto mode.
     pub abr_min_switch_interval: Duration,
     /// Hysteresis for up-switch decisions in ABR.
@@ -169,7 +212,7 @@ impl Default for AudioOptions {
             selection_mode: SelectionMode::Auto,
             target_sample_rate: 48_000,
             target_channels: 2,
-            ring_capacity_frames: 8192, // ~170ms @ 48kHz
+            frame_buffer_capacity_frames: 8192, // ~170ms @ 48kHz
             abr_min_switch_interval: Duration::from_millis(4000),
             abr_up_hysteresis_ratio: 0.15,
         }
@@ -192,8 +235,8 @@ impl AudioOptions {
         self
     }
 
-    pub fn with_ring_capacity_frames(mut self, capacity: usize) -> Self {
-        self.ring_capacity_frames = capacity;
+    pub fn with_frame_buffer_capacity_frames(mut self, capacity: usize) -> Self {
+        self.frame_buffer_capacity_frames = capacity;
         self
     }
 
