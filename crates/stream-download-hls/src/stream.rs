@@ -225,6 +225,14 @@ impl HlsStream {
         self.event_sender.subscribe()
     }
 
+    /// Returns a clone of the unified command sender used to control the worker.
+    ///
+    /// This is useful for downstream consumers that need to issue commands (seek/variant selection)
+    /// without owning the `HlsStream` value.
+    pub fn command_sender(&self) -> mpsc::Sender<HlsCommand> {
+        self.cmd_sender.clone()
+    }
+
     /// Sends a unified command to the worker.
     #[inline(always)]
     async fn send_cmd(&self, cmd: HlsCommand) -> Result<(), HlsError> {

@@ -1,6 +1,6 @@
 # stream-download-audio
 
-Trait-based, production-oriented audio pipeline for the `stream-download` workspace: decode HTTP or HLS into interleaved `f32` PCM with **codec-switch-safe** behavior, **blocking backpressure** on the producer side, and an optional **rodio adapter**.
+Trait-based audio pipeline for the `stream-download` workspace: decode HTTP or HLS into interleaved `f32` PCM with **codec-switch-safe** behavior, **bounded backpressure** (producer waits, consumer is non-blocking), and an optional **rodio adapter**.
 
 This README is a **specification of the public API and architecture**. It intentionally avoids implementation details and internal module structure.
 
@@ -12,7 +12,7 @@ This README is a **specification of the public API and architecture**. It intent
   - Seamless codec changes (AAC ↔ FLAC) via decoder reinitialization
 - Expose audio as **interleaved `f32` PCM** with predictable buffering semantics.
 - Support **seek by time** (`Duration`) even though underlying streams are `Read + Seek` by bytes.
-- Allow deterministic testing: a consumer can iterate over sample chunks, issue seeks, and validate output.
+- Allow deterministic testing: consume an async `Stream` of PCM chunks, issue commands (seek / HLS variant switch), and validate output.
 
 ## Non-goals (for v1 of this refactor)
 
@@ -31,16 +31,16 @@ You build a single high-level component:
   - `P`: the `StorageProvider` used by `stream-download` (and by `stream-download-hls` storage/caching)
 
 Internally it owns a **trait-based audio source** that:
-1. reads bytes from `S` (`Read + Seek`)
+1. owns/uses `StreamDownload<S, P>` (with `Settings<S>` provided at initialization)
 2. decodes via Symphonia into PCM frames
 3. (optionally in future) processes PCM (DSP/resampling)
 4. sends PCM chunks to a bounded channel
 
 ### Critical buffering semantics
 
-- The pipeline uses a **producer/consumer channel** for PCM chunks.
-- **Producer blocks** when the channel is full (ensures *no sample loss* and preserves alignment).
-- **Consumer never blocks** (it is polled from an audio thread).
+- The pipeline uses a bounded producer/consumer queue for PCM chunks.
+- The **producer waits** when the queue is full (ensures *no sample loss* and preserves alignment).
+- The **consumer is non-blocking**: when no chunk is available, the async stream yields `Pending` (never forces the caller to wait).
 
 This is the core safety property for playback quality: no random dropping of samples and no channel misalignment.
 
@@ -55,7 +55,7 @@ This is the core safety property for playback quality: no random dropping of sam
   - `f32`
   - frame-aligned (`len % channels == 0`)
 
-```/dev/null/stream_download_audio_spec.md#L1-40
+```/dev/null/stream_download_audio_spec.md#L1-60
 pub struct AudioSpec {
     pub sample_rate: u32,
     pub channels: u16,
@@ -67,68 +67,50 @@ pub struct PcmChunk {
 }
 ```
 
+### Commands (seek + HLS-only variant switching)
+
+The high-level component exposes a command channel:
+
+- `Seek(Duration)` is supported by all sources.
+- `SetHlsVariant` is supported only by HLS sources:
+  - HTTP sources ignore or return a not-supported error (implementation choice), but the API exists.
+
+```/dev/null/stream_download_audio_spec.md#L62-90
+pub enum AudioCommand {
+    Seek(std::time::Duration),
+
+    /// Manual variant switch (HLS only).
+    SetHlsVariant { variant: u64 },
+
+    /// Return to ABR/auto selection (HLS only).
+    ClearHlsVariantOverride,
+}
+```
+
 ### Seeking
 
 - The user-facing seek API is **time-based**: `seek(Duration)`.
 - Under the hood:
   - underlying streams support `Read + Seek` by bytes
-  - Symphonia supports accurate seeks by time via the `FormatReader`
-- **HTTP source**: creates a decoder once and seeks within the format reader.
-- **HLS source**: must **recreate the decoder** when variant changes; seeking must therefore be designed to work across decoder recreation.
+  - Symphonia supports seeks by time via the `FormatReader`
+- **HTTP source**: creates `FormatReader/Decoder` once and seeks within the format reader.
+- **HLS source**: recreates `FormatReader/Decoder` on init/variant epoch changes, but always on top of the same `StreamDownload` reader.
 
-Seek is **best-effort**:
-- if seek cannot be performed, the pipeline reports it (via a control message / error, see below) and continues from a sensible state.
+Sample-rate changes are included in `PcmChunk.spec`. In v1, behavior on sample-rate conversion is deferred; the pipeline should call an internal placeholder hook (`todo`) where resampling will later be integrated.
 
-### HLS variant switching
-
-- Variant switches may change codecs and sample formats.
-- On HLS variant change, the source must:
-  - reset decoder state
-  - reinitialize the decoder on the new init segment/epoch
-  - continue emitting PCM chunks without corrupting output
-
----
-
-## Trait-based Sources
-
-The high-level component holds a boxed trait object representing the active source.
-
-The intent is that:
-- `HttpAudioSource` is simple: single decoder lifetime, regular reads/seeks.
-- `HlsAudioSource` is more complex: decoder epochs and reinitialization on variant/init changes.
-
-### Source responsibilities
-
-A source is responsible for:
-- pulling bytes from its underlying `S: Read + Seek`
-- decoding bytes to PCM (`f32`, interleaved)
-- (later) applying processing/resampling
-- producing `PcmChunk`s to the pipeline
-
-The pipeline does **not** want to know whether bytes come from HTTP, HLS, cache, etc.
-
-```/dev/null/stream_download_audio_spec.md#L42-120
+```/dev/null/stream_download_audio_spec.md#L92-150
 pub trait AudioSource: Send {
-    /// Returns the current output spec, if known.
-    /// The spec becomes known after decoder initialization.
     fn output_spec(&self) -> Option<AudioSpec>;
 
-    /// Decode and produce the next chunk of PCM.
-    ///
-    /// - Returns `Ok(Some(chunk))` when PCM is produced.
-    /// - Returns `Ok(None)` when the source reached end-of-stream.
-    /// - Returns `Err` on unrecoverable decode/source failures.
     fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError>;
 
-    /// Best-effort seek by time.
-    ///
-    /// Implementations should use Symphonia time-based seeking when possible.
-    /// For HLS, this may recreate decoder state as needed.
-    fn seek(&mut self, position: std::time::Duration) -> Result<(), AudioError>;
+    fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError>;
 }
 ```
 
-> Note: exact error typing is not fixed by this README; the contract is that errors are explicit and never silently drop samples.
+Notes:
+- `AudioSource` is intentionally synchronous; the high-level pipeline runs it in a worker task.
+- `handle_command` is best-effort. For HTTP sources, HLS-specific commands may be ignored or reported as not supported.
 
 ---
 
@@ -142,34 +124,36 @@ The high-level component is generic over:
 
 This keeps integration with the `stream-download` ecosystem explicit and testable.
 
-```/dev/null/stream_download_audio_spec.md#L122-205
-pub struct AudioPipeline<S, P> {
+```/dev/null/stream_download_audio_spec.md#L152-235
+pub struct AudioStream<S, P> {
     // Owns a trait-based source which itself owns/uses the stream + storage.
     // source: Box<dyn AudioSource>,
 
-    // Producer/consumer channel for PCM chunks.
-    // Producer side blocks when full; consumer side is non-blocking.
+    // Producer/consumer queue for PCM chunks.
+    // Producer waits when full; consumer is polled (non-blocking).
 }
 
-impl<S, P> AudioPipeline<S, P> {
-    /// Spawn the decode/produce worker and return a handle that the audio thread can pull from.
-    pub fn new(stream: S, storage: P, settings: AudioSettings) -> Self;
+impl<S, P> AudioStream<S, P> {
+    /// Spawns the decode/produce worker and returns a non-blocking async stream of PCM chunks.
+    ///
+    /// `settings` is the `stream-download` settings for the underlying stream type `S`.
+    pub async fn new(source: Box<dyn AudioSource>, settings: AudioSettings) -> Result<Self, AudioError>;
 
-    /// Non-blocking consumer: attempts to pop a chunk.
-    /// Returns `None` if no chunk is currently available.
-    pub fn try_next_chunk(&mut self) -> Option<PcmChunk>;
-
-    /// For tests: blocking-ish iterator that yields chunks (may block internally on the worker side).
-    /// This is intended for deterministic testing.
-    pub fn chunks(&mut self) -> impl Iterator<Item = PcmChunk>;
-
-    /// Request a best-effort seek by time.
-    pub fn seek(&mut self, position: std::time::Duration) -> Result<(), AudioError>;
-
-    /// Returns the last known output spec (after decoder init).
     pub fn output_spec(&self) -> Option<AudioSpec>;
+
+    /// Send a command to the worker/source.
+    pub fn command_tx(&self) -> tokio::sync::mpsc::Sender<AudioCommand>;
+}
+
+impl<S, P> futures_util::Stream for AudioStream<S, P> {
+    type Item = Result<PcmChunk, AudioError>;
 }
 ```
+
+Contract:
+- When no data is available, `poll_next` returns `Pending`.
+- On end-of-stream, the stream returns `Ready(None)`.
+- On fatal error, the stream yields `Some(Err(..))` and then terminates.
 
 ### Worker model
 
@@ -217,16 +201,14 @@ Notes:
 
 ## Rodio Adapter (optional feature)
 
-With feature `rodio`, the crate provides an adapter that exposes the pipeline as a `rodio::Source<Item = f32>`.
+With feature `rodio`, the crate provides an adapter that exposes `AudioStream` as a `rodio::Source<Item = f32>`.
 
-Key constraints:
-- rodio pulls samples on an audio thread; the adapter must **not block** that thread.
-- therefore the adapter should:
-  - poll `try_next_chunk()`
-  - use an internal small stash/buffer for partial consumption of a chunk
-  - output silence (or handle underrun explicitly) if desired by policy
+Constraints:
+- rodio pulls samples synchronously.
+- the adapter is expected to drive the async `AudioStream` in a background task and buffer PCM internally.
+- chunk sizes are arbitrary; the adapter must keep a remainder buffer for partial consumption.
 
-```/dev/null/stream_download_audio_spec.md#L242-260
+```/dev/null/stream_download_audio_spec.md#L260-310
 // feature = "rodio"
 pub struct RodioSourceAdapter { /* ... */ }
 
