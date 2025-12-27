@@ -1,8 +1,14 @@
 use std::error::Error;
-use std::time::Duration;
 
 use rodio::{OutputStreamBuilder, Sink};
-use stream_download_audio::{AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter};
+use stream_download::http::HttpStream;
+use stream_download::source::DecodeError;
+use stream_download::storage::temp::TempStorageProvider;
+use stream_download::{Settings, StreamDownload};
+use stream_download_audio::{
+    AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter, TapStorageProvider,
+};
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -22,11 +28,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3".parse()?;
 
     // Decoder/buffering options.
-    // NOTE: these are meaningful units (bytes + samples), not arbitrary fixed sizes.
+    //
+    // `pcm_chunk_frames` controls how many *sample-frames* we batch per `AudioMsg::Pcm`.
+    // Too small => lots of wakeups/overhead on the rodio bridge.
+    // Too large => bursty delivery and higher latency.
+    //
+    // A moderate value tends to work best with rodio for network streams.
     let opts = AudioDecodeOptions::default();
 
+    // In-band control tap (HTTP typically doesn't emit controls, but the API is uniform).
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
+
+    // Build StreamDownload yourself so you can configure storage/settings precisely.
+    let storage = TapStorageProvider::new(TempStorageProvider::default(), ctrl_tx);
+
+    println!("Creating StreamDownload (HTTP)...");
+    let reader = StreamDownload::new::<HttpStream<stream_download::http::reqwest::Client>>(
+        url,
+        storage,
+        Settings::default(),
+    )
+    .await?;
+
     println!("Creating AudioDecodeStream (HTTP)...");
-    let stream = AudioDecodeStream::new_http(url, opts).await?;
+    let stream = AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, opts).await?;
     println!("AudioDecodeStream created.");
 
     // Setup rodio output

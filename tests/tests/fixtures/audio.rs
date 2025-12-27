@@ -7,9 +7,17 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use reqwest::Url;
+use tokio::sync::mpsc;
 
-use stream_download_audio::{AudioControl, AudioDecodeOptions, AudioDecodeStream, AudioMsg};
-use stream_download_hls::HlsSettings;
+use stream_download::http::HttpStream;
+use stream_download::source::DecodeError;
+use stream_download::storage::ProvidesStorageHandle;
+use stream_download::storage::temp::TempStorageProvider;
+use stream_download::{Settings, StreamDownload};
+use stream_download_audio::{
+    AudioControl, AudioDecodeOptions, AudioDecodeStream, AudioMsg, TapStorageProvider,
+};
+use stream_download_hls::{HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams};
 
 #[derive(Debug, Clone)]
 pub struct RequestEntry {
@@ -439,6 +447,10 @@ impl AudioFixture {
     }
 
     /// Construct an `AudioDecodeStream` for progressive HTTP MP3 served by this fixture's server.
+    ///
+    /// This now uses the StreamDownload-first API:
+    /// - build `StreamDownload` (HTTP) with a tapped storage provider to surface in-band controls
+    /// - pass the `StreamDownload` + `StreamControl` receiver into `AudioDecodeStream`
     pub async fn audio_stream_http_mp3(
         &self,
         storage_root: Option<std::path::PathBuf>,
@@ -446,29 +458,83 @@ impl AudioFixture {
     ) -> AudioDecodeStream {
         let url = self.mp3_url();
         let _ = storage_root; // reserved for future storage wiring for HTTP path
+
         let opts = opts.unwrap_or_else(AudioDecodeOptions::default);
 
-        AudioDecodeStream::new_http(url, opts)
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
+        let storage = TapStorageProvider::new(TempStorageProvider::default(), ctrl_tx);
+
+        let reader =
+            match StreamDownload::new::<HttpStream<stream_download::http::reqwest::Client>>(
+                url,
+                storage,
+                Settings::default(),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.decode_error().await;
+                    panic!("failed to create StreamDownload(HTTP MP3): {msg}");
+                }
+            };
+
+        AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, opts)
             .await
             .expect("failed to create AudioDecodeStream(HTTP MP3)")
     }
 
     /// Construct an `AudioDecodeStream` for the real HLS assets served by this fixture's server.
+    ///
+    /// This now uses the StreamDownload-first API:
+    /// - build `StreamDownload` over `stream_download_hls::HlsStream`
+    /// - use `TapStorageProvider` to surface in-band `StreamControl` boundaries (init/media)
+    /// - pass the `StreamDownload` + `StreamControl` receiver into `AudioDecodeStream`
     pub async fn audio_stream_hls_real_assets(
         &self,
         hls_settings: stream_download_hls::HlsSettings,
         storage_root: Option<std::path::PathBuf>,
     ) -> AudioDecodeStream {
         let url = self.hls_master_url();
+        let _ = storage_root; // storage is configured via StreamDownload storage provider
 
-        AudioDecodeStream::new_hls(
-            url,
-            hls_settings,
-            AudioDecodeOptions::default(),
-            storage_root,
-        )
-        .await
-        .expect("failed to create AudioDecodeStream(HLS)")
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(256);
+
+        // Use the HLS segmented persistent storage provider for tests so we can vend a StorageHandle
+        // required by `HlsStreamParams` (for playlist/key caching).
+        //
+        // We still wrap it with `TapStorageProvider` to surface in-band StreamControl boundaries
+        // to the audio layer.
+        let prefetch_bytes = std::num::NonZeroUsize::new(8 * 1024 * 1024).expect("non-zero");
+        let max_cached_streams = std::num::NonZeroUsize::new(10).expect("non-zero");
+
+        let hls_storage_root = std::env::temp_dir().join("stream-download-audio-tests-hls-storage");
+        let hls_storage = HlsPersistentStorageProvider::new_hls_file_tree(
+            hls_storage_root,
+            prefetch_bytes,
+            Some(max_cached_streams),
+        );
+
+        let storage = TapStorageProvider::new(hls_storage, ctrl_tx);
+
+        let storage_handle = storage
+            .storage_handle()
+            .expect("HLS storage provider must vend a StorageHandle");
+
+        let params = HlsStreamParams::new(url, hls_settings, storage_handle);
+
+        let reader =
+            match StreamDownload::new::<HlsStream>(params, storage, Settings::default()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.decode_error().await;
+                    panic!("failed to create StreamDownload(HLS): {msg}");
+                }
+            };
+
+        AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, AudioDecodeOptions::default())
+            .await
+            .expect("failed to create AudioDecodeStream(HLS)")
     }
 
     /// Construct an `AudioDecodeStream` for the real HLS assets served by this fixture's server,
@@ -632,6 +698,10 @@ impl AudioFixture {
                 Ok(Some(AudioMsg::Control(AudioControl::HlsSegmentEnd { id }))) => {
                     ordered_hls_segment_ends.push((id.variant, id.sequence.unwrap_or(0)));
                 }
+                Ok(Some(AudioMsg::Control(AudioControl::SeekFailed { .. }))) => {
+                    // Best-effort signal: ignore in the generic observer loop.
+                    // Tests that care about seek failures should explicitly wait for this control.
+                }
                 Ok(Some(AudioMsg::Control(AudioControl::EndOfStream))) => {
                     saw_end = true;
                     break;
@@ -680,6 +750,8 @@ impl AudioFixture {
 
             match tokio::time::timeout(remaining, stream.next_msg()).await {
                 Ok(Some(AudioMsg::Control(ctrl))) => {
+                    // `SeekFailed` is a best-effort signal and should not break control waits unless
+                    // the predicate explicitly asks for it.
                     if pred(&ctrl) {
                         return Some(ctrl);
                     }
@@ -720,7 +792,7 @@ impl AudioFixture {
                     }
                 }
                 Ok(Some(AudioMsg::Control(_))) => {
-                    // Ignore controls while waiting for PCM.
+                    // Ignore controls (including SeekFailed) while waiting for PCM.
                 }
                 Ok(None) => break,
                 Err(_elapsed) => break,

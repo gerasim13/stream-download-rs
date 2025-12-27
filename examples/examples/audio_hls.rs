@@ -1,10 +1,15 @@
 use std::env;
 use std::error::Error;
-use std::time::Duration;
 
 use rodio::{OutputStreamBuilder, Sink};
-use stream_download_audio::{AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter};
-use stream_download_hls::HlsSettings;
+use stream_download::storage::ProvidesStorageHandle;
+use stream_download::storage::temp::TempStorageProvider;
+use stream_download::{Settings, StreamDownload};
+use stream_download_audio::{
+    AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter, TapStorageProvider,
+};
+use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams};
+use tokio::sync::mpsc;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -35,8 +40,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // NOTE: these values are meaningful units (bytes + samples), not arbitrary fixed sizes.
     let opts = AudioDecodeOptions::default();
 
+    // In-band control tap: required to surface ordered HLS init/media boundaries from stream-download
+    // into the audio layer (without relying on out-of-band events).
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(256);
+
+    // Build StreamDownload over stream-download-hls::HlsStream so you can fully control storage/settings.
+    //
+    // Storage provider:
+    // - we use TempStorageProvider for this example, but you can use any provider you want.
+    // - TapStorageProvider forwards in-band StreamControl messages to `ctrl_rx`.
+    let storage = TapStorageProvider::new(TempStorageProvider::new(), ctrl_tx);
+
+    println!("Creating StreamDownload (HLS)...");
+    let params = HlsStreamParams::new(
+        url,
+        hls_settings,
+        storage.storage_handle().expect("storage handle"),
+    );
+    let reader = StreamDownload::new::<HlsStream>(params, storage, Settings::default()).await?;
+
     println!("Creating AudioDecodeStream (HLS)...");
-    let stream = AudioDecodeStream::new_hls(url, hls_settings, opts, Some(storage_root)).await?;
+    let stream = AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, opts).await?;
     println!("AudioDecodeStream created.");
 
     println!("Setting up Rodio output...");

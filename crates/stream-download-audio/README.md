@@ -1,396 +1,286 @@
 # stream-download-audio
 
-Production-ready audio pipeline for `stream-download`: float PCM source with HLS/HTTP backends, symphonia decoding, processing hooks, and rodio adapter.
+Trait-based, production-oriented audio pipeline for the `stream-download` workspace: decode HTTP or HLS into interleaved `f32` PCM with **codec-switch-safe** behavior, **blocking backpressure** on the producer side, and an optional **rodio adapter**.
 
-**Status: Phase 1.1 Complete** - Core decoding, ABR switching, and format conversion working. Tested with HLS adaptive streaming (AAC/FLAC variant switching).
+This README is a **specification of the public API and architecture**. It intentionally avoids implementation details and internal module structure.
 
-**Goal**: iOS/Android audio player library equivalent to Apple's AVPlayer.
+## Goals
 
-## Highlights
+- Provide an audio layer comparable in spirit to AVPlayer:
+  - HTTP single-file playback
+  - HLS adaptive streaming (ABR/manual switching)
+  - Seamless codec changes (AAC ↔ FLAC) via decoder reinitialization
+- Expose audio as **interleaved `f32` PCM** with predictable buffering semantics.
+- Support **seek by time** (`Duration`) even though underlying streams are `Read + Seek` by bytes.
+- Allow deterministic testing: a consumer can iterate over sample chunks, issue seeks, and validate output.
 
-- **Production-ready HLS adaptive streaming** with smooth codec switching (AAC ↔ FLAC)
-- **Zero sample loss** via blocking backpressure during initialization
-- **Automatic format conversion** using symphonia (i32 FLAC, f32 AAC, i16 MP3 → f32)
-- **Batch-based PCM transfer** for optimal performance
-- **Partial batch buffering** handles frame size mismatches between codecs
-- Pull-based `SampleSource` returning interleaved `f32` PCM
-- High-level `AudioStream<P: StorageProvider>` with unified API
-- Backends:
-  - **HLS** via `stream-download-hls` (ABR tested and working)
-  - **HTTP** via `stream-download` (single resource)
-- Event system for variant switches, format changes, errors
-- Optional `rodio` adapter (feature-gated) for direct playback
-- Explicit processing hooks (`AudioProcessor`) for effects chain
+## Non-goals (for v1 of this refactor)
 
-## Why this crate?
+- Automatic sample-rate conversion / resampling (rubato integration planned).
+- Complex DSP/effects chain (a processing interface exists, but wiring is deferred).
+- Real-time audio callback guarantees. The consumer must not block; the producer may block.
 
-Building a cross-platform audio player for iOS/Android requires:
-- Handling multiple audio formats (AAC, FLAC, MP3, etc.)
-- HLS adaptive streaming with seamless quality switching
-- Proper format conversion between different sample formats
-- Zero audio glitches during variant switches
-- Unified API regardless of source (HLS, HTTP, local file)
+---
 
-This crate solves these problems with a production-ready implementation tested with real-world HLS streams.
+## High-level Design
 
-## Features
+You build a single high-level component:
 
-- `audio` (default): Core audio decoding and pipeline (requires symphonia)
-- `hls`: HLS adaptive streaming support
-- `rodio`: Enable rodio adapter that implements `rodio::Source<Item=f32>`
+- Generic over:
+  - `S`: the underlying stream type (`HlsStream` or `HttpStream` or other compatible stream in the future)
+  - `P`: the `StorageProvider` used by `stream-download` (and by `stream-download-hls` storage/caching)
 
-**Recommended**: Enable `audio`, `hls`, and `rodio` for full functionality.
+Internally it owns a **trait-based audio source** that:
+1. reads bytes from `S` (`Read + Seek`)
+2. decodes via Symphonia into PCM frames
+3. (optionally in future) processes PCM (DSP/resampling)
+4. sends PCM chunks to a bounded channel
 
-## Installation
+### Critical buffering semantics
 
-Add to your `Cargo.toml`:
+- The pipeline uses a **producer/consumer channel** for PCM chunks.
+- **Producer blocks** when the channel is full (ensures *no sample loss* and preserves alignment).
+- **Consumer never blocks** (it is polled from an audio thread).
 
-```toml
-[dependencies]
-stream-download-audio = { version = "0.0.1", path = "../stream-download-audio", features = ["symphonia"] }
+This is the core safety property for playback quality: no random dropping of samples and no channel misalignment.
 
-# Optional: to use the rodio adapter
-stream-download-audio = { version = "0.0.1", path = "../stream-download-audio", features = ["symphonia", "rodio"] }
-```
+---
 
-This crate depends on the sibling crates within the same workspace:
-- `stream-download`
-- `stream-download-hls`
+## Public API: Concepts and Contracts
 
-In this repository they are already wired via path dependencies.
+### PCM types
 
-## Quickstart
+- All PCM delivered to consumers is:
+  - interleaved
+  - `f32`
+  - frame-aligned (`len % channels == 0`)
 
-### HLS Adaptive Streaming with Rodio
-
-```rust
-use rodio::{OutputStreamBuilder, Sink};
-use stream_download_audio::{AudioSettings, AudioStream, RodioSourceAdapter};
-use stream_download_hls::HlsSettings;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = "https://example.com/master.m3u8".parse()?;
-    
-    // Configure audio settings
-    let audio_settings = AudioSettings::default(); // 48kHz stereo
-    
-    // Enable ABR (automatic bitrate switching)
-    let hls_settings = HlsSettings::default(); // ABR enabled by default
-    
-    // Create AudioStream with HLS backend
-    let storage_root = Some(std::env::temp_dir().join("audio-cache"));
-    let stream = AudioStream::new_hls(
-        url,
-        storage_root,
-        audio_settings,
-        hls_settings,
-    ).await;
-    
-    // Setup rodio output
-    let stream_handle = OutputStreamBuilder::open_default_stream()?;
-    let sink = Sink::connect_new(&stream_handle.mixer());
-    
-    // Adapt AudioStream to rodio Source and play
-    let source = RodioSourceAdapter::new(stream);
-    sink.append(source);
-    sink.play();
-    
-    // Play for 60 seconds
-    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    
-    Ok(())
-}
-```
-
-### HTTP Single File
-
-```rust
-use stream_download_audio::{AudioSettings, AudioStream, SampleSource};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let url = "https://example.com/audio.mp3".parse()?;
-    
-    let audio_settings = AudioSettings::default();
-    let stream_settings = stream_download::Settings::default();
-    
-    // Note: HTTP backend needs proper StorageProvider
-    // See examples/audio_hls.rs for working example
-    let mut audio = AudioStream::new_http(
-        url,
-        storage_provider,
-        audio_settings,
-        stream_settings,
-    ).await;
-    
-    // Pull interleaved f32 samples
-    let mut buf = [0.0f32; 1024];
-    let n = audio.pop_chunk(&mut buf);
-    // Feed `buf[..n]` to your audio device...
-    
-    Ok(())
-}
-```
-
-### Subscribe to Events
-
-```rust
-let events = stream.subscribe_events();
-
-tokio::spawn(async move {
-    loop {
-        match events.recv() {
-            Ok(PlayerEvent::VariantSwitched { from, to, reason }) => {
-                println!("Switched from variant {} to {} ({})", from.unwrap_or(0), to, reason);
-            }
-            Ok(PlayerEvent::FormatChanged { sample_rate, channels, .. }) => {
-                println!("Format: {}Hz {}ch", sample_rate, channels);
-            }
-            Ok(PlayerEvent::Error { message }) => {
-                eprintln!("Error: {}", message);
-            }
-            _ => {}
-        }
-    }
-});
-```
-
-## API Overview
-
-### AudioStream<P: StorageProvider>
-
-Generic audio stream supporting multiple backends:
-
-```rust
-// HLS constructor
-pub async fn new_hls(
-    url: Url,
-    storage_root: Option<PathBuf>,
-    audio_settings: AudioSettings,
-    hls_settings: HlsSettings,
-) -> Self
-
-// HTTP constructor
-pub async fn new_http(
-    url: Url,
-    storage_provider: P,
-    audio_settings: AudioSettings,
-    stream_settings: stream_download::Settings,
-) -> Self
-
-// Event subscription
-pub fn subscribe_events(&self) -> kanal::Receiver<PlayerEvent>
-
-// Get current audio spec
-pub fn output_spec(&self) -> AudioSpec
-
-// Pull samples (internal, used by RodioSourceAdapter)
-fn pop_chunk(&mut self, out: &mut [f32]) -> usize
-
-// Clear buffer (useful for seek)
-pub fn clear_buffer(&mut self)
-```
-
-### AudioSettings
-
-```rust
-pub struct AudioSettings {
-    pub target_sample_rate: u32,      // Default: 48000
-    pub target_channels: u16,          // Default: 2 (stereo)
-    pub ring_capacity_frames: usize,   // Default: 8192
-}
-```
-
-### AudioSpec
-
-```rust
+```/dev/null/stream_download_audio_spec.md#L1-40
 pub struct AudioSpec {
     pub sample_rate: u32,
     pub channels: u16,
 }
-```
 
-### PlayerEvent
-
-```rust
-pub enum PlayerEvent {
-    VariantSwitched {
-        from: Option<usize>,
-        to: usize,
-        reason: String,
-    },
-    FormatChanged {
-        sample_rate: u32,
-        channels: u16,
-        codec: Option<String>,
-        container: Option<String>,
-    },
-    Error {
-        message: String,
-    },
-    EndOfStream,
+pub struct PcmChunk {
+    pub spec: AudioSpec,
+    pub pcm: Vec<f32>, // interleaved, length is multiple of channels
 }
 ```
 
-### RodioSourceAdapter (with `rodio` feature)
+### Seeking
 
-```rust
-impl rodio::Source for RodioSourceAdapter {
-    type Item = f32;
-    
-    fn current_frame_len(&self) -> Option<usize>
-    fn channels(&self) -> u16
-    fn sample_rate(&self) -> u32
-    fn total_duration(&self) -> Option<Duration>
+- The user-facing seek API is **time-based**: `seek(Duration)`.
+- Under the hood:
+  - underlying streams support `Read + Seek` by bytes
+  - Symphonia supports accurate seeks by time via the `FormatReader`
+- **HTTP source**: creates a decoder once and seeks within the format reader.
+- **HLS source**: must **recreate the decoder** when variant changes; seeking must therefore be designed to work across decoder recreation.
+
+Seek is **best-effort**:
+- if seek cannot be performed, the pipeline reports it (via a control message / error, see below) and continues from a sensible state.
+
+### HLS variant switching
+
+- Variant switches may change codecs and sample formats.
+- On HLS variant change, the source must:
+  - reset decoder state
+  - reinitialize the decoder on the new init segment/epoch
+  - continue emitting PCM chunks without corrupting output
+
+---
+
+## Trait-based Sources
+
+The high-level component holds a boxed trait object representing the active source.
+
+The intent is that:
+- `HttpAudioSource` is simple: single decoder lifetime, regular reads/seeks.
+- `HlsAudioSource` is more complex: decoder epochs and reinitialization on variant/init changes.
+
+### Source responsibilities
+
+A source is responsible for:
+- pulling bytes from its underlying `S: Read + Seek`
+- decoding bytes to PCM (`f32`, interleaved)
+- (later) applying processing/resampling
+- producing `PcmChunk`s to the pipeline
+
+The pipeline does **not** want to know whether bytes come from HTTP, HLS, cache, etc.
+
+```/dev/null/stream_download_audio_spec.md#L42-120
+pub trait AudioSource: Send {
+    /// Returns the current output spec, if known.
+    /// The spec becomes known after decoder initialization.
+    fn output_spec(&self) -> Option<AudioSpec>;
+
+    /// Decode and produce the next chunk of PCM.
+    ///
+    /// - Returns `Ok(Some(chunk))` when PCM is produced.
+    /// - Returns `Ok(None)` when the source reached end-of-stream.
+    /// - Returns `Err` on unrecoverable decode/source failures.
+    fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError>;
+
+    /// Best-effort seek by time.
+    ///
+    /// Implementations should use Symphonia time-based seeking when possible.
+    /// For HLS, this may recreate decoder state as needed.
+    fn seek(&mut self, position: std::time::Duration) -> Result<(), AudioError>;
 }
 ```
 
-### AudioProcessor (trait for effects)
+> Note: exact error typing is not fixed by this README; the contract is that errors are explicit and never silently drop samples.
 
-```rust
-pub trait AudioProcessor: Send + Sync {
-    fn process(&self, pcm: &mut [f32], spec: AudioSpec) -> Result<(), String>;
+---
+
+## The High-level Component (generic over Stream + Storage)
+
+### Generic parameters
+
+The high-level component is generic over:
+- `S`: the stream implementation (`HlsStream` / `HttpStream`)
+- `P`: the storage provider type used to build and operate the stream
+
+This keeps integration with the `stream-download` ecosystem explicit and testable.
+
+```/dev/null/stream_download_audio_spec.md#L122-205
+pub struct AudioPipeline<S, P> {
+    // Owns a trait-based source which itself owns/uses the stream + storage.
+    // source: Box<dyn AudioSource>,
+
+    // Producer/consumer channel for PCM chunks.
+    // Producer side blocks when full; consumer side is non-blocking.
+}
+
+impl<S, P> AudioPipeline<S, P> {
+    /// Spawn the decode/produce worker and return a handle that the audio thread can pull from.
+    pub fn new(stream: S, storage: P, settings: AudioSettings) -> Self;
+
+    /// Non-blocking consumer: attempts to pop a chunk.
+    /// Returns `None` if no chunk is currently available.
+    pub fn try_next_chunk(&mut self) -> Option<PcmChunk>;
+
+    /// For tests: blocking-ish iterator that yields chunks (may block internally on the worker side).
+    /// This is intended for deterministic testing.
+    pub fn chunks(&mut self) -> impl Iterator<Item = PcmChunk>;
+
+    /// Request a best-effort seek by time.
+    pub fn seek(&mut self, position: std::time::Duration) -> Result<(), AudioError>;
+
+    /// Returns the last known output spec (after decoder init).
+    pub fn output_spec(&self) -> Option<AudioSpec>;
 }
 ```
 
-*Note: Processor interface defined but not yet used in pipeline*
+### Worker model
 
-## Architecture
+- The pipeline runs a worker which repeatedly:
+  - calls `source.next_chunk()`
+  - sends produced `PcmChunk`s into the producer side of the bounded channel
+- The send operation **blocks** when the channel is full.
+- This guarantees:
+  - no silent drops
+  - stable chunk ordering
 
-### PCM Pipeline Flow
+Implementation may use:
+- a dedicated OS thread
+- or a synchronous task within a Tokio runtime
+- or an async task + spawn-blocking bridge
 
-```
-HlsPacketProducer → kanal::bounded_async(Packet) → Decoder Thread
-                                                         ↓
-                                                    Symphonia decode
-                                                         ↓
-                                                    Planar buffers (L/R)
-                                                         ↓
-                                            Automatic format conversion
-                                            (i32→f32, i16→f32, etc.)
-                                                         ↓
-                                                Convert to interleaved
-                                                         ↓
-                                          kanal::bounded(Vec<f32>) [BLOCKING]
-                                                         ↓
-                                              PipelineRunner::pop_chunk
-                                                         ↓
-                                              Partial batch buffer
-                                            (handles frame size mismatches)
-                                                         ↓
-                                              RodioSourceAdapter
-                                                         ↓
-                                                   Rodio Sink
-```
+The contract is the same regardless of runtime strategy.
 
-### Key Design Decisions
+---
 
-1. **Planar decode format**: Symphonia's `copy_to_slice_planar` without type annotation enables automatic format conversion
-2. **Blocking channel (kanal::bounded)**: Prevents sample loss during initialization by blocking decoder when consumer not ready
-3. **Batch transfer**: Sends `Vec<f32>` batches instead of individual samples for performance
-4. **Partial batch buffer**: Preserves remainder when batch size > output buffer (e.g., FLAC 2048 frames vs Rodio 1024 request)
-5. **Generic over StorageProvider**: Flexible storage backends for different use cases
+## Settings
 
-### Backends
+Settings configure buffering and target format constraints.
 
-#### HLS (Production Ready)
-- ✅ ABR tested with real-world streams
-- ✅ Smooth codec switching (AAC ↔ FLAC)
-- ✅ Format conversion handling
-- ✅ Zero sample loss during variant switches
-- Uses `stream-download-hls` for segment fetching
-- Packets contain init segment + media segment
-- Sequence tracking for observability
+```/dev/null/stream_download_audio_spec.md#L207-240
+pub struct AudioSettings {
+    /// Capacity in frames for the producer/consumer buffer.
+    /// Larger values increase latency but reduce risk of underrun.
+    pub ring_capacity_frames: usize,
 
-#### HTTP (Needs Testing)
-- Uses `stream-download` for single resource fetch
-- Same decode pipeline as HLS
-- Seek infrastructure in place but not fully tested
+    /// Target channel count (v1: typically 2).
+    pub target_channels: u16,
 
-## Current Status
-
-### ✅ Phase 1.0: API Refactoring (Completed)
-- Generic `AudioStream<P: StorageProvider>` with unified API
-- `new_http()` and `new_hls()` constructors
-- `AudioSettings` for configuration
-- Event system with `PlayerEvent`
-- Seek infrastructure (command channel ready)
-
-### ✅ Phase 1.1: Critical Bug Fixes (Completed)
-
-**Problems Solved:**
-1. **Timing Issue**: Decoder started immediately but consumer created later → 12 seconds of audio lost
-   - **Solution**: Blocking channel (kanal::bounded) - decoder waits for consumer
-
-2. **Format Conversion**: FLAC (i32) vs AAC (f32) caused speed/pitch glitches
-   - **Solution**: Planar format with automatic conversion via symphonia
-
-3. **Batch Size Mismatch**: FLAC 2048 frames vs Rodio 1024 request → half the samples dropped
-   - **Solution**: Partial batch buffer preserves remainder
-
-4. **Performance**: Individual sample transfer was inefficient
-   - **Solution**: Batch-based transfer with `Vec<f32>`
-
-**Verification:**
-- ✅ Audio starts from beginning (user confirmed)
-- ✅ ABR switching works smoothly (AAC ↔ FLAC)
-- ✅ No glitches during variant switches
-- ✅ Correct playback tempo for all codecs
-
-### 🚧 Phase 1.2: Advanced Testing (Next)
-- HLS variant switching tests
-- Seek functionality testing
-- Error recovery scenarios
-- Performance benchmarks
-- Multi-channel support (>2 channels)
-
-## Known Limitations
-
-- ❌ Resampling not implemented (pass-through only)
-- ❌ Seek not fully tested
-- ❌ HTTP backend needs integration testing
-- ❌ AudioProcessor chain not wired (interface defined)
-- ❌ Maximum 2 channels (stereo) - planar buffers are `[Vec<f32>; 2]`
-- ❌ No background playback support yet
-
-## Roadmap
-
-### Phase 2: iOS/Android Bindings
-- Swift bindings for iOS (uniffi-rs or similar)
-- Kotlin/JNI bindings for Android
-- Platform-specific audio output
-- Background playback support
-
-### Phase 3: AVPlayer Equivalence
-- Playback rate control
-- Playlist management
-- Remote control integration
-- AirPlay support (iOS)
-- Now Playing info
-
-### Future Enhancements
-- Resampling with `rubato` (high-quality, pure-Rust)
-- Multi-channel support (5.1, 7.1)
-- Audio effects pipeline (EQ, compressor, etc.)
-- Gapless playback
-- Crossfade between tracks
-
-## Testing
-
-Run examples:
-```bash
-# HLS adaptive streaming (60 seconds)
-RUST_LOG=info cargo run --example audio_hls --features "audio hls rodio"
-
-# Run tests
-cargo test --features "audio hls"
+    /// Target sample rate.
+    /// In v1 this is a constraint/expectation; resampling is planned.
+    pub target_sample_rate: u32,
+}
 ```
 
-Test files:
-- `tests/audio_fixture.rs` - WAV sine wave generator
-- `tests/audio_tests.rs` - HTTP integration test
-- `tests/audio_hls_tests.rs` - HLS test placeholders
+Notes:
+- v1 focuses on correct decode + correctness under variant changes.
+- resampling and automatic sample-rate conversion are planned (rubato).
+
+---
+
+## Rodio Adapter (optional feature)
+
+With feature `rodio`, the crate provides an adapter that exposes the pipeline as a `rodio::Source<Item = f32>`.
+
+Key constraints:
+- rodio pulls samples on an audio thread; the adapter must **not block** that thread.
+- therefore the adapter should:
+  - poll `try_next_chunk()`
+  - use an internal small stash/buffer for partial consumption of a chunk
+  - output silence (or handle underrun explicitly) if desired by policy
+
+```/dev/null/stream_download_audio_spec.md#L242-260
+// feature = "rodio"
+pub struct RodioSourceAdapter { /* ... */ }
+
+// Implements `rodio::Source<Item = f32>`
+```
+
+---
+
+## Testing philosophy
+
+The design explicitly supports deterministic tests:
+
+- Obtain an iterator over `PcmChunk`s via `chunks()`.
+- Read N chunks, perform `seek(Duration)`, then read more.
+- Validate:
+  - chunk sizes are frame-aligned
+  - output spec is consistent (or changes only when expected)
+  - PCM after seek corresponds to the new position
+
+For HLS:
+- tests should prefer **manual variant switching** for determinism.
+- ABR behavior is heuristic; if tested, it should be driven by controlled network shaping rather than timing assumptions.
+
+---
+
+## Backends
+
+### HTTP
+
+- Single resource.
+- Decoder is created once and read continuously.
+- Seek uses Symphonia time-based seek within the format reader.
+
+### HLS
+
+- Segmented content with potential codec changes across variants.
+- Decoder must be recreated when variant/init epoch changes.
+- Seek must be designed to remain correct across decoder recreation.
+
+---
+
+## Status
+
+This README describes the new trait-based design and contracts.
+
+Next steps (implementation):
+- define the public types and traits
+- implement HTTP source
+- implement HLS source with decoder-epoch handling
+- implement bounded producer/consumer channel semantics
+- implement rodio adapter
+- add deterministic integration tests (HTTP + HLS real assets)
+
+---
 
 ## License
 
