@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
+use std::io::{Read, Seek};
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -18,8 +20,6 @@ use stream_download_hls::{HlsCommand, HlsStream, HlsStreamParams};
 
 #[cfg(feature = "rodio")]
 use std::collections::VecDeque;
-#[cfg(feature = "rodio")]
-use std::sync::{Arc, Mutex};
 #[cfg(feature = "rodio")]
 use std::time::Instant;
 
@@ -137,6 +137,40 @@ pub trait AudioSource: Send + 'static {
     /// HTTP sources may ignore/return `NotSupported` for HLS-only commands.
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError>;
 }
+
+struct DecodeEngine {
+    spec: Option<AudioSpec>,
+}
+
+impl DecodeEngine {
+    fn new() -> Self {
+        Self { spec: None }
+    }
+
+    fn output_spec(&self) -> Option<AudioSpec> {
+        self.spec
+    }
+
+    fn reset(&mut self) {
+        self.spec = None;
+    }
+
+    fn next_chunk<R>(&mut self, _reader: &mut R) -> Result<Option<PcmChunk>, AudioError>
+    where
+        R: Read + Seek,
+    {
+        todo!("decode engine: create/drive a format reader + audio decoder, output interleaved f32")
+    }
+
+    fn seek<R>(&mut self, _reader: &mut R, _position: Duration) -> Result<(), AudioError>
+    where
+        R: Read + Seek,
+    {
+        todo!("decode engine: seek by time via format reader, reset decoder as needed")
+    }
+}
+
+type SharedReader<P> = Arc<Mutex<StreamDownload<P>>>;
 
 /// High-level, non-blocking async stream of decoded PCM chunks.
 ///
@@ -416,8 +450,8 @@ struct HttpAudioSource<P>
 where
     P: StorageProvider,
 {
-    _reader: StreamDownload<P>,
-    spec: Option<AudioSpec>,
+    reader: SharedReader<P>,
+    engine: DecodeEngine,
 }
 
 impl<P> HttpAudioSource<P>
@@ -434,8 +468,8 @@ where
             .map_err(|e| AudioError::Other(format!("{e:?}")))?;
 
         Ok(Self {
-            _reader: reader,
-            spec: None,
+            reader: Arc::new(Mutex::new(reader)),
+            engine: DecodeEngine::new(),
         })
     }
 }
@@ -445,16 +479,26 @@ where
     P: StorageProvider + 'static,
 {
     fn output_spec(&self) -> Option<AudioSpec> {
-        self.spec
+        self.engine.output_spec()
     }
 
     fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
-        todo!("HTTP decode via Symphonia FormatReader/Decoder")
+        let mut guard = self
+            .reader
+            .lock()
+            .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
+        self.engine.next_chunk(&mut *guard)
     }
 
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError> {
         match cmd {
-            AudioCommand::Seek(_pos) => todo!("HTTP seek via Symphonia time-based seek"),
+            AudioCommand::Seek(pos) => {
+                let mut guard = self
+                    .reader
+                    .lock()
+                    .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
+                self.engine.seek(&mut *guard, pos)
+            }
             AudioCommand::SetHlsVariant { .. } => Err(AudioError::NotSupported(
                 "HLS variant switching is not supported for HTTP sources",
             )),
@@ -469,9 +513,9 @@ struct HlsAudioSource<P>
 where
     P: StorageProvider,
 {
-    _reader: StreamDownload<P>,
+    reader: SharedReader<P>,
+    engine: DecodeEngine,
     hls_cmd_tx: mpsc::Sender<HlsCommand>,
-    spec: Option<AudioSpec>,
 }
 
 impl<P> HlsAudioSource<P>
@@ -495,9 +539,9 @@ where
             .map_err(|e| AudioError::Other(format!("{e:?}")))?;
 
         Ok(Self {
-            _reader: reader,
+            reader: Arc::new(Mutex::new(reader)),
+            engine: DecodeEngine::new(),
             hls_cmd_tx,
-            spec: None,
         })
     }
 }
@@ -507,17 +551,27 @@ where
     P: StorageProvider + 'static,
 {
     fn output_spec(&self) -> Option<AudioSpec> {
-        self.spec
+        self.engine.output_spec()
     }
 
     fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
-        todo!("HLS decode via Symphonia with decoder/FormatReader recreation on init/variant epoch")
+        // HLS-specific: on init/variant epoch changes, call `self.engine.reset()`.
+        // Control plumbing will be added via a StorageWriter control tap.
+        let mut guard = self
+            .reader
+            .lock()
+            .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
+        self.engine.next_chunk(&mut *guard)
     }
 
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError> {
         match cmd {
-            AudioCommand::Seek(_pos) => {
-                todo!("HLS seek via Symphonia time-based seek on the current FormatReader")
+            AudioCommand::Seek(pos) => {
+                let mut guard = self
+                    .reader
+                    .lock()
+                    .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
+                self.engine.seek(&mut *guard, pos)
             }
             AudioCommand::SetHlsVariant { variant } => {
                 let _ = self.hls_cmd_tx.try_send(HlsCommand::SetVariant {
