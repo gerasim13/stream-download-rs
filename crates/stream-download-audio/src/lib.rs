@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,6 +20,15 @@ use stream_download::source::SourceStream;
 use stream_download::storage::StorageProvider;
 use stream_download_hls::VariantId;
 use stream_download_hls::{HlsCommand, HlsStream, HlsStreamParams};
+
+use symphonia::core::audio::layouts::CHANNEL_LAYOUT_STEREO;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::Time;
+use symphonia::default::{get_codecs, get_probe};
 
 #[cfg(feature = "rodio")]
 use std::collections::VecDeque;
@@ -62,6 +74,7 @@ pub enum AudioError {
     InvalidPcm(&'static str),
     EndOfStream,
     Io(std::io::Error),
+    Decode(String),
     Other(String),
 }
 
@@ -72,6 +85,7 @@ impl fmt::Display for AudioError {
             Self::InvalidPcm(msg) => write!(f, "invalid pcm: {msg}"),
             Self::EndOfStream => write!(f, "end of stream"),
             Self::Io(e) => write!(f, "{e}"),
+            Self::Decode(msg) => write!(f, "decode error: {msg}"),
             Self::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -138,13 +152,78 @@ pub trait AudioSource: Send + 'static {
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError>;
 }
 
+struct SharedReaderMediaSource<P: StorageProvider> {
+    inner: SharedReader<P>,
+    len: Option<u64>,
+    seek_enabled: Arc<AtomicBool>,
+}
+
+impl<P: StorageProvider> SharedReaderMediaSource<P> {
+    fn new(inner: SharedReader<P>, seek_enabled: Arc<AtomicBool>, len: Option<u64>) -> Self {
+        Self {
+            inner,
+            len,
+            seek_enabled,
+        }
+    }
+}
+
+impl<P> MediaSource for SharedReaderMediaSource<P>
+where
+    P: StorageProvider + 'static,
+{
+    fn is_seekable(&self) -> bool {
+        self.seek_enabled.load(Ordering::Relaxed)
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.len
+    }
+}
+
+impl<P> Read for SharedReaderMediaSource<P>
+where
+    P: StorageProvider + 'static,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader lock poisoned"))?;
+        guard.read(buf)
+    }
+}
+
+impl<P> Seek for SharedReaderMediaSource<P>
+where
+    P: StorageProvider + 'static,
+{
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "reader lock poisoned"))?;
+        guard.seek(pos)
+    }
+}
+
 struct DecodeEngine {
     spec: Option<AudioSpec>,
+    reader: Option<Box<dyn FormatReader>>,
+    decoder: Option<Box<dyn AudioDecoder>>,
+    track_id: Option<u32>,
+    seek_enabled: Arc<AtomicBool>,
 }
 
 impl DecodeEngine {
     fn new() -> Self {
-        Self { spec: None }
+        Self {
+            spec: None,
+            reader: None,
+            decoder: None,
+            track_id: None,
+            seek_enabled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     fn output_spec(&self) -> Option<AudioSpec> {
@@ -153,20 +232,177 @@ impl DecodeEngine {
 
     fn reset(&mut self) {
         self.spec = None;
+        self.reader = None;
+        self.decoder = None;
+        self.track_id = None;
+        self.seek_enabled.store(false, Ordering::Relaxed);
     }
 
-    fn next_chunk<R>(&mut self, _reader: &mut R) -> Result<Option<PcmChunk>, AudioError>
+    fn ensure_open<P>(&mut self, reader: SharedReader<P>) -> Result<(), AudioError>
     where
-        R: Read + Seek,
+        P: StorageProvider + 'static,
     {
-        todo!("decode engine: create/drive a format reader + audio decoder, output interleaved f32")
+        if self.reader.is_some() && self.decoder.is_some() && self.track_id.is_some() {
+            return Ok(());
+        }
+
+        let len = None;
+
+        let media_src = Box::new(SharedReaderMediaSource::new(
+            reader,
+            Arc::clone(&self.seek_enabled),
+            len,
+        ));
+        let mss = MediaSourceStream::new(media_src, Default::default());
+
+        let hint = Hint::new();
+        let probed = get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .map_err(|e| AudioError::Decode(e.to_string()))?;
+
+        self.seek_enabled.store(true, Ordering::Relaxed);
+
+        let reader = probed;
+
+        let track = reader
+            .default_track(TrackType::Audio)
+            .ok_or_else(|| AudioError::Decode("no audio track".into()))?;
+
+        let codec_params = track
+            .codec_params
+            .as_ref()
+            .ok_or_else(|| AudioError::Decode("invalid codec params".into()))?
+            .audio()
+            .ok_or_else(|| AudioError::Decode("invalid audio codec params".into()))?;
+
+        let decoder = get_codecs()
+            .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
+            .map_err(|e| AudioError::Decode(e.to_string()))?;
+
+        let sample_rate = codec_params
+            .sample_rate
+            .ok_or_else(|| AudioError::Decode("missing sample rate".into()))?;
+
+        let channels = codec_params
+            .channels
+            .as_ref()
+            .cloned()
+            .unwrap_or(CHANNEL_LAYOUT_STEREO);
+
+        self.spec = Some(AudioSpec {
+            sample_rate,
+            channels: channels.count() as u16,
+        });
+        self.track_id = Some(track.id);
+        self.decoder = Some(decoder);
+        self.reader = Some(reader);
+
+        Ok(())
     }
 
-    fn seek<R>(&mut self, _reader: &mut R, _position: Duration) -> Result<(), AudioError>
+    fn next_chunk<P>(&mut self, reader: SharedReader<P>) -> Result<Option<PcmChunk>, AudioError>
     where
-        R: Read + Seek,
+        P: StorageProvider + 'static,
     {
-        todo!("decode engine: seek by time via format reader, reset decoder as needed")
+        self.ensure_open(Arc::clone(&reader))?;
+
+        let Some(reader) = self.reader.as_mut() else {
+            return Err(AudioError::Other(
+                "decode engine: missing format reader".into(),
+            ));
+        };
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Err(AudioError::Other("decode engine: missing decoder".into()));
+        };
+
+        let track_id = self
+            .track_id
+            .ok_or_else(|| AudioError::Other("decode engine: missing track id".into()))?;
+
+        loop {
+            match reader.next_packet() {
+                Ok(Some(packet)) => {
+                    if packet.track_id() != track_id {
+                        continue;
+                    }
+
+                    let decoded = decoder
+                        .decode(&packet)
+                        .map_err(|e| AudioError::Decode(e.to_string()))?;
+
+                    let frames = decoded.frames();
+                    if frames == 0 {
+                        continue;
+                    }
+
+                    let spec = self
+                        .spec
+                        .ok_or_else(|| AudioError::Other("decode engine: missing spec".into()))?;
+
+                    let channels = spec.channels as usize;
+                    let mut left = vec![0.0f32; frames];
+                    let mut right = vec![0.0f32; frames];
+
+                    let mut chans: [&mut [f32]; 2] = [&mut left, &mut right];
+                    decoded.copy_to_slice_planar(&mut chans);
+
+                    let mut interleaved = Vec::with_capacity(frames * channels);
+                    if channels == 1 {
+                        interleaved.extend_from_slice(&left[..frames]);
+                    } else {
+                        for i in 0..frames {
+                            interleaved.push(left[i]);
+                            interleaved.push(right[i]);
+                        }
+                    }
+
+                    return Ok(Some(PcmChunk {
+                        spec,
+                        pcm: interleaved,
+                    }));
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(AudioError::Decode(e.to_string())),
+            }
+        }
+    }
+
+    fn seek<P>(&mut self, reader: SharedReader<P>, position: Duration) -> Result<(), AudioError>
+    where
+        P: StorageProvider + 'static,
+    {
+        self.ensure_open(Arc::clone(&reader))?;
+
+        let Some(format_reader) = self.reader.as_mut() else {
+            return Err(AudioError::Other(
+                "decode engine: missing format reader".into(),
+            ));
+        };
+        let Some(decoder) = self.decoder.as_mut() else {
+            return Err(AudioError::Other("decode engine: missing decoder".into()));
+        };
+
+        let time = Time::from(position.as_secs_f64());
+        let r = format_reader.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time,
+                track_id: self.track_id,
+            },
+        );
+
+        match r {
+            Ok(_) => {
+                decoder.reset();
+                Ok(())
+            }
+            Err(e) => Err(AudioError::Decode(e.to_string())),
+        }
     }
 }
 
@@ -483,22 +719,12 @@ where
     }
 
     fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
-        let mut guard = self
-            .reader
-            .lock()
-            .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
-        self.engine.next_chunk(&mut *guard)
+        self.engine.next_chunk(Arc::clone(&self.reader))
     }
 
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError> {
         match cmd {
-            AudioCommand::Seek(pos) => {
-                let mut guard = self
-                    .reader
-                    .lock()
-                    .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
-                self.engine.seek(&mut *guard, pos)
-            }
+            AudioCommand::Seek(pos) => self.engine.seek(Arc::clone(&self.reader), pos),
             AudioCommand::SetHlsVariant { .. } => Err(AudioError::NotSupported(
                 "HLS variant switching is not supported for HTTP sources",
             )),
@@ -557,22 +783,12 @@ where
     fn next_chunk(&mut self) -> Result<Option<PcmChunk>, AudioError> {
         // HLS-specific: on init/variant epoch changes, call `self.engine.reset()`.
         // Control plumbing will be added via a StorageWriter control tap.
-        let mut guard = self
-            .reader
-            .lock()
-            .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
-        self.engine.next_chunk(&mut *guard)
+        self.engine.next_chunk(Arc::clone(&self.reader))
     }
 
     fn handle_command(&mut self, cmd: AudioCommand) -> Result<(), AudioError> {
         match cmd {
-            AudioCommand::Seek(pos) => {
-                let mut guard = self
-                    .reader
-                    .lock()
-                    .map_err(|_| AudioError::Other("reader lock poisoned".into()))?;
-                self.engine.seek(&mut *guard, pos)
-            }
+            AudioCommand::Seek(pos) => self.engine.seek(Arc::clone(&self.reader), pos),
             AudioCommand::SetHlsVariant { variant } => {
                 let _ = self.hls_cmd_tx.try_send(HlsCommand::SetVariant {
                     variant_id: variant,
