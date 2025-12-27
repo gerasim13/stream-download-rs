@@ -1,15 +1,14 @@
 use std::env;
 use std::error::Error;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
+use reqwest::Url;
 use rodio::{OutputStreamBuilder, Sink};
+use stream_download::Settings;
 use stream_download::storage::ProvidesStorageHandle;
-use stream_download::storage::temp::TempStorageProvider;
-use stream_download::{Settings, StreamDownload};
-use stream_download_audio::{
-    AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter, TapStorageProvider,
-};
-use stream_download_hls::{HlsSettings, HlsStream, HlsStreamParams};
-use tokio::sync::mpsc;
+use stream_download_audio::{AudioSettings, AudioStream, RodioSourceAdapter};
+use stream_download_hls::{HlsPersistentStorageProvider, HlsSettings, HlsStream, HlsStreamParams};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
@@ -27,41 +26,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_file(false)
         .init();
 
-    // Example HLS master playlist.
-    let url = "https://stream.silvercomet.top/hls/master.m3u8".parse()?;
+    let url: Url = "https://stream.silvercomet.top/hls/master.m3u8".parse()?;
 
-    // Storage root for persistent HLS caching (playlists, keys, segments).
+    // HLS needs a StorageHandle for playlists/keys caching.
+    //
+    // `TempStorageProvider` does not provide a `StorageHandle`, so for HLS we use a segmented
+    // storage provider that can vend a tree-layout handle.
     let storage_root = env::temp_dir().join("stream-download-audio-hls-example");
+    let storage = HlsPersistentStorageProvider::new_hls_file_tree(
+        storage_root,
+        NonZeroUsize::new(256 * 1024).expect("non-zero prefetch bytes"),
+        None,
+    );
+
+    let storage_handle = storage.storage_handle().expect("storage handle");
 
     // HLS settings (ABR enabled by default).
-    let hls_settings = HlsSettings::default();
+    let hls_settings = Arc::new(HlsSettings::default());
+    let params = HlsStreamParams::new(url, hls_settings, storage_handle);
 
-    // Decoder/buffering options.
-    // NOTE: these values are meaningful units (bytes + samples), not arbitrary fixed sizes.
-    let opts = AudioDecodeOptions::default();
+    // stream-download settings for the underlying HLS stream.
+    let stream_settings: Settings<HlsStream> = Settings::default();
 
-    // In-band control tap: required to surface ordered HLS init/media boundaries from stream-download
-    // into the audio layer (without relying on out-of-band events).
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(256);
+    // Audio buffering/settings.
+    let audio_settings = AudioSettings {
+        queue_capacity_chunks: 8,
+        target_channels: 2,
+        target_sample_rate: 48_000,
+    };
 
-    // Build StreamDownload over stream-download-hls::HlsStream so you can fully control storage/settings.
-    //
-    // Storage provider:
-    // - we use TempStorageProvider for this example, but you can use any provider you want.
-    // - TapStorageProvider forwards in-band StreamControl messages to `ctrl_rx`.
-    let storage = TapStorageProvider::new(TempStorageProvider::new(), ctrl_tx);
-
-    println!("Creating StreamDownload (HLS)...");
-    let params = HlsStreamParams::new(
-        url,
-        hls_settings,
-        storage.storage_handle().expect("storage handle"),
-    );
-    let reader = StreamDownload::new::<HlsStream>(params, storage, Settings::default()).await?;
-
-    println!("Creating AudioDecodeStream (HLS)...");
-    let stream = AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, opts).await?;
-    println!("AudioDecodeStream created.");
+    println!("Creating AudioStream (HLS)...");
+    let stream = AudioStream::new_hls(params, storage, stream_settings, audio_settings).await?;
+    println!("AudioStream created.");
 
     println!("Setting up Rodio output...");
     let stream_handle =

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,6 +15,13 @@ use stream_download::source::SourceStream;
 use stream_download::storage::StorageProvider;
 use stream_download_hls::VariantId;
 use stream_download_hls::{HlsCommand, HlsStream, HlsStreamParams};
+
+#[cfg(feature = "rodio")]
+use std::collections::VecDeque;
+#[cfg(feature = "rodio")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "rodio")]
+use std::time::Instant;
 
 /// Audio output description for produced PCM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +63,27 @@ pub enum AudioError {
     EndOfStream,
     Io(std::io::Error),
     Other(String),
+}
+
+impl fmt::Display for AudioError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSupported(msg) => write!(f, "not supported: {msg}"),
+            Self::InvalidPcm(msg) => write!(f, "invalid pcm: {msg}"),
+            Self::EndOfStream => write!(f, "end of stream"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AudioError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl From<std::io::Error> for AudioError {
@@ -153,6 +182,136 @@ impl<S, P> AudioStream<S, P> {
 
     fn resample_placeholder(&mut self, _chunk: &mut PcmChunk, _settings: &AudioSettings) {
         todo!("rubato-based resampling will be integrated here")
+    }
+}
+
+#[cfg(feature = "rodio")]
+struct RodioBufferState {
+    spec: Option<AudioSpec>,
+    queue: VecDeque<f32>,
+    ended: bool,
+    error: Option<AudioError>,
+    last_progress: Instant,
+}
+
+#[cfg(feature = "rodio")]
+impl RodioBufferState {
+    fn new() -> Self {
+        Self {
+            spec: None,
+            queue: VecDeque::new(),
+            ended: false,
+            error: None,
+            last_progress: Instant::now(),
+        }
+    }
+}
+
+/// `rodio` adapter: drives an `AudioStream` in a background task and exposes it as `rodio::Source`.
+///
+/// - Chunk sizes are arbitrary; this adapter buffers samples and feeds rodio one-by-one.
+/// - If the internal buffer is empty, `next()` returns silence (0.0).
+/// - If the stream ends, `next()` returns `None`.
+#[cfg(feature = "rodio")]
+pub struct RodioSourceAdapter<S, P> {
+    state: Arc<Mutex<RodioBufferState>>,
+    _phantom: PhantomData<fn() -> (S, P)>,
+}
+
+#[cfg(feature = "rodio")]
+impl<S, P> RodioSourceAdapter<S, P>
+where
+    S: 'static,
+    P: 'static,
+{
+    pub fn new(mut stream: AudioStream<S, P>) -> Self {
+        let state = Arc::new(Mutex::new(RodioBufferState::new()));
+        let state_clone = Arc::clone(&state);
+
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        let mut guard = state_clone.lock().expect("rodio buffer lock poisoned");
+                        guard.spec = Some(chunk.spec);
+                        guard.queue.extend(chunk.pcm);
+                        guard.last_progress = Instant::now();
+                    }
+                    Err(e) => {
+                        let mut guard = state_clone.lock().expect("rodio buffer lock poisoned");
+                        guard.error = Some(e);
+                        guard.ended = true;
+                        break;
+                    }
+                }
+            }
+
+            let mut guard = state_clone.lock().expect("rodio buffer lock poisoned");
+            guard.ended = true;
+        });
+
+        Self {
+            state,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn spec(&self) -> Option<AudioSpec> {
+        self.state.lock().ok().and_then(|guard| guard.spec)
+    }
+}
+
+#[cfg(feature = "rodio")]
+impl<S, P> Iterator for RodioSourceAdapter<S, P>
+where
+    S: 'static,
+    P: 'static,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut guard = self.state.lock().expect("rodio buffer lock poisoned");
+
+        if guard.error.is_some() {
+            // End the source on error.
+            return None;
+        }
+
+        if let Some(sample) = guard.queue.pop_front() {
+            return Some(sample);
+        }
+
+        if guard.ended {
+            return None;
+        }
+
+        // Underrun: return silence.
+        Some(0.0)
+    }
+}
+
+#[cfg(feature = "rodio")]
+impl<S, P> rodio::Source for RodioSourceAdapter<S, P>
+where
+    S: 'static,
+    P: 'static,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.spec().map(|s| s.channels).unwrap_or(2)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.spec().map(|s| s.sample_rate).unwrap_or(48_000)
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
     }
 }
 

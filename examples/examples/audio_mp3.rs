@@ -1,14 +1,11 @@
 use std::error::Error;
 
+use reqwest::Url;
 use rodio::{OutputStreamBuilder, Sink};
+use stream_download::Settings;
 use stream_download::http::HttpStream;
-use stream_download::source::DecodeError;
 use stream_download::storage::temp::TempStorageProvider;
-use stream_download::{Settings, StreamDownload};
-use stream_download_audio::{
-    AudioDecodeOptions, AudioDecodeStream, RodioSourceAdapter, TapStorageProvider,
-};
-use tokio::sync::mpsc;
+use stream_download_audio::{AudioSettings, AudioStream, RodioSourceAdapter};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -17,6 +14,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::default()
+                .add_directive("stream_download=info".parse()?)
                 .add_directive("stream_download_audio=info".parse()?)
                 .add_directive(LevelFilter::INFO.into()),
         )
@@ -25,41 +23,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .init();
 
     // Progressive HTTP audio (MP3/AAC/FLAC etc.)
-    let url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3".parse()?;
+    let url: Url = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3".parse()?;
 
-    // Decoder/buffering options.
-    //
-    // `pcm_chunk_frames` controls how many *sample-frames* we batch per `AudioMsg::Pcm`.
-    // Too small => lots of wakeups/overhead on the rodio bridge.
-    // Too large => bursty delivery and higher latency.
-    //
-    // A moderate value tends to work best with rodio for network streams.
-    let opts = AudioDecodeOptions::default();
+    // stream-download settings for the underlying HTTP stream.
+    let stream_settings: Settings<HttpStream<stream_download::http::reqwest::Client>> =
+        Settings::default();
 
-    // In-band control tap (HTTP typically doesn't emit controls, but the API is uniform).
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
+    // Audio buffering/settings.
+    let audio_settings = AudioSettings {
+        queue_capacity_chunks: 8,
+        target_channels: 2,
+        target_sample_rate: 48_000,
+    };
 
-    // Build StreamDownload yourself so you can configure storage/settings precisely.
-    let storage = TapStorageProvider::new(TempStorageProvider::default(), ctrl_tx);
+    // Storage for stream-download buffering.
+    let storage = TempStorageProvider::default();
 
-    println!("Creating StreamDownload (HTTP)...");
-    let reader = StreamDownload::new::<HttpStream<stream_download::http::reqwest::Client>>(
-        url,
-        storage,
-        Settings::default(),
-    )
-    .await?;
+    println!("Creating AudioStream (HTTP)...");
+    let stream = AudioStream::new_http(url, storage, stream_settings, audio_settings).await?;
+    println!("AudioStream created.");
 
-    println!("Creating AudioDecodeStream (HTTP)...");
-    let stream = AudioDecodeStream::new_from_stream_download(reader, ctrl_rx, opts).await?;
-    println!("AudioDecodeStream created.");
-
-    // Setup rodio output
+    println!("Setting up Rodio output...");
     let stream_handle =
         OutputStreamBuilder::open_default_stream().expect("open default audio stream");
     let sink = Sink::connect_new(&stream_handle.mixer());
+    sink.set_volume(0.05);
 
-    // Adapt AudioDecodeStream into a rodio Source and play.
+    println!("Creating RodioSourceAdapter...");
     let source = RodioSourceAdapter::new(stream);
     sink.append(source);
     sink.play();
