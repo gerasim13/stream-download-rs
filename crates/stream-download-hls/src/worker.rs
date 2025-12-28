@@ -22,6 +22,7 @@ use url::Url;
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
 use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 
+use crate::cache::keys::master_hash_from_url;
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
 use crate::manager::apply_middlewares;
@@ -996,9 +997,11 @@ impl HlsStreamWorker {
         cmd_receiver: mpsc::Receiver<HlsCommand>,
         cancel_token: CancellationToken,
         event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-        master_hash: String,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
     ) -> Result<Self, HlsError> {
+        // Identifier used for persistent cache layout:
+        // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
+        let master_hash = master_hash_from_url(&url);
         // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
             settings.request_timeout,

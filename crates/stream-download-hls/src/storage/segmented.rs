@@ -16,12 +16,18 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
+use super::cache_layer::HlsCacheLayer;
+use super::hls_factory::HlsFileTreeSegmentFactory;
+use super::tree_handle::TreeStorageResourceReader;
 use super::{cache_layer, hls_factory};
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl};
+use stream_download::storage::ProvidesStorageHandle;
+use stream_download::storage::StorageHandle;
+use stream_download::storage::StorageResourceReader;
 use stream_download::storage::{
     ContentLength, DynamicLength, SegmentedLength, StorageProvider, StorageWriter,
 };
-use tracing::trace;
+use tracing::{info, trace};
 
 /// Factory for creating one [`StorageProvider`] per chunk.
 pub trait SegmentStorageFactory: Clone + Send + Sync + 'static {
@@ -70,17 +76,13 @@ where
         storage_root: impl Into<PathBuf>,
         prefetch_bytes: NonZeroUsize,
         max_cached_streams: Option<NonZeroUsize>,
-    ) -> SegmentedStorageProvider<cache_layer::HlsCacheLayer<hls_factory::HlsFileTreeSegmentFactory>>
-    {
-        let storage_root: PathBuf = storage_root.into();
-
+    ) -> SegmentedStorageProvider<HlsCacheLayer<HlsFileTreeSegmentFactory>> {
         // Best-effort ensure the root exists up front.
+        let storage_root: PathBuf = storage_root.into();
         let _ = fs::create_dir_all(&storage_root);
 
-        let file_tree =
-            hls_factory::HlsFileTreeSegmentFactory::new(storage_root.clone(), prefetch_bytes);
-
-        let mut factory = cache_layer::HlsCacheLayer::new(file_tree, storage_root.clone());
+        let file_tree = HlsFileTreeSegmentFactory::new(storage_root.clone(), prefetch_bytes);
+        let mut factory = HlsCacheLayer::new(file_tree, storage_root.clone());
         if let Some(max) = max_cached_streams {
             factory = factory.with_max_cached_streams(max);
         }
@@ -88,11 +90,11 @@ where
         SegmentedStorageProvider::new(factory, storage_root)
     }
 
-    /// Override the default logical stream key used by the reader.
-    pub fn with_default_stream_key(mut self, key: ResourceKey) -> Self {
-        self.default_stream_key = key;
-        self
-    }
+    // /// Override the default logical stream key used by the reader.
+    // pub fn with_default_stream_key(mut self, key: ResourceKey) -> Self {
+    //     self.default_stream_key = key;
+    //     self
+    // }
 }
 
 impl<F> StorageProvider for SegmentedStorageProvider<F>
@@ -113,14 +115,14 @@ where
             storage_root: self.storage_root.clone(),
         }));
 
-        // Ensure there is a default stream entry so the reader has a target.
-        {
-            let mut guard = state.write();
-            guard
-                .streams
-                .entry(self.default_stream_key.clone())
-                .or_insert_with(StreamState::<F::Provider>::default);
-        }
+        // // Ensure there is a default stream entry so the reader has a target.
+        // {
+        //     let mut guard = state.write();
+        //     guard
+        //         .streams
+        //         .entry(self.default_stream_key.clone())
+        //         .or_insert_with(StreamState::<F::Provider>::default);
+        // }
 
         let reader = SegmentedReader::<F::Provider> {
             state: state.clone(),
@@ -133,7 +135,7 @@ where
             factory: self.factory,
             current_stream_key: None,
             current_seg_index: None,
-            current_kind: None,
+            // current_kind: None,
         };
 
         Ok((reader, writer))
@@ -146,15 +148,12 @@ where
     }
 }
 
-impl<F> stream_download::storage::ProvidesStorageHandle for SegmentedStorageProvider<F>
+impl<F> ProvidesStorageHandle for SegmentedStorageProvider<F>
 where
     F: SegmentStorageFactory,
 {
-    fn storage_handle(&self) -> Option<stream_download::storage::StorageHandle> {
-        Some(
-            super::tree_handle::TreeStorageResourceReader::new(self.storage_root.clone())
-                .into_handle(),
-        )
+    fn storage_handle(&self) -> Option<StorageHandle> {
+        Some(TreeStorageResourceReader::new(self.storage_root.clone()).into_handle())
     }
 }
 
@@ -167,54 +166,6 @@ where
     resources: HashMap<ResourceKey, Bytes>,
     streams: HashMap<ResourceKey, StreamState<P>>,
     storage_root: PathBuf,
-}
-
-#[cfg(any())]
-struct ResourceFsReader {
-    root: PathBuf,
-}
-
-#[cfg(any())]
-impl StorageResourceReader for ResourceFsReader {
-    fn read(&self, key: &ResourceKey) -> io::Result<Option<Bytes>> {
-        use std::fs;
-
-        let rel = encode_resource_key(key);
-        let path = self.root.join(rel);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = fs::read(path)?;
-        Ok(Some(Bytes::from(data)))
-    }
-}
-
-#[cfg(any())]
-fn encode_resource_key(key: &ResourceKey) -> PathBuf {
-    let mut pb = PathBuf::new();
-    for comp in key.0.split('/') {
-        let clean = sanitize_component(comp);
-        if !clean.is_empty() {
-            pb.push(clean);
-        }
-    }
-    if pb.as_os_str().is_empty() {
-        pb.push("default");
-    }
-    pb
-}
-
-#[cfg(any())]
-fn sanitize_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Per-stream segmented state (sequence of segments, in order).
@@ -334,11 +285,23 @@ where
             return Ok(0);
         }
 
-        // Snapshot segments and their cumulative offsets and available lengths.
-        let (segments, cumulative_starts, total_len) = {
+        // Storage readers in `stream_download` are expected to behave like normal blocking `Read`
+        // handles: returning `Ok(0)` should mean true EOF. For segmented storage, the logical stream
+        // grows over time; therefore, if we're at the current end but the last segment is not yet
+        // finalized, we must NOT return `Ok(0)` (that would look like EOF to consumers).
+        //
+        // We don't have a condvar here (blocking is handled at a higher level via `SourceHandle`),
+        // so the best we can do is surface an "try again later" signal.
+        //
+        // NOTE: If you observe busy-loops at call sites, wire this to the core wait/notify path.
+        let (segments, cumulative_starts, total_len, last_finalized) = {
             let guard = self.state.read();
             let Some(stream) = guard.streams.get(&self.stream_key) else {
-                return Ok(0);
+                // Stream not yet created; treat as "not ready" rather than EOF.
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "segmented stream not yet available",
+                ));
             };
 
             let mut starts = Vec::with_capacity(stream.segments.len());
@@ -350,11 +313,36 @@ where
                 offset = offset.saturating_add(avail);
                 segs.push(seg.clone());
             }
-            (segs, starts, offset)
+
+            let last_finalized = stream
+                .segments
+                .last()
+                .map(|s| s.is_finalized())
+                .unwrap_or(false);
+
+            (segs, starts, offset, last_finalized)
         };
 
-        if segments.is_empty() || self.pos >= total_len {
-            return Ok(0);
+        if segments.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "segmented stream has no segments yet",
+            ));
+        }
+
+        if self.pos >= total_len && !last_finalized {
+            // We must only return `Ok(0)` (true EOF) when the whole logical stream is finished.
+            // For segmented storage, "last segment finalized" is not sufficient to prove that
+            // no more segments will appear later (e.g. more chunks may be created after the
+            // currently-last one).
+            //
+            // So at end-of-available-bytes we always report "not ready" and let the higher level
+            // (`stream_download`'s SourceHandle) block until more bytes become available or the
+            // download completes.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "segmented stream reached current end; awaiting more data or stream completion",
+            ));
         }
 
         // Locate segment for current position.
@@ -394,17 +382,24 @@ where
                 let physical_offset = seg.start_offset.saturating_add(offset_in_seg);
                 inner.seek(SeekFrom::Start(physical_offset))?;
                 let n = inner.read(&mut buf[read_total..read_total + to_read])?;
+
+                if n == 0 {
+                    // If we expected bytes but got none, treat as "not ready" unless this is
+                    // the final segment and it is finalized (true EOF is handled above).
+                    //
+                    // This prevents spurious `Ok(0)` returns that look like EOF to consumers.
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "segment reader returned 0 before stream EOF; bytes not yet readable",
+                    ));
+                }
+
                 read_total += n;
                 local_pos = local_pos.saturating_add(n as u64);
                 trace!(
                     "read {} bytes from segment {} at position {}, total read {}",
                     n, seg_index, local_pos, read_total
                 );
-                if n == 0 {
-                    // Defensive: if inner returned EOF unexpectedly, advance.
-                    seg_index += 1;
-                    continue;
-                }
             }
         }
 
@@ -450,7 +445,7 @@ where
 
     current_stream_key: Option<ResourceKey>,
     current_seg_index: Option<usize>,
-    current_kind: Option<ChunkKind>,
+    // current_kind: Option<ChunkKind>,
 }
 
 impl<F> SegmentedWriter<F>
@@ -531,7 +526,7 @@ where
         stream.segments.push(segment);
         self.current_stream_key = Some(stream_key);
         self.current_seg_index = Some(stream.segments.len() - 1);
-        self.current_kind = Some(kind);
+        // self.current_kind = Some(kind);
         Ok(())
     }
 
@@ -571,14 +566,43 @@ where
 
     fn finalize_current_segment(&mut self, gathered_len: u64) -> io::Result<()> {
         let seg = self.current_segment()?;
+
+        // Use the readable length from the segment reader as the authoritative value.
+        //
+        // We have seen cases where the worker/writer reports one more byte than is actually
+        // readable via the stitched `Read + Seek` view, which causes stalls / EOF-ish behavior
+        // and makes StreamControl accounting exceed real readable bytes.
+        //
+        // Note: the stitched stream exposes only the suffix starting at `start_offset`, so
+        // we must express the chosen gathered length in *underlying segment coordinates*
+        // (reader length includes the full segment resource).
+        let actual_readable = {
+            let mut r = seg.reader.lock();
+            match r.seek(SeekFrom::End(0)) {
+                Ok(end) => end,
+                Err(_) => gathered_len,
+            }
+        };
+
+        let chosen_gathered_len = actual_readable.min(gathered_len);
+
+        if chosen_gathered_len != gathered_len {
+            tracing::warn!(
+                reported_gathered_len = gathered_len,
+                actual_readable_len = actual_readable,
+                start_offset = seg.start_offset,
+                "storage: ChunkEnd gathered_len exceeds readable bytes; clamping to readable length"
+            );
+        }
+
         {
             let mut g = seg.gathered_len.lock();
-            *g = gathered_len;
+            *g = chosen_gathered_len;
         }
 
         trace!(
             "storage: ChunkEnd gathered_len={} (finalizing segment)",
-            gathered_len
+            chosen_gathered_len
         );
 
         if let Some(mut inner) = seg.writer.lock().take() {
@@ -758,10 +782,23 @@ where
                 // - if still writable: use inner writer position
                 // - if finalized: snap to end of segment
                 if let Some(seg) = stream.segments.get(i) {
-                    if let Some(inner) = seg.writer.lock().as_mut() {
-                        let inner_pos = inner.seek(SeekFrom::Current(0))?;
-                        abs = abs.saturating_add(inner_pos);
+                    if seg.writer.lock().is_some() {
+                        // IMPORTANT:
+                        // `stream_download` uses `writer.stream_position()` (implemented via
+                        // `seek(SeekFrom::Current(0))`) to decide which byte ranges are readable
+                        // and to wake blocked reads.
+                        //
+                        // For segmented storage the authoritative "readable so far" value is the
+                        // gathered length (what has actually been written and is expected to be
+                        // readable via the stitched reader), NOT the current cursor position of
+                        // the underlying writer handle (which may advance via seeks or buffering).
+                        //
+                        // If we report cursor position here, core may mark bytes as downloaded and
+                        // unblock readers too early, causing the stitched reader to return `Ok(0)`
+                        // ("EOF-ish") before bytes are actually readable.
+                        abs = abs.saturating_add(seg.available_len());
                     } else {
+                        // Finalized segment: readable length is stable.
                         abs = abs.saturating_add(seg.available_len());
                     }
                 }
@@ -816,7 +853,18 @@ where
                 ..
             } => self.open_new_segment(stream_key, reported_len, kind, filename_hint, start_offset),
 
-            StreamControl::ChunkEnd { gathered_len, .. } => {
+            StreamControl::ChunkEnd {
+                stream_key,
+                kind,
+                sequence,
+                variant,
+                gathered_len,
+                ..
+            } => {
+                info!(
+                    "Chunk end for stream key: {:?}, sequence: {:?}, variant: {:?}, kind: {:?}",
+                    stream_key, sequence, variant, kind
+                );
                 self.finalize_current_segment(gathered_len)
             }
 
@@ -837,25 +885,6 @@ where
 
     fn get_available_ranges_for(
         &mut self,
-        stream_key: &ResourceKey,
-    ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
-        SegmentedWriter::get_available_ranges_for(self, stream_key)
-    }
-}
-
-/// Optional helper method (not part of core traits) to report available ranges for a stream.
-///
-/// This is useful for debugging and for later “smart seek” behaviors.
-/// We keep it as an inherent method so we don't need to change core traits again.
-impl<F> SegmentedWriter<F>
-where
-    F: SegmentStorageFactory,
-{
-    /// Returns a segmented `ContentLength` and a list of available ranges for `stream_key`.
-    ///
-    /// This is used for best-effort introspection (progress/seek planning).
-    pub fn get_available_ranges_for(
-        &self,
         stream_key: &ResourceKey,
     ) -> io::Result<Option<(ContentLength, Vec<Range<u64>>)>> {
         let guard = self.state.read();

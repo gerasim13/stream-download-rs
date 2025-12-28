@@ -11,19 +11,18 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{self, Poll};
 
 use crate::HlsStreamWorker;
-use crate::cache::keys::master_hash_from_url;
 use crate::error::HlsError;
 use crate::parser::{CodecInfo, VariantId};
 use crate::settings::HlsSettings;
 
 use futures_util::Stream;
-use stream_download::source::{SourceStream, StreamControl, StreamMsg};
+use stream_download::source::{SourceStream, StreamMsg};
 use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
 use url::Url;
@@ -112,131 +111,82 @@ impl HlsStreamParams {
 
 pub struct HlsStream {
     /// Receiver for ordered stream messages (data + control).
-    data_receiver: mpsc::Receiver<StreamMsg>,
+    data_rx: mpsc::Receiver<StreamMsg>,
     /// Sender for unified commands to the worker loop.
-    cmd_sender: mpsc::Sender<HlsCommand>,
-    /// Cancellation token for shutdown.
-    cancel_token: CancellationToken,
+    cmd_tx: mpsc::Sender<HlsCommand>,
+    /// Broadcaster for out-of-band stream events.
+    event_tx: broadcast::Sender<StreamEvent>,
     /// Background worker task handle.
     streaming_task: tokio::task::JoinHandle<()>,
-    /// Broadcaster for out-of-band stream events.
-    event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-
+    /// Cancellation token for shutdown.
+    cancel_token: CancellationToken,
     /// Best-effort segmented length snapshot used by `content_length()`.
-    segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
+    segmented_length: Arc<RwLock<SegmentedLength>>,
 }
 
 impl HlsStream {
-    /// Creates a new HLS stream (convenience wrapper around [`Self::new_with_config`]).
-    pub async fn new(
-        url: Url,
-        settings: Arc<crate::HlsSettings>,
-        storage_handle: StorageHandle,
-    ) -> Result<Self, HlsError> {
-        Self::new_with_config(url, settings, storage_handle).await
-    }
-
     /// Creates a new HLS stream and spawns a default [`HlsStreamWorker`].
-    ///
-    /// This is the constructor used by `SourceStream::create`.
-    pub async fn new_with_config(
+    pub async fn new(
         url: Url,
         settings: Arc<HlsSettings>,
         storage_handle: StorageHandle,
     ) -> Result<Self, HlsError> {
         // Create channels for data and commands (bounded data channel provides backpressure).
         let buffer_size = settings.prefetch_buffer_size;
-        let (data_sender, data_receiver) = mpsc::channel::<StreamMsg>(buffer_size);
-        let (cmd_sender, cmd_receiver) = mpsc::channel::<HlsCommand>(8);
+        let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(buffer_size);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<HlsCommand>(8);
+        let (event_tx, _event_rx) = broadcast::channel(64);
         let cancel_token = CancellationToken::new();
-
-        // Event broadcast channel (out-of-band metadata).
-        let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(64);
-
         // Best-effort segmented length snapshot shared with `content_length()`.
-        let segmented_length = Arc::new(std::sync::RwLock::new(SegmentedLength::default()));
-
-        // Identifier used for persistent cache layout:
-        // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-        let master_hash = master_hash_from_url(&url);
+        let segmented_length = Arc::new(RwLock::new(SegmentedLength::default()));
 
         // Construct the default worker (previous behavior).
         let worker = HlsStreamWorker::new(
             url,
             settings,
             storage_handle,
-            data_sender,
-            cmd_receiver,
+            data_tx,
+            cmd_rx,
             cancel_token.clone(),
-            event_sender.clone(),
-            master_hash,
+            event_tx.clone(),
             segmented_length.clone(),
         )
         .await?;
 
-        Self::new_with_worker(
-            data_receiver,
-            cmd_sender,
-            cancel_token,
-            event_sender,
-            segmented_length,
-            worker,
-        )
-    }
-
-    /// Creates an HLS stream by supplying a fully constructed worker.
-    ///
-    /// The provided `worker` must be wired to the channels and cancellation token passed here.
-    pub fn new_with_worker(
-        data_receiver: mpsc::Receiver<StreamMsg>,
-        cmd_sender: mpsc::Sender<HlsCommand>,
-        cancel_token: CancellationToken,
-        event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-        segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
-        worker: HlsStreamWorker,
-    ) -> Result<Self, HlsError> {
+        // Spawn the worker task.
         let streaming_task = tokio::spawn(async move {
             tracing::trace!("HLS streaming task started");
-            let result = worker.run().await;
-
-            if let Err(e) = result {
-                match e {
-                    HlsError::Cancelled => {
-                        tracing::trace!("HLS streaming task cancelled")
-                    }
-                    _ => tracing::error!("HLS streaming loop error: {}", e),
-                }
+            match worker.run().await {
+                Ok(_) => tracing::trace!("HLS streaming task finished"),
+                Err(HlsError::Cancelled) => tracing::trace!("HLS streaming task cancelled"),
+                Err(e) => tracing::error!("HLS streaming loop error: {}", e),
             }
-            tracing::trace!("HLS streaming task finished");
         });
 
         Ok(Self {
-            data_receiver,
-            cmd_sender,
+            data_rx,
+            cmd_tx,
             cancel_token,
             streaming_task,
-            event_sender,
+            event_tx,
             segmented_length,
         })
     }
 
     /// Subscribes to out-of-band stream events.
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<StreamEvent> {
-        self.event_sender.subscribe()
+        self.event_tx.subscribe()
     }
 
     /// Returns a clone of the unified command sender used to control the worker.
-    ///
-    /// This is useful for downstream consumers that need to issue commands (seek/variant selection)
-    /// without owning the `HlsStream` value.
     pub fn command_sender(&self) -> mpsc::Sender<HlsCommand> {
-        self.cmd_sender.clone()
+        self.cmd_tx.clone()
     }
 
     /// Sends a unified command to the worker.
     #[inline(always)]
     async fn send_cmd(&self, cmd: HlsCommand) -> Result<(), HlsError> {
-        self.cmd_sender
+        self.cmd_tx
             .send(cmd)
             .await
             .map_err(|_| HlsError::SeekFailed)?;
@@ -250,11 +200,13 @@ impl HlsStream {
     }
 
     /// Manually selects a variant.
+    #[inline(always)]
     pub async fn set_variant(&self, variant_id: VariantId) -> Result<(), HlsError> {
         self.send_cmd(HlsCommand::SetVariant { variant_id }).await
     }
 
     /// Clears manual variant selection and returns to AUTO (ABR-controlled) selection.
+    #[inline(always)]
     pub async fn clear_variant_override(&self) -> Result<(), HlsError> {
         self.send_cmd(HlsCommand::ClearVariantOverride).await
     }
@@ -325,41 +277,10 @@ impl Stream for HlsStream {
     type Item = io::Result<StreamMsg>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.data_receiver.poll_recv(cx) {
-            Poll::Ready(Some(msg)) => {
-                // Control messages are ordered relative to data and must be forwarded as-is.
-                match &msg {
-                    StreamMsg::Data(bytes) => {
-                        tracing::trace!(
-                            "HlsStream::poll_next: returning Data({} bytes)",
-                            bytes.len()
-                        );
-                    }
-                    StreamMsg::Control(StreamControl::ChunkStart { .. }) => {
-                        tracing::trace!("HlsStream::poll_next: returning Control(ChunkStart)");
-                    }
-                    StreamMsg::Control(StreamControl::ChunkEnd { .. }) => {
-                        tracing::trace!("HlsStream::poll_next: returning Control(ChunkEnd)");
-                    }
-                    StreamMsg::Control(StreamControl::StoreResource { .. }) => {
-                        tracing::trace!("HlsStream::poll_next: returning Control(StoreResource)");
-                    }
-                    StreamMsg::Control(StreamControl::SetDefaultStreamKey { .. }) => {
-                        tracing::trace!(
-                            "HlsStream::poll_next: returning Control(SetDefaultStreamKey)"
-                        );
-                    }
-                }
-                Poll::Ready(Some(Ok(msg)))
-            }
-            Poll::Ready(None) => {
-                tracing::trace!("HlsStream::poll_next: channel closed");
-                Poll::Ready(None)
-            }
-            Poll::Pending => {
-                tracing::trace!("HlsStream::poll_next: no data available, pending");
-                Poll::Pending
-            }
+        match self.data_rx.poll_recv(cx) {
+            Poll::Ready(Some(msg)) => Poll::Ready(Some(Ok(msg))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

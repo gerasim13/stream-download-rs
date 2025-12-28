@@ -8,7 +8,9 @@ use fixtures::setup::SERVER_RT;
 use futures_util::StreamExt;
 use rstest::rstest;
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
-use stream_download_hls::{HlsManager, HlsSettings, NextSegmentDescResult, StreamEvent, VariantId};
+use stream_download_hls::{
+    HlsManager, HlsSettings, MediaStream, NextSegmentDescResult, StreamEvent, VariantId,
+};
 use tokio::sync::mpsc;
 
 mod fixtures;
@@ -2002,7 +2004,7 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             variant_index: usize,
         ) -> (String, Vec<u8>) {
             manager
-                .select_variant(variant_index)
+                .select_variant(VariantId(variant_index))
                 .await
                 .unwrap_or_else(|e| panic!("select variant {variant_index} failed: {e}"));
 

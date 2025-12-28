@@ -161,7 +161,7 @@ impl Default for HlsSettings {
             key_query_params: None,
             #[cfg(feature = "aes-decrypt")]
             key_request_headers: None,
-            prefetch_buffer_size: 2,
+            prefetch_buffer_size: 32,
 
             // ABR defaults
             abr_initial_variant_index: None,

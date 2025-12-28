@@ -32,7 +32,7 @@ pub struct SegmentedLength {
 /// - `gathered`: The actual length of the content after processing (e.g., decryption,
 ///   decompression), or `None` if the final value is not yet known (still being calculated or
 ///   accumulated).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DynamicLength {
     /// The length of the content as reported by the server, for example, via Content-Range header.
     pub reported: u64,

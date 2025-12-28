@@ -3,13 +3,13 @@
 //! Adds ABR-oriented variant selection on top of a [`MediaStream`] and delegates switching to the
 //! wrapped stream (typically [`crate::HlsManager`]).
 
-use self::bandwidth_estimator::BandwidthEstimator;
-use crate::HlsManager;
-use crate::manager::NextSegmentDescResult;
-use crate::parser::{VariantId, VariantStream};
-use crate::{HlsResult, MediaStream};
 use std::time::{Duration, Instant};
 use tracing::debug;
+
+use self::bandwidth_estimator::BandwidthEstimator;
+use crate::manager::NextSegmentDescResult;
+use crate::parser::{VariantId, VariantStream};
+use crate::{HlsManager, HlsResult, MediaStream};
 
 mod bandwidth_estimator;
 mod ewma;
@@ -197,36 +197,12 @@ impl<S: MediaStream> AbrController<S> {
             return Ok(());
         }
 
-        // Current variant bandwidth (bps) if known
-        let current_bw = self
-            .current_variant_id
-            .and_then(|id| variants.iter().find(|v| v.id == id))
-            .and_then(|v| v.bandwidth)
-            .unwrap_or(0) as f64;
-
-        // Estimated available throughput after applying safety factor
+        let current_bw = self.get_current_bandwidth(&variants);
         let estimated_bandwidth = self.bandwidth_estimator.get_estimate();
         let adjusted_bandwidth = estimated_bandwidth * self.config.throughput_safety_factor as f64;
 
-        // Choose the best candidate under adjusted throughput; if none, choose the lowest bandwidth.
-        let (candidate_id, candidate_bw) = {
-            let best_under: Option<&VariantStream> = variants
-                .iter()
-                .filter(|v| v.bandwidth.unwrap_or(0) as f64 <= adjusted_bandwidth)
-                .max_by_key(|v| v.bandwidth);
-
-            if let Some(v) = best_under {
-                (Some(v.id), v.bandwidth.unwrap_or(0) as f64)
-            } else {
-                let min_v = variants.iter().min_by_key(|v| v.bandwidth);
-                if let Some(v) = min_v {
-                    (Some(v.id), v.bandwidth.unwrap_or(0) as f64)
-                } else {
-                    (None, 0.0)
-                }
-            }
-        };
-
+        let (candidate_id, candidate_bw) =
+            self.select_candidate_variant(&variants, adjusted_bandwidth);
         debug!(
             "ABR: current_bw={:.0}bps, est={:.0}bps, adj={:.0}bps, buffer={:.2}s, candidate_bw={:.0}bps, candidate_id={:?}",
             current_bw,
@@ -237,84 +213,170 @@ impl<S: MediaStream> AbrController<S> {
             candidate_id
         );
 
-        // Backoff to avoid oscillations
         let now = Instant::now();
-        let can_switch_time = self
-            .last_switch_instant
-            .map(|t| now.duration_since(t) >= self.config.min_switch_interval)
-            .unwrap_or(true);
-
-        // Buffer driven down-switch urgency
+        let can_switch_time = self.can_switch_now(now);
         let urgent_down = metrics.buffer_seconds < self.config.down_switch_buffer;
 
         if let Some(new_id) = candidate_id {
             if candidate_bw > current_bw {
-                // Consider up-switch only if buffer is healthy (or gating disabled), we have enough headroom,
-                // and we are past the switch backoff interval.
-                let buffer_ok = self.config.min_buffer_for_up_switch <= 0.0
-                    || metrics.buffer_seconds >= self.config.min_buffer_for_up_switch;
-                let headroom_ok = adjusted_bandwidth
-                    >= current_bw * (1.0 + self.config.up_hysteresis_ratio as f64);
-                let up_allowed = buffer_ok && headroom_ok && can_switch_time;
-
-                if up_allowed && Some(new_id) != self.current_variant_id {
-                    debug!(
-                        "ABR: switching UP {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2})",
-                        self.current_variant_id,
-                        new_id,
-                        current_bw,
-                        candidate_bw,
-                        adjusted_bandwidth,
-                        metrics.buffer_seconds
-                    );
-                    self.stream.select_variant(new_id).await?;
-                    self.current_variant_id = Some(new_id);
-                    self.last_switch_instant = Some(now);
-                } else {
-                    debug!(
-                        "ABR: skip UP (buffer_ok={}, headroom_ok={}, can_switch_time={}, same_variant={})",
-                        buffer_ok,
-                        headroom_ok,
-                        can_switch_time,
-                        Some(new_id) == self.current_variant_id
-                    );
-                }
+                self.handle_up_switch(
+                    new_id,
+                    current_bw,
+                    candidate_bw,
+                    adjusted_bandwidth,
+                    metrics.buffer_seconds,
+                    can_switch_time,
+                    now,
+                )
+                .await?;
             } else if candidate_bw < current_bw {
-                // Consider down-switch if buffer is low (urgent) or bandwidth margin suggests it,
-                // respecting backoff unless it's urgent.
-                let margin_ok = adjusted_bandwidth
-                    <= current_bw * (1.0 - self.config.down_hysteresis_ratio as f64);
-                let down_allowed = urgent_down || margin_ok;
-
-                if down_allowed
-                    && (can_switch_time || urgent_down)
-                    && Some(new_id) != self.current_variant_id
-                {
-                    debug!(
-                        "ABR: switching DOWN {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2}, urgent={})",
-                        self.current_variant_id,
-                        new_id,
-                        current_bw,
-                        candidate_bw,
-                        adjusted_bandwidth,
-                        metrics.buffer_seconds,
-                        urgent_down
-                    );
-                    self.stream.select_variant(new_id).await?;
-                    self.current_variant_id = Some(new_id);
-                    self.last_switch_instant = Some(now);
-                } else {
-                    debug!(
-                        "ABR: skip DOWN (margin_ok={}, urgent_down={}, can_switch_time={}, same_variant={})",
-                        margin_ok,
-                        urgent_down,
-                        can_switch_time,
-                        Some(new_id) == self.current_variant_id
-                    );
-                }
-            } // else equal bandwidth: do nothing
+                self.handle_down_switch(
+                    new_id,
+                    current_bw,
+                    candidate_bw,
+                    adjusted_bandwidth,
+                    metrics.buffer_seconds,
+                    urgent_down,
+                    can_switch_time,
+                    now,
+                )
+                .await?;
+            }
+            // equal bandwidth: do nothing
         }
 
+        Ok(())
+    }
+
+    /// Get the bandwidth of the current variant.
+    fn get_current_bandwidth(&self, variants: &[VariantStream]) -> f64 {
+        self.current_variant_id
+            .and_then(|id| variants.iter().find(|v| v.id == id))
+            .and_then(|v| v.bandwidth)
+            .unwrap_or(0) as f64
+    }
+
+    /// Select the best candidate variant based on adjusted bandwidth.
+    fn select_candidate_variant(
+        &self,
+        variants: &[VariantStream],
+        adjusted_bandwidth: f64,
+    ) -> (Option<VariantId>, f64) {
+        // Choose the best candidate under adjusted throughput; if none, choose the lowest bandwidth.
+        let best_under = variants
+            .iter()
+            .filter(|v| v.bandwidth.unwrap_or(0) as f64 <= adjusted_bandwidth)
+            .max_by_key(|v| v.bandwidth);
+
+        if let Some(v) = best_under {
+            (Some(v.id), v.bandwidth.unwrap_or(0) as f64)
+        } else {
+            let min_v = variants.iter().min_by_key(|v| v.bandwidth);
+            min_v
+                .map(|v| (Some(v.id), v.bandwidth.unwrap_or(0) as f64))
+                .unwrap_or((None, 0.0))
+        }
+    }
+
+    /// Check if enough time has passed since the last switch.
+    fn can_switch_now(&self, now: Instant) -> bool {
+        self.last_switch_instant
+            .map(|t| now.duration_since(t) >= self.config.min_switch_interval)
+            .unwrap_or(true)
+    }
+
+    /// Handle up-switch decision and execution.
+    async fn handle_up_switch(
+        &mut self,
+        new_id: VariantId,
+        current_bw: f64,
+        candidate_bw: f64,
+        adjusted_bandwidth: f64,
+        buffer_seconds: f32,
+        can_switch_time: bool,
+        now: Instant,
+    ) -> HlsResult<()> {
+        // Consider up-switch only if buffer is healthy (or gating disabled), we have enough headroom,
+        // and we are past the switch backoff interval.
+        let buffer_ok = self.config.min_buffer_for_up_switch <= 0.0
+            || buffer_seconds >= self.config.min_buffer_for_up_switch;
+        let headroom_ok =
+            adjusted_bandwidth >= current_bw * (1.0 + self.config.up_hysteresis_ratio as f64);
+        let up_allowed = buffer_ok && headroom_ok && can_switch_time;
+
+        if up_allowed && Some(new_id) != self.current_variant_id {
+            debug!(
+                "ABR: switching UP {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2})",
+                self.current_variant_id,
+                new_id,
+                current_bw,
+                candidate_bw,
+                adjusted_bandwidth,
+                buffer_seconds
+            );
+            self.perform_switch(new_id, now).await?;
+        } else {
+            debug!(
+                "ABR: skip UP (buffer_ok={}, headroom_ok={}, can_switch_time={}, same_variant={})",
+                buffer_ok,
+                headroom_ok,
+                can_switch_time,
+                Some(new_id) == self.current_variant_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle down-switch decision and execution.
+    async fn handle_down_switch(
+        &mut self,
+        new_id: VariantId,
+        current_bw: f64,
+        candidate_bw: f64,
+        adjusted_bandwidth: f64,
+        buffer_seconds: f32,
+        urgent_down: bool,
+        can_switch_time: bool,
+        now: Instant,
+    ) -> HlsResult<()> {
+        // Consider down-switch if buffer is low (urgent) or bandwidth margin suggests it,
+        // respecting backoff unless it's urgent.
+        let margin_ok =
+            adjusted_bandwidth <= current_bw * (1.0 - self.config.down_hysteresis_ratio as f64);
+        let down_allowed = urgent_down || margin_ok;
+
+        if down_allowed
+            && (can_switch_time || urgent_down)
+            && Some(new_id) != self.current_variant_id
+        {
+            debug!(
+                "ABR: switching DOWN {:?} -> {:?} (cur_bw={:.0}, cand_bw={:.0}, adj={:.0}, buffer={:.2}, urgent={})",
+                self.current_variant_id,
+                new_id,
+                current_bw,
+                candidate_bw,
+                adjusted_bandwidth,
+                buffer_seconds,
+                urgent_down
+            );
+            self.perform_switch(new_id, now).await?;
+        } else {
+            debug!(
+                "ABR: skip DOWN (margin_ok={}, urgent_down={}, can_switch_time={}, same_variant={})",
+                margin_ok,
+                urgent_down,
+                can_switch_time,
+                Some(new_id) == self.current_variant_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Perform the actual variant switch.
+    async fn perform_switch(&mut self, new_id: VariantId, now: Instant) -> HlsResult<()> {
+        self.stream.select_variant(new_id).await?;
+        self.current_variant_id = Some(new_id);
+        self.last_switch_instant = Some(now);
         Ok(())
     }
 }
@@ -341,7 +403,6 @@ impl AbrController<HlsManager> {
 
         // Run ABR switching logic before asking the manager for the next descriptor.
         self.maybe_switch(&metrics).await?;
-
         self.stream.next_segment_descriptor_nonblocking().await
     }
 }

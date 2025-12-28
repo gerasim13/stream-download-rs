@@ -815,7 +815,16 @@ impl HlsFixture {
         let storage_handle = storage.storage_handle();
         let hls_settings = Arc::new(self.hls_settings.clone());
 
-        let (data_tx, _data_rx) = mpsc::channel::<StreamMsg>(16);
+        let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(16);
+        // Spawn a background task to consume messages from the channel
+        // to prevent it from closing when the receiver is dropped
+        let _drop_guard = tokio::spawn(async move {
+            let mut data_rx = data_rx;
+            while data_rx.recv().await.is_some() {
+                // Just consume messages to keep channel open
+                // Task will exit when sender is dropped and channel closes
+            }
+        });
         let (base_url, mut manager) = self.manager(storage_handle, data_tx).await;
 
         manager
