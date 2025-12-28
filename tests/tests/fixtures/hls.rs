@@ -18,6 +18,7 @@ use stream_download::storage::{
     StorageWriter,
 };
 use stream_download::{Settings, StreamDownload};
+use stream_download_hls::MediaStream;
 use stream_download_hls::{
     AbrConfig, AbrController, HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream,
     HlsStreamParams, HlsStreamWorker, KeyProcessorCallback, ResourceDownloader, VariantId,
@@ -810,7 +811,7 @@ impl HlsFixture {
         storage_kind: HlsFixtureStorageKind,
         initial_variant_index: usize,
         manual_variant_id: Option<VariantId>,
-    ) -> (reqwest::Url, AbrController<HlsManager>) {
+    ) -> (reqwest::Url, (HlsManager, AbrController)) {
         let storage = self.build_storage(storage_kind);
         let storage_handle = storage.storage_handle();
         let hls_settings = Arc::new(self.hls_settings.clone());
@@ -854,20 +855,38 @@ impl HlsFixture {
             min_switch_interval: hls_settings.abr_min_switch_interval,
         };
 
+        // Get variants from manager
+        let variants = manager
+            .master()
+            .expect("manager should have master playlist")
+            .variants
+            .clone();
+
         let mut controller = AbrController::new(
-            manager,
+            variants.clone(),
             abr_cfg,
             manual_variant_id,
             initial_variant_index,
             initial_bandwidth,
         );
 
-        controller
-            .init()
-            .await
-            .expect("failed to initialize abr controller");
+        // If manual mode is active, select the variant in manager
+        if let Some(variant_id) = manual_variant_id {
+            manager
+                .select_variant(variant_id)
+                .await
+                .expect("failed to select initial variant");
+        } else {
+            // Select initial variant for AUTO mode
+            if let Some(variant) = variants.get(initial_variant_index) {
+                manager
+                    .select_variant(variant.id)
+                    .await
+                    .expect("failed to select initial variant");
+            }
+        }
 
-        (base_url, controller)
+        (base_url, (manager, controller))
     }
 
     /// Start the fixture server and build an `HlsStreamWorker` wired to it.

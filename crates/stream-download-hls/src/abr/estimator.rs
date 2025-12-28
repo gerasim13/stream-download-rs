@@ -5,7 +5,7 @@ use super::ewma::Ewma;
 /// The estimator tracks a fast-moving and a slow-moving average and uses the minimum of the two,
 /// so bandwidth drops affect decisions quickly while increases require sustained evidence.
 #[derive(Debug)]
-pub(crate) struct BandwidthEstimator {
+pub struct BandwidthEstimator {
     fast_ewma: Ewma,
     slow_ewma: Ewma,
     bytes_sampled: u64,
@@ -54,12 +54,5 @@ impl BandwidthEstimator {
                 .get_estimate()
                 .min(self.slow_ewma.get_estimate())
         }
-    }
-
-    /// Reset the `BandwidthEstimator` as if there was no sample added yet.
-    pub(crate) fn reset(&mut self) {
-        self.fast_ewma = Ewma::new(Self::FAST_EWMA_HALF_LIFE);
-        self.slow_ewma = Ewma::new(Self::SLOW_EWMA_HALF_LIFE);
-        self.bytes_sampled = 0;
     }
 }

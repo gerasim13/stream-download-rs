@@ -15,7 +15,7 @@ mod storage;
 mod stream;
 mod worker;
 
-pub use crate::abr::{AbrConfig, AbrController, PlaybackMetrics};
+pub use crate::abr::{AbrConfig, AbrController, AbrDecision};
 pub use crate::downloader::HlsByteStream;
 pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
 pub use crate::error::{HlsError, HlsResult};

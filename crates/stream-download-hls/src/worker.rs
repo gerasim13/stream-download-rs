@@ -30,8 +30,11 @@ use crate::stream::StreamEvent;
 
 #[cfg(feature = "aes-decrypt")]
 use crate::Aes128CbcMiddleware;
+use crate::abr::AbrDecision;
 use crate::parser::VariantId;
-use crate::{AbrConfig, AbrController, HlsManager, ResourceDownloader, StreamMiddleware};
+use crate::{
+    AbrConfig, AbrController, HlsManager, MediaStream, ResourceDownloader, StreamMiddleware,
+};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -67,7 +70,8 @@ pub struct HlsStreamWorker {
     cmd_receiver: mpsc::Receiver<HlsCommand>,
     cancel_token: CancellationToken,
     event_sender: tokio::sync::broadcast::Sender<StreamEvent>,
-    controller: AbrController<HlsManager>,
+    manager: HlsManager,
+    controller: AbrController,
     current_position: u64,
     bytes_to_skip: u64,
     retry_delay: std::time::Duration,
@@ -200,13 +204,12 @@ impl HlsStreamWorker {
             self.bytes_to_skip = position - self.current_position;
         } else {
             let (desc, intra) = self
-                .controller
-                .inner_stream_mut()
+                .manager
                 .resolve_position(position)
                 .await
                 .map_err(|_| HlsError::SeekFailed)?;
-            self.controller
-                .inner_stream_mut()
+            // Tell the manager to seek to that descriptor.
+            self.manager
                 .seek_to_descriptor(&desc)
                 .map_err(|_| HlsError::SeekFailed)?;
             self.bytes_to_skip = intra;
@@ -225,8 +228,11 @@ impl HlsStreamWorker {
     /// next descriptor/segment boundary.
     #[instrument(skip(self), fields(variant_id = ?variant_id))]
     async fn apply_set_variant(&mut self, variant_id: VariantId) -> Result<(), HlsError> {
-        self.controller
-            .set_manual(variant_id)
+        self.controller.set_manual(variant_id);
+
+        // Apply the switch to the manager
+        self.manager
+            .select_variant(variant_id)
             .await
             .map_err(|_| HlsError::SeekFailed)?;
 
@@ -276,26 +282,23 @@ impl HlsStreamWorker {
         if let Some(len) = storage_len {
             // Record the observed length to avoid future probes.
             if desc.is_init {
-                self.controller.inner_stream_mut().set_segment_size(0, len);
+                self.manager.set_segment_size(0, len);
             } else {
-                self.controller
-                    .inner_stream_mut()
-                    .set_segment_size(desc.sequence, len);
+                self.manager.set_segment_size(desc.sequence, len);
             }
             return Some(len);
         }
 
         let seg_size_opt = if desc.is_init {
-            self.controller.inner_stream().segment_size(0)
+            self.manager.segment_size(0)
         } else {
-            self.controller.inner_stream().segment_size(desc.sequence)
+            self.manager.segment_size(desc.sequence)
         };
         if let Some(sz) = seg_size_opt {
             Some(sz)
         } else {
             match self
-                .controller
-                .inner_stream_mut()
+                .manager
                 .probe_and_record_segment_size(
                     if desc.is_init { 0 } else { desc.sequence },
                     &desc.uri,
@@ -336,8 +339,7 @@ impl HlsStreamWorker {
             );
 
             let resolved_result = self
-                .controller
-                .inner_stream_mut()
+                .manager
                 .resolve_aes128_cbc_params(
                     desc.key.as_ref(),
                     if desc.is_init {
@@ -742,18 +744,13 @@ impl HlsStreamWorker {
         let stream_res = if self.bytes_to_skip > 0 && !desc.is_init {
             let start = self.bytes_to_skip;
             self.bytes_to_skip = 0;
-            self.controller
-                .inner_stream()
+            self.manager
                 .downloader()
                 .stream_segment_range(&desc.uri, start, None)
                 .await
         } else {
             // Init is always streamed fully.
-            self.controller
-                .inner_stream()
-                .downloader()
-                .stream_segment(&desc.uri)
-                .await
+            self.manager.downloader().stream_segment(&desc.uri).await
         };
 
         match stream_res {
@@ -1072,7 +1069,7 @@ impl HlsStreamWorker {
         master_hash: String,
         segmented_length: Arc<std::sync::RwLock<SegmentedLength>>,
     ) -> Result<Self, HlsError> {
-        // Initialize manager and ABR controller
+        // Initialize manager
         manager
             .load_master()
             .await
@@ -1118,18 +1115,30 @@ impl HlsStreamWorker {
             .as_ref()
             .and_then(|cb| (cb)(master));
 
-        let mut controller = AbrController::new(
-            manager,
+        // Create independent ABR controller
+        let controller = AbrController::new(
+            master.variants.clone(),
             abr_config,
             manual_variant_id,
             initial_variant_index,
             init_bw,
         );
 
-        controller
-            .init()
-            .await
-            .map_err(|e| e.with_context("failed to initialize ABR controller"))?;
+        // If manual mode is active, select the variant in manager
+        if let Some(variant_id) = manual_variant_id {
+            manager
+                .select_variant(variant_id)
+                .await
+                .map_err(|e| e.with_context("failed to select initial variant"))?;
+        } else {
+            // Select initial variant for AUTO mode
+            if let Some(variant) = master.variants.get(initial_variant_index) {
+                manager
+                    .select_variant(variant.id)
+                    .await
+                    .map_err(|e| e.with_context("failed to select initial variant"))?;
+            }
+        }
 
         Ok(Self {
             data_sender,
@@ -1137,6 +1146,7 @@ impl HlsStreamWorker {
             cancel_token,
             storage_handle,
             segmented_length,
+            manager,
             controller,
             current_position: 0,
             bytes_to_skip: 0,
@@ -1152,41 +1162,52 @@ impl HlsStreamWorker {
         let mut last_variant_id: Option<crate::parser::VariantId> = None;
         loop {
             // Get the next descriptor (ABR decision happens inside the controller).
-            // Keep this as a single call to avoid overlapping mutable borrows of `self.controller`.
-            let next_desc = match Self::race_with_cmd(
-                &self.cancel_token,
-                &mut self.cmd_receiver,
-                self.controller.next_segment_descriptor_nonblocking(),
-            )
-            .await?
-            {
-                RaceOutcome::Completed(result) => result,
-                RaceOutcome::Cmd(cmd) => {
-                    match cmd {
+            // Create a future that doesn't borrow self mutably to avoid overlapping borrows.
+            let next_desc = {
+                let cancel_token = &self.cancel_token;
+                let cmd_receiver = &mut self.cmd_receiver;
+                let manager = &mut self.manager;
+                let controller = &mut self.controller;
+
+                let next_desc_future = async {
+                    // Make ABR decision (includes buffer update)
+                    let decision = controller.make_decision();
+
+                    // Apply decision if needed
+                    if let AbrDecision::SwitchTo(variant_id) = decision {
+                        manager.select_variant(variant_id).await?;
+                    }
+
+                    // Get next segment descriptor from manager
+                    manager.next_segment_descriptor_nonblocking().await
+                };
+
+                match Self::race_with_cmd(cancel_token, cmd_receiver, next_desc_future).await? {
+                    RaceOutcome::Completed(result) => result,
+                    RaceOutcome::Cmd(cmd) => match cmd {
                         HlsCommand::Seek { position } => {
                             tracing::trace!(
                                 "HLS streaming loop: received seek to position {}",
                                 position
                             );
-                            self.apply_seek_position(position).await?;
+                            return self.apply_seek_position(position).await;
                         }
                         HlsCommand::SetVariant { variant_id } => {
                             tracing::trace!(
                                 "HLS streaming loop: received SetVariant({:?})",
                                 variant_id
                             );
-                            self.apply_set_variant(variant_id).await?;
+                            return self.apply_set_variant(variant_id).await;
                         }
                         HlsCommand::ClearVariantOverride => {
                             tracing::trace!("HLS streaming loop: received ClearVariantOverride");
-                            self.apply_clear_variant_override().await?;
+                            return self.apply_clear_variant_override().await;
                         }
+                    },
+                    RaceOutcome::ChannelClosed => {
+                        tracing::trace!("HLS stream: command channel closed");
+                        break;
                     }
-                    continue;
-                }
-                RaceOutcome::ChannelClosed => {
-                    tracing::trace!("HLS stream: command channel closed");
-                    break;
                 }
             };
 

@@ -9,7 +9,8 @@ use futures_util::StreamExt;
 use rstest::rstest;
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 use stream_download_hls::{
-    HlsManager, HlsSettings, MediaStream, NextSegmentDescResult, StreamEvent, VariantId,
+    AbrDecision, HlsManager, HlsSettings, MediaStream, NextSegmentDescResult, StreamEvent,
+    VariantId,
 };
 use tokio::sync::mpsc;
 
@@ -1303,7 +1304,8 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
             build_fixture_storage_kind("hls-abr-downswitch", variant_count, "memory");
 
         // Start on variant 1 (higher bandwidth), then force a low throughput sample to push a downswitch.
-        let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 1, None).await;
+        let (_base_url, (mut manager, mut controller)) =
+            fixture.abr_controller(storage_kind, 1, None).await;
 
         assert_eq!(
             controller.current_variant_id(),
@@ -1318,7 +1320,19 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
             Duration::from_millis(4000),
         );
 
-        let desc = controller
+        // Make ABR decision
+        let decision = controller.make_decision();
+
+        // Apply decision if needed
+        if let AbrDecision::SwitchTo(variant_id) = decision {
+            manager
+                .select_variant(variant_id)
+                .await
+                .expect("failed to switch variant");
+        }
+
+        // Get next segment descriptor
+        let desc = manager
             .next_segment_descriptor_nonblocking()
             .await
             .expect("descriptor after throughput drop");
@@ -1339,7 +1353,7 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
         assert_eq!(
             seg.variant_id,
             VariantId(0),
-            "descriptor returned after switch should target variant 0"
+            "segment descriptor should be from variant 0 after downswitch"
         );
         assert!(
             seg.is_init,
@@ -1763,14 +1777,14 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
             });
 
         let storage_kind = build_fixture_storage_kind("hls-abr-upswitch", variant_count, "memory");
-        let (_base_url, mut controller) = fixture.abr_controller(storage_kind, 0, None).await;
+        let (_base_url, (mut manager, mut controller)) = fixture.abr_controller(storage_kind, 0, None).await;
 
         // Drain init + first media segment on variant 0.
-        let first_init = controller
+        let first_init = manager
             .next_segment_descriptor_nonblocking()
             .await
             .expect("descriptor for first init");
-        let first_seg = controller
+        let first_seg = manager
             .next_segment_descriptor_nonblocking()
             .await
             .expect("descriptor for first segment");
@@ -1802,14 +1816,25 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
             Duration::from_millis(100),
         );
 
-        let switched_init = controller
+        // Make ABR decision
+        let decision = controller.make_decision();
+
+        // Apply decision if needed
+        if let AbrDecision::SwitchTo(variant_id) = decision {
+            manager
+                .select_variant(variant_id)
+                .await
+                .expect("failed to switch variant");
+        }
+
+        let switched_init = manager
             .next_segment_descriptor_nonblocking()
             .await
-            .expect("descriptor after upswitch");
-        let switched_seg = controller
+            .expect("descriptor after throughput boost");
+        let switched_seg = manager
             .next_segment_descriptor_nonblocking()
             .await
-            .expect("media descriptor after upswitch");
+            .expect("second descriptor after throughput boost");
 
         let switched_init = match switched_init {
             NextSegmentDescResult::Segment(s) => s,
