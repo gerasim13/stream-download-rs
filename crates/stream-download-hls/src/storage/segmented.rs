@@ -852,24 +852,10 @@ where
                 start_offset,
                 ..
             } => self.open_new_segment(stream_key, reported_len, kind, filename_hint, start_offset),
-
-            StreamControl::ChunkEnd {
-                stream_key,
-                kind,
-                sequence,
-                variant,
-                gathered_len,
-                ..
-            } => {
-                info!(
-                    "Chunk end for stream key: {:?}, sequence: {:?}, variant: {:?}, kind: {:?}",
-                    stream_key, sequence, variant, kind
-                );
+            StreamControl::ChunkEnd { gathered_len, .. } => {
                 self.finalize_current_segment(gathered_len)
             }
-
             StreamControl::StoreResource { key, data } => self.store_resource(key, data),
-
             StreamControl::SetDefaultStreamKey { stream_key } => {
                 // Update the shared default stream key so stitched readers can follow it without
                 // requiring a direct reader-side API call.

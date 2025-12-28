@@ -4,12 +4,13 @@
 //! tagged with [`CacheSource`].
 
 use bytes::Bytes;
+use tracing::trace;
+
 use stream_download::source::ResourceKey;
 use stream_download::storage::StorageHandle;
 
 use crate::downloader::ResourceDownloader;
 use crate::error::{HlsError, HlsResult};
-use tracing::trace;
 
 /// Where returned bytes came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

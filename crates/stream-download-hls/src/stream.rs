@@ -268,7 +268,6 @@ impl SourceStream for HlsStream {
     }
 
     fn supports_seek(&self) -> bool {
-        // HLS supports seeking through command system
         true
     }
 }

@@ -17,14 +17,16 @@ use stream_download::storage::StorageHandle;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
-use crate::cache::keys::{key_key_from_url, master_hash_from_url, playlist_key_from_url};
+use crate::cache::keys::{master_hash_from_url, playlist_key_from_url};
+#[cfg(feature = "aes-decrypt")]
+use crate::crypto::resolver::AesKeyResolver;
 use crate::downloader::HlsByteStream;
 use crate::downloader::ResourceDownloader;
 use crate::downloader::{CacheSource, CachedResourceDownloader};
 use crate::error::{HlsError, HlsResult};
 use crate::parser::{
-    CodecInfo, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist, MediaPlaylist, MediaSegment,
-    SegmentKey, VariantId, VariantStream, parse_master_playlist, parse_media_playlist,
+    CodecInfo, InitSegment, MasterPlaylist, MediaPlaylist, MediaSegment, SegmentKey, VariantId,
+    VariantStream, parse_master_playlist, parse_media_playlist,
 };
 use crate::settings::HlsSettings;
 
@@ -53,17 +55,6 @@ pub trait MediaStream {
 /// Transforms an `HlsByteStream` (object-safe).
 pub trait StreamMiddleware: Send + Sync {
     fn apply(&self, input: HlsByteStream) -> HlsByteStream;
-}
-
-/// Applies middlewares left-to-right (no-op if `middlewares` is empty).
-pub fn apply_middlewares(
-    mut input: HlsByteStream,
-    middlewares: &[Arc<dyn StreamMiddleware>],
-) -> HlsByteStream {
-    for mw in middlewares {
-        input = mw.apply(input);
-    }
-    input
 }
 
 /// A segment yielded by the stream.
@@ -112,7 +103,7 @@ pub struct SegmentData {
 struct PlaylistSnapshot {
     end_list: bool,
     last_seq: u64,
-    target_duration: Option<std::time::Duration>,
+    target_duration: Option<Duration>,
     current_segment: Option<MediaSegment>,
 }
 
@@ -121,9 +112,9 @@ pub struct SegmentDescriptor {
     pub uri: String,
     pub sequence: u64,
     pub is_init: bool,
-    pub duration: std::time::Duration,
+    pub duration: Duration,
     pub variant_id: VariantId,
-    pub codec_info: Option<crate::parser::CodecInfo>,
+    pub codec_info: Option<CodecInfo>,
     pub key: Option<SegmentKey>,
 }
 
@@ -131,7 +122,7 @@ pub struct SegmentDescriptor {
 pub enum NextSegmentDescResult {
     Segment(SegmentDescriptor),
     EndOfStream,
-    NeedsRefresh { wait: std::time::Duration },
+    NeedsRefresh { wait: Duration },
 }
 
 /// High-level handle for a single HLS stream (no network I/O until async methods are called).
@@ -159,8 +150,9 @@ pub struct HlsManager {
     next_segment_index: usize,
     /// Whether init segment has been sent for the current variant.
     init_segment_sent: bool,
-    /// Cache of fetched AES-128 keys by absolute URI.
-    key_cache: HashMap<String, Bytes>,
+    /// AES key resolver for handling AES-128-CBC encryption.
+    #[cfg(feature = "aes-decrypt")]
+    aes_key_resolver: Option<AesKeyResolver>,
     /// Cache of downloaded init segments by absolute URI with LRU eviction.
     init_segment_cache: LruCache<String, Bytes>,
     /// Known sizes (in bytes) of media segments keyed by sequence.
@@ -180,19 +172,27 @@ impl HlsManager {
         let cached_downloader =
             CachedResourceDownloader::new(downloader.clone(), Some(storage_handle));
 
+        #[cfg(feature = "aes-decrypt")]
+        let aes_key_resolver = Some(AesKeyResolver::new(
+            Arc::clone(&config),
+            Arc::new(cached_downloader.clone()),
+            config.key_processor_cb.clone(),
+        ));
+
         Self {
             master_url,
             config,
             downloader,
             cached_downloader,
             control_sender,
+            #[cfg(feature = "aes-decrypt")]
+            aes_key_resolver,
             master: None,
             current_variant_index: None,
             current_media_playlist: None,
             media_playlist_url: None,
             next_segment_index: 0,
             init_segment_sent: false,
-            key_cache: HashMap::new(),
             init_segment_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
             segment_sizes: HashMap::new(),
         }
@@ -267,11 +267,11 @@ impl HlsManager {
             .ok_or_else(|| HlsError::Message("current variant index is out of bounds".to_string()))
     }
 
-    fn current_codec_info(&self) -> HlsResult<Option<crate::parser::CodecInfo>> {
+    fn current_codec_info(&self) -> HlsResult<Option<CodecInfo>> {
         Ok(self.current_variant()?.codec.clone())
     }
 
-    fn current_variant_info(&self) -> HlsResult<(VariantId, Option<crate::parser::CodecInfo>)> {
+    fn current_variant_info(&self) -> HlsResult<(VariantId, Option<CodecInfo>)> {
         let variant = self.current_variant()?;
         Ok((variant.id, variant.codec.clone()))
     }
@@ -326,7 +326,7 @@ impl HlsManager {
     }
 
     /// Return the currently cached master playlist, if any.
-    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<crate::manager::SegmentType>> {
+    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<SegmentType>> {
         let init_opt = self
             .current_media_playlist
             .as_ref()
@@ -348,7 +348,7 @@ impl HlsManager {
                 downloaded
             };
 
-            return Ok(Some(crate::manager::SegmentType::Init(SegmentData {
+            return Ok(Some(SegmentType::Init(SegmentData {
                 data,
                 variant_id,
                 codec_info,
@@ -361,10 +361,7 @@ impl HlsManager {
         Ok(None)
     }
 
-    async fn emit_media_segment(
-        &mut self,
-        seg: MediaSegment,
-    ) -> HlsResult<crate::manager::SegmentType> {
+    async fn emit_media_segment(&mut self, seg: MediaSegment) -> HlsResult<SegmentType> {
         let codec_info = self.current_codec_info()?;
 
         let data = self.download_segment(&seg.uri).await?;
@@ -373,7 +370,7 @@ impl HlsManager {
 
         self.next_segment_index += 1;
 
-        Ok(crate::manager::SegmentType::Media(SegmentData {
+        Ok(SegmentType::Media(SegmentData {
             data,
             variant_id: seg.variant_id,
             codec_info,
@@ -481,109 +478,27 @@ impl HlsManager {
         Ok(self.current_media_playlist.as_ref().unwrap())
     }
 
-    /// Download segment bytes by URI with optional encryption key.
-    #[cfg(feature = "aes-decrypt")]
-    fn finalize_key_url(&self, abs_key_url: &str) -> HlsResult<String> {
-        if let Some(params) = &self.config.key_query_params {
-            let mut url = url::Url::parse(abs_key_url).map_err(HlsError::base_url_parse)?;
-            {
-                let mut qp = url.query_pairs_mut();
-                for (k, v) in params {
-                    qp.append_pair(k, v);
-                }
-            }
-            Ok(url.to_string())
-        } else {
-            Ok(abs_key_url.to_string())
-        }
-    }
-
-    #[cfg(feature = "aes-decrypt")]
-    async fn fetch_key_bytes(&mut self, final_key_url: &str) -> HlsResult<Bytes> {
-        if let Some(cached) = self.key_cache.get(final_key_url) {
-            return Ok(cached.clone());
-        }
-
-        // Variant-scoped key caching:
-        // key path: `<master_hash>/<variant_id>/<key_basename>`
-        let master_hash = master_hash_from_url(&self.master_url);
-        let variant_id = self.current_variant()?.id;
-
-        let key = key_key_from_url(&master_hash, variant_id, final_key_url)
-            .ok_or_else(|| HlsError::Message("unable to derive key basename".to_string()))?;
-
-        let res = self
-            .cached_downloader
-            .download_key_cached(final_key_url, &key)
-            .await?;
-
-        if res.source == CacheSource::Network {
-            self.emit_store_resource(key.clone(), res.bytes.clone())?;
-        }
-
-        let mut kb = res.bytes;
-        if let Some(cb) = &self.config.key_processor_cb {
-            kb = (cb)(kb);
-        }
-
-        if kb.len() != 16 {
-            return Err(HlsError::invalid_aes128_key_len(kb.len()));
-        }
-
-        self.key_cache.insert(final_key_url.to_string(), kb.clone());
-
-        Ok(kb)
-    }
-
-    #[cfg(feature = "aes-decrypt")]
-    fn compute_iv(key_info: &KeyInfo, sequence: Option<u64>) -> [u8; 16] {
-        if let Some(iv) = key_info.iv {
-            iv
-        } else if let Some(seq) = sequence {
-            let mut iv = [0u8; 16];
-            iv[8..].copy_from_slice(&seq.to_be_bytes());
-            iv
-        } else {
-            [0u8; 16]
-        }
-    }
-
-    /// Resolves AES-128-CBC decryption parameters `(key, iv)` for a segment.
-    #[cfg(feature = "aes-decrypt")]
-    pub async fn resolve_aes128_cbc_params(
-        &mut self,
-        key: Option<&SegmentKey>,
-        sequence: Option<u64>,
-    ) -> HlsResult<Option<([u8; 16], [u8; 16])>> {
-        // Use pattern matching to extract all required information in one go
-        let Some(SegmentKey {
-            method: EncryptionMethod::Aes128,
-            key_info: Some(key_info),
-        }) = key
-        else {
-            return Ok(None);
-        };
-
-        let Some(key_uri) = &key_info.uri else {
-            return Ok(None);
-        };
-
-        // Fetch and validate key
-        let abs_key_url = self.resolve_url(key_uri)?;
-        let final_key_url = self.finalize_key_url(&abs_key_url)?;
-        let key_bytes = self.fetch_key_bytes(&final_key_url).await?;
-
-        let mut key_arr = [0u8; 16];
-        key_arr.copy_from_slice(&key_bytes);
-        let iv = Self::compute_iv(key_info, sequence);
-
-        Ok(Some((key_arr, iv)))
-    }
-
     async fn download_segment(&mut self, uri: &str) -> HlsResult<Bytes> {
         let resolved_url = self.resolve_url(uri)?;
         let data = self.downloader.download_bytes(&resolved_url).await?;
         Ok(data)
+    }
+
+    /// Resolve DRM (AES-128-CBC) params for a descriptor if applicable.
+    #[cfg(feature = "aes-decrypt")]
+    pub async fn resolve_drm_params_for_desc(
+        &mut self,
+        desc: &SegmentDescriptor,
+    ) -> HlsResult<Option<([u8; 16], [u8; 16])>> {
+        let variant_id = self.current_variant()?.id;
+        let master_url = self.master_url.as_str().to_string();
+
+        if let Some(resolver) = &mut self.aes_key_resolver {
+            return resolver
+                .resolve_drm_params_for_desc(&master_url, variant_id, desc)
+                .await;
+        }
+        Ok(None)
     }
 
     /// Non-blocking descriptor-based API mirroring `next_segment_nonblocking` logic.

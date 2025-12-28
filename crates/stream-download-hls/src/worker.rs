@@ -16,7 +16,7 @@ use crate::stream::HlsCommand;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{instrument, trace};
+use tracing::instrument;
 use url::Url;
 
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
@@ -25,16 +25,15 @@ use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 use crate::cache::keys::master_hash_from_url;
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
-use crate::manager::apply_middlewares;
 use crate::stream::StreamEvent;
 
 #[cfg(feature = "aes-decrypt")]
 use crate::Aes128CbcMiddleware;
+#[cfg(feature = "aes-decrypt")]
+use crate::StreamMiddleware;
 use crate::abr::AbrDecision;
 use crate::parser::VariantId;
-use crate::{
-    AbrConfig, AbrController, HlsManager, MediaStream, ResourceDownloader, StreamMiddleware,
-};
+use crate::{AbrConfig, AbrController, HlsManager, MediaStream, ResourceDownloader};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -59,6 +58,7 @@ struct SegmentContext {
     plan: SegmentPlan,
     desc: crate::manager::SegmentDescriptor,
     seg_size: Option<u64>,
+    #[cfg(feature = "aes-decrypt")]
     drm_params_opt: Option<([u8; 16], [u8; 16])>,
     init_len_opt: Option<u64>,
     routing: Option<SegmentRouting>,
@@ -88,6 +88,9 @@ pub struct HlsStreamWorker {
 }
 
 impl HlsStreamWorker {
+    const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
     #[inline]
     fn update_last_segment_length(&self, gathered_len: u64) {
         if let Ok(mut guard) = self.segmented_length.write() {
@@ -99,55 +102,6 @@ impl HlsStreamWorker {
             }
         }
     }
-
-    async fn resolve_segment_processing_params(
-        &mut self,
-        desc: &crate::manager::SegmentDescriptor,
-        seg_size: Option<u64>,
-    ) -> Result<(Option<([u8; 16], [u8; 16])>, Option<u64>), HlsError> {
-        // Resolve per-segment DRM params (if any) before building middlewares.
-        //
-        // IMPORTANT:
-        // If a segment advertises an AES-128 key, failure to resolve key/IV MUST abort.
-        // Silently streaming encrypted bytes without a decrypt middleware causes confusing downstream
-        // failures (e.g. "garbage" output and retries) and breaks test expectations.
-        //
-        let drm_params_opt: Option<([u8; 16], [u8; 16])> =
-            self.resolve_drm_params_for_desc(desc).await?;
-
-        // Init length is only meaningful when we stream it "as-is" (no DRM middleware).
-        let init_len_opt = if desc.is_init || drm_params_opt.is_some() {
-            None
-        } else {
-            seg_size
-        };
-
-        Ok((drm_params_opt, init_len_opt))
-    }
-
-    /// Build per-segment middlewares (no self borrow to avoid conflicts).
-    #[inline]
-    fn build_middlewares(
-        drm_params_opt: Option<([u8; 16], [u8; 16])>,
-    ) -> Vec<Arc<dyn StreamMiddleware>> {
-        let mut v: Vec<Arc<dyn StreamMiddleware>> = Vec::new();
-
-        #[cfg(feature = "aes-decrypt")]
-        if let Some((key, iv)) = drm_params_opt {
-            // NOTE: key is sensitive; do NOT log it. IV is safe to log for debugging.
-            trace!(
-                iv = ?iv,
-                "HLS DRM: enabling AES-128-CBC middleware for segment"
-            );
-            v.push(Arc::new(Aes128CbcMiddleware::new(key, iv)));
-        } else {
-            trace!("HLS DRM: no DRM params resolved; streaming segment without DRM middleware");
-        }
-
-        v
-    }
-    const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
     /// Emit events for variant changes and segment boundaries before streaming bytes.
     /// Keeps `run` method concise and standardizes event ordering.
@@ -307,82 +261,6 @@ impl HlsStreamWorker {
             {
                 Ok(s) => s,
                 Err(_) => None,
-            }
-        }
-    }
-
-    /// Resolve DRM (AES-128-CBC) params for a descriptor if applicable.
-    #[instrument(skip(self, desc))]
-    async fn resolve_drm_params_for_desc(
-        &mut self,
-        desc: &crate::manager::SegmentDescriptor,
-    ) -> Result<Option<([u8; 16], [u8; 16])>, HlsError> {
-        #[cfg(not(feature = "aes-decrypt"))]
-        {
-            trace!(
-                is_init = desc.is_init,
-                sequence = desc.sequence,
-                variant_id = desc.variant_id.0,
-                "HLS DRM: aes-decrypt feature disabled; no DRM params will be resolved"
-            );
-            return Ok(None);
-        }
-
-        #[cfg(feature = "aes-decrypt")]
-        {
-            trace!(
-                is_init = desc.is_init,
-                sequence = desc.sequence,
-                variant_id = desc.variant_id.0,
-                has_key = desc.key.is_some(),
-                "HLS DRM: resolving DRM params for descriptor"
-            );
-
-            let resolved_result = self
-                .manager
-                .resolve_aes128_cbc_params(
-                    desc.key.as_ref(),
-                    if desc.is_init {
-                        None
-                    } else {
-                        Some(desc.sequence)
-                    },
-                )
-                .await;
-
-            match resolved_result {
-                Ok(Some((key, iv))) => {
-                    trace!(
-                        iv = ?iv,
-                        "HLS DRM: resolved AES-128-CBC params for descriptor"
-                    );
-                    Ok(Some((key, iv)))
-                }
-                Ok(None) => {
-                    trace!("HLS DRM: no AES-128-CBC params resolved for descriptor");
-                    Ok(None)
-                }
-                Err(e) => {
-                    // If a segment advertises encryption but we failed to resolve key/IV,
-                    // this is a hard error: continuing would stream encrypted bytes as plaintext.
-                    if desc.key.is_some() {
-                        tracing::error!(
-                            error = %e,
-                            is_init = desc.is_init,
-                            sequence = desc.sequence,
-                            variant_id = desc.variant_id.0,
-                            uri = %desc.uri,
-                            "HLS DRM: failed to resolve AES-128 params for encrypted segment"
-                        );
-                        Err(e)
-                    } else {
-                        trace!(
-                            error = %e,
-                            "HLS DRM: resolve_aes128_cbc_params failed (no key present in descriptor)"
-                        );
-                        Ok(None)
-                    }
-                }
             }
         }
     }
@@ -807,8 +685,16 @@ impl HlsStreamWorker {
 
         // Apply middlewares and pump bytes.
         let start_time = std::time::Instant::now();
-        let middlewares = HlsStreamWorker::build_middlewares(ctx.drm_params_opt);
-        let stream = apply_middlewares(stream, &middlewares);
+        #[cfg(feature = "aes-decrypt")]
+        let stream = {
+            if let Some((key, iv)) = ctx.drm_params_opt {
+                let middleware = Arc::new(Aes128CbcMiddleware::new(key, iv));
+                middleware.apply(stream)
+            } else {
+                stream
+            }
+        };
+
         let gathered_len = self.pump_stream_chunks(stream).await?;
         let elapsed = start_time.elapsed();
 
@@ -928,19 +814,31 @@ impl HlsStreamWorker {
         // Best-effort full skip if we know the whole segment size.
         if self.try_skip_full_segment_by_size(seg_size) {
             return Ok(SegmentContext {
-                plan: SegmentPlan::Skipped,
                 desc,
                 seg_size,
+                #[cfg(feature = "aes-decrypt")]
                 drm_params_opt: None,
                 init_len_opt: None,
                 routing: None,
                 cached_len: None,
+                plan: SegmentPlan::Skipped,
             });
         }
 
-        let (drm_params_opt, init_len_opt) = self
-            .resolve_segment_processing_params(&desc, seg_size)
-            .await?;
+        let init_len_opt = if desc.is_init { None } else { seg_size };
+
+        #[cfg(feature = "aes-decrypt")]
+        let (drm_params_opt, init_len_opt) = {
+            // Compute init_len_opt (only meaningful when streaming "as-is" without DRM middleware)
+            // If segment has DRM middleware, we cannot know the exact size before decryption
+            let drm_params_opt = self.manager.resolve_drm_params_for_desc(&desc).await?;
+            let init_len_opt = if drm_params_opt.is_some() {
+                None
+            } else {
+                init_len_opt
+            };
+            (drm_params_opt, init_len_opt)
+        };
 
         // Side-effect: keep stitched reader following the active variant.
         self.maybe_update_default_stream_key(&desc, last_variant_id);
@@ -960,6 +858,7 @@ impl HlsStreamWorker {
             plan,
             desc,
             seg_size,
+            #[cfg(feature = "aes-decrypt")]
             drm_params_opt,
             init_len_opt,
             routing: Some(routing),

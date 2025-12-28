@@ -1,7 +1,6 @@
-//! Encryption/decryption helpers (feature-gated).
+//! AES-128-CBC middleware implementation.
 //!
-//! Provides AES-128-CBC decryption middleware and related types behind the `aes-decrypt` feature.
-//! High-level usage notes live in `crates/stream-download-hls/README.md`.
+//! Provides AES-128-CBC decryption middleware for HLS streams.
 
 use aes::Aes128;
 use bytes::Bytes;
@@ -16,9 +15,6 @@ use tracing::trace;
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
 use crate::manager::StreamMiddleware;
-
-/// Transforms raw key bytes fetched from a key server before they are used for decryption.
-pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
 
 /// AES-128-CBC decrypt middleware.
 ///

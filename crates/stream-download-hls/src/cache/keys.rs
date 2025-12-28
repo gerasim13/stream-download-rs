@@ -16,10 +16,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use stream_download::source::ResourceKey;
+use tracing::trace;
 
 use crate::parser::VariantId;
-
-use tracing::trace;
 
 /// Computes a deterministic identifier for a stream from the master playlist URL.
 ///

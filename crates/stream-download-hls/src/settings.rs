@@ -13,7 +13,7 @@ use std::time::Duration;
 use url::Url;
 
 #[cfg(feature = "aes-decrypt")]
-use crate::crypto::KeyProcessorCallback;
+use crate::crypto::resolver::KeyProcessorCallback;
 use crate::parser::{MasterPlaylist, VariantId};
 
 /// Variant selection callback (return `Some(id)` for manual selection, or `None` for ABR).
@@ -22,9 +22,6 @@ pub type VariantStreamSelector = dyn Fn(&MasterPlaylist) -> Option<VariantId> + 
 /// Unified settings for HLS streaming.
 #[derive(Clone)]
 pub struct HlsSettings {
-    // ----------------------------
-    // URL resolution
-    // ----------------------------
     /// Optional base URL override used to form final URLs for:
     /// - media playlists (variant URIs in master playlist)
     /// - segments
@@ -33,9 +30,6 @@ pub struct HlsSettings {
     /// When `None`, URL resolution falls back to the relevant playlist URL.
     pub base_url: Option<Url>,
 
-    // ----------------------------
-    // Variant selection
-    // ----------------------------
     /// Variant selector callback.
     ///
     /// If it returns `None`, selection is AUTO (ABR-controlled).
@@ -44,9 +38,6 @@ pub struct HlsSettings {
     /// The callback is given the parsed master playlist.
     pub variant_stream_selector: Option<Arc<Box<VariantStreamSelector>>>,
 
-    // ----------------------------
-    // HTTP downloader
-    // ----------------------------
     /// Timeout for a single HTTP operation (e.g., creating the stream or collecting bytes).
     /// Default: 30 seconds.
     pub request_timeout: Duration,
@@ -63,9 +54,6 @@ pub struct HlsSettings {
     /// Default: 5 seconds.
     pub max_retry_delay: Duration,
 
-    // ----------------------------
-    // Core HLS behavior
-    // ----------------------------
     /// Optional override for how often live playlists should be refreshed.
     /// If not set, `#EXT-X-TARGETDURATION` should be used.
     pub live_refresh_interval: Option<Duration>,
@@ -80,9 +68,6 @@ pub struct HlsSettings {
     pub prefetch_buffer_size: usize,
 
     /// Optional callback to post-process fetched AES keys before use (e.g., unwrap DRM).
-    ///
-    /// Intentionally boxed and wrapped in `Arc` for cheap clones across tasks.
-    /// Not included in Debug output for readability.
     #[cfg(feature = "aes-decrypt")]
     pub key_processor_cb: Option<Arc<Box<KeyProcessorCallback>>>,
 
@@ -94,9 +79,6 @@ pub struct HlsSettings {
     #[cfg(feature = "aes-decrypt")]
     pub key_request_headers: Option<HashMap<String, String>>,
 
-    // ----------------------------
-    // ABR behavior
-    // ----------------------------
     /// Optional initial variant index for AUTO (ABR-controlled) startup.
     ///
     /// When `variant_stream_selector` is `None` (AUTO mode), the worker/controller needs to pick an
@@ -140,37 +122,35 @@ pub struct HlsSettings {
 impl Default for HlsSettings {
     fn default() -> Self {
         Self {
-            // URL resolution defaults
-            base_url: None,
-
-            // Variant selection defaults
-            variant_stream_selector: None,
-
             // Downloader defaults
             request_timeout: Duration::from_secs(30),
-            max_retries: 3,
             retry_base_delay: Duration::from_millis(100),
             max_retry_delay: Duration::from_secs(5),
+            retry_timeout: Duration::from_secs(5),
+            max_retries: 3,
 
             // HLS defaults
+            base_url: None,
+            variant_stream_selector: None,
             live_refresh_interval: None,
-            retry_timeout: Duration::from_secs(5),
+            prefetch_buffer_size: 32,
+
+            // AES decryption defaults
             #[cfg(feature = "aes-decrypt")]
             key_processor_cb: None,
             #[cfg(feature = "aes-decrypt")]
             key_query_params: None,
             #[cfg(feature = "aes-decrypt")]
             key_request_headers: None,
-            prefetch_buffer_size: 32,
 
             // ABR defaults
+            abr_min_switch_interval: Duration::from_secs(4),
             abr_initial_variant_index: None,
             abr_min_buffer_for_up_switch: 0.0,
             abr_down_switch_buffer: 3.0,
             abr_throughput_safety_factor: 0.8,
             abr_up_hysteresis_ratio: 0.15,
             abr_down_hysteresis_ratio: 0.05,
-            abr_min_switch_interval: Duration::from_secs(4),
         }
     }
 }

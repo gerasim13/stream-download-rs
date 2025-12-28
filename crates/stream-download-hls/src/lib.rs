@@ -53,7 +53,11 @@ pub use crate::worker::HlsStreamWorker;
 #[cfg(feature = "aes-decrypt")]
 mod crypto;
 #[cfg(feature = "aes-decrypt")]
-pub use crate::crypto::{Aes128CbcMiddleware, KeyProcessorCallback};
+pub use crate::crypto::middleware::Aes128CbcMiddleware;
+#[cfg(feature = "aes-decrypt")]
+pub use crate::crypto::resolver::AesKeyResolver;
+#[cfg(feature = "aes-decrypt")]
+pub use crate::crypto::resolver::KeyProcessorCallback;
 
 pub use bytes::Bytes;
 pub use std::time::Duration;
