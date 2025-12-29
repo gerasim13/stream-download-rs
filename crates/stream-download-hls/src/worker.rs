@@ -1079,7 +1079,7 @@ impl HlsStreamWorker {
                     }
 
                     // Get next segment descriptor from manager
-                    manager.next_segment_descriptor_nonblocking().await
+                    manager.next_segment().await
                 };
 
                 match Self::race_with_cmd(cancel_token, cmd_receiver, next_desc_future).await? {
@@ -1112,14 +1112,14 @@ impl HlsStreamWorker {
             };
 
             match next_desc {
-                Ok(crate::manager::NextSegmentDescResult::Segment(desc)) => {
+                Ok(crate::manager::NextSegmentResult::Segment(desc)) => {
                     // Reset retry delay on success
                     self.retry_delay = Self::INITIAL_RETRY_DELAY;
 
                     // Delegate per-segment logic to a dedicated helper
                     self.process_descriptor(desc, &mut last_variant_id).await?;
                 }
-                Ok(crate::manager::NextSegmentDescResult::EndOfStream) => {
+                Ok(crate::manager::NextSegmentResult::EndOfStream) => {
                     tracing::trace!("HLS stream: end of stream (closing data channel)");
                     // IMPORTANT:
                     // We must close the data channel so `HlsStream::poll_next` can return `Poll::Ready(None)`.
@@ -1133,7 +1133,7 @@ impl HlsStreamWorker {
                     drop(self.data_sender);
                     break;
                 }
-                Ok(crate::manager::NextSegmentDescResult::NeedsRefresh { wait }) => {
+                Ok(crate::manager::NextSegmentResult::NeedsRefresh { wait }) => {
                     // Live stream needs to wait for new segments
                     // Use select! for proper cancellation during wait
                     self.handle_needs_refresh(wait).await?;

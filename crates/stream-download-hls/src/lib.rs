@@ -22,10 +22,7 @@ pub use crate::error::{HlsError, HlsResult};
 
 /// Deterministic cache/layout helper.
 pub use crate::cache::keys::master_hash_from_url;
-pub use crate::manager::{
-    HlsManager, NextSegmentDescResult, NextSegmentResult, SegmentData, SegmentDescriptor,
-    SegmentType,
-};
+pub use crate::manager::{HlsManager, NextSegmentResult, SegmentDescriptor};
 pub use crate::parser::{
     CodecInfo, ContainerFormat, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist,
     MediaPlaylist, MediaSegment, SegmentKey, VariantId, VariantStream,

@@ -4,14 +4,11 @@
 //! Playlist/key caching is handled via `CachedResourceDownloader` and `StreamControl::StoreResource`.
 //! For higher-level design notes, see `crates/stream-download-hls/README.md`.
 
-use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lru::LruCache;
 use stream_download::source::{ResourceKey, StreamControl, StreamMsg};
 use stream_download::storage::StorageHandle;
 use tokio::sync::mpsc;
@@ -43,13 +40,11 @@ pub trait MediaStream {
     /// Selects the active variant for subsequent segment fetching.
     async fn select_variant(&mut self, variant: VariantId) -> HlsResult<()>;
 
-    /// Returns the next segment (blocks for live until one becomes available).
+    /// Returns the next segment descriptor without blocking for live streams.
     ///
-    /// For cancellation-friendly polling, use [`Self::next_segment_nonblocking`].
-    async fn next_segment(&mut self) -> HlsResult<Option<SegmentType>>;
-
-    /// Fetches the next segment without blocking for live streams.
-    async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult>;
+    /// For VOD streams, returns `EndOfStream` when all segments have been fetched.
+    /// For live streams, returns `NeedsRefresh` when no new segments are available.
+    async fn next_segment(&mut self) -> HlsResult<NextSegmentResult<SegmentDescriptor>>;
 }
 
 /// Transforms an `HlsByteStream` (object-safe).
@@ -57,20 +52,11 @@ pub trait StreamMiddleware: Send + Sync {
     fn apply(&self, input: HlsByteStream) -> HlsByteStream;
 }
 
-/// A segment yielded by the stream.
-#[derive(Debug, Clone)]
-pub enum SegmentType {
-    /// Initialization segment (if present, precedes media segments for the same variant).
-    Init(SegmentData),
-    /// Media segment containing actual audio/video data.
-    Media(SegmentData),
-}
-
 /// Result of a non-blocking segment fetch attempt.
 #[derive(Debug, Clone)]
-pub enum NextSegmentResult {
+pub enum NextSegmentResult<T> {
     /// A segment is available and ready to be processed.
-    Segment(SegmentType),
+    Segment(T),
 
     /// End of stream (VOD finished or live playlist has `#EXT-X-ENDLIST`).
     EndOfStream,
@@ -80,23 +66,6 @@ pub enum NextSegmentResult {
         /// Suggested wait duration before the next refresh attempt.
         wait: Duration,
     },
-}
-
-/// Raw segment bytes plus metadata required for decoding/scheduling.
-#[derive(Debug, Clone)]
-pub struct SegmentData {
-    /// Raw bytes of the media segment (e.g., a TS or fMP4 file).
-    pub data: Bytes,
-    /// Uniquely identifies the variant (stream/rendition) this segment belongs to.
-    pub variant_id: VariantId,
-    /// Codec and container information for the associated variant.
-    pub codec_info: Option<CodecInfo>,
-    /// Encryption key information, if the segment is encrypted.
-    pub key: Option<SegmentKey>,
-    /// The segment's media sequence number.
-    pub sequence: u64,
-    /// The duration of the media segment.
-    pub duration: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -116,13 +85,6 @@ pub struct SegmentDescriptor {
     pub variant_id: VariantId,
     pub codec_info: Option<CodecInfo>,
     pub key: Option<SegmentKey>,
-}
-
-#[derive(Debug, Clone)]
-pub enum NextSegmentDescResult {
-    Segment(SegmentDescriptor),
-    EndOfStream,
-    NeedsRefresh { wait: Duration },
 }
 
 /// High-level handle for a single HLS stream (no network I/O until async methods are called).
@@ -153,10 +115,8 @@ pub struct HlsManager {
     /// AES key resolver for handling AES-128-CBC encryption.
     #[cfg(feature = "aes-decrypt")]
     aes_key_resolver: Option<AesKeyResolver>,
-    /// Cache of downloaded init segments by absolute URI with LRU eviction.
-    init_segment_cache: LruCache<String, Bytes>,
     /// Known sizes (in bytes) of media segments keyed by sequence.
-    segment_sizes: HashMap<u64, u64>,
+    segment_sizes: std::collections::HashMap<u64, u64>,
 }
 
 impl HlsManager {
@@ -193,8 +153,7 @@ impl HlsManager {
             media_playlist_url: None,
             next_segment_index: 0,
             init_segment_sent: false,
-            init_segment_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
-            segment_sizes: HashMap::new(),
+            segment_sizes: std::collections::HashMap::new(),
         }
     }
 
@@ -325,61 +284,6 @@ impl HlsManager {
         Ok((found_new_idx, new_total, new_end_list, interval))
     }
 
-    /// Return the currently cached master playlist, if any.
-    async fn try_emit_init_segment(&mut self) -> HlsResult<Option<SegmentType>> {
-        let init_opt = self
-            .current_media_playlist
-            .as_ref()
-            .and_then(|p| p.init_segment.as_ref())
-            .cloned();
-
-        if let Some(init_segment) = init_opt {
-            let (variant_id, codec_info) = self.current_variant_info()?;
-            let resolved_uri = self.resolve_url(&init_segment.uri)?;
-
-            let data = if let Some(cached) = self.init_segment_cache.get(&resolved_uri) {
-                cached.clone()
-            } else {
-                let downloaded = self.download_segment(&init_segment.uri).await?;
-                // Record init segment size for seek map
-                self.set_segment_size(0, downloaded.len() as u64);
-                self.init_segment_cache
-                    .put(resolved_uri.clone(), downloaded.clone());
-                downloaded
-            };
-
-            return Ok(Some(SegmentType::Init(SegmentData {
-                data,
-                variant_id,
-                codec_info,
-                key: init_segment.key,
-                sequence: 0,
-                duration: std::time::Duration::from_secs(0),
-            })));
-        }
-
-        Ok(None)
-    }
-
-    async fn emit_media_segment(&mut self, seg: MediaSegment) -> HlsResult<SegmentType> {
-        let codec_info = self.current_codec_info()?;
-
-        let data = self.download_segment(&seg.uri).await?;
-        // Record media segment size for seek map
-        self.set_segment_size(seg.sequence, data.len() as u64);
-
-        self.next_segment_index += 1;
-
-        Ok(SegmentType::Media(SegmentData {
-            data,
-            variant_id: seg.variant_id,
-            codec_info,
-            key: seg.key,
-            sequence: seg.sequence,
-            duration: seg.duration,
-        }))
-    }
-
     /// Returns the cached master playlist (if loaded).
     pub fn master(&self) -> Option<&MasterPlaylist> {
         self.master.as_ref()
@@ -478,12 +382,6 @@ impl HlsManager {
         Ok(self.current_media_playlist.as_ref().unwrap())
     }
 
-    async fn download_segment(&mut self, uri: &str) -> HlsResult<Bytes> {
-        let resolved_url = self.resolve_url(uri)?;
-        let data = self.downloader.download_bytes(&resolved_url).await?;
-        Ok(data)
-    }
-
     /// Resolve DRM (AES-128-CBC) params for a descriptor if applicable.
     #[cfg(feature = "aes-decrypt")]
     pub async fn resolve_drm_params_for_desc(
@@ -501,11 +399,13 @@ impl HlsManager {
         Ok(None)
     }
 
-    /// Non-blocking descriptor-based API mirroring `next_segment_nonblocking` logic.
-    /// Returns a segment descriptor suitable for opening a streaming HTTP connection.
-    pub async fn next_segment_descriptor_nonblocking(
+    /// Returns the next segment descriptor without blocking for live streams.
+    ///
+    /// For VOD streams, returns `EndOfStream` when all segments have been fetched.
+    /// For live streams, returns `NeedsRefresh` when no new segments are available.
+    pub async fn next_segment_descriptor(
         &mut self,
-    ) -> HlsResult<NextSegmentDescResult> {
+    ) -> HlsResult<NextSegmentResult<SegmentDescriptor>> {
         let PlaylistSnapshot {
             end_list,
             last_seq,
@@ -523,7 +423,7 @@ impl HlsManager {
             {
                 let desc = self.build_init_descriptor(&init_segment)?;
                 self.init_segment_sent = true;
-                return Ok(NextSegmentDescResult::Segment(desc));
+                return Ok(NextSegmentResult::Segment(desc));
             } else {
                 // Mark even if absent to avoid re-checking
                 self.init_segment_sent = true;
@@ -534,12 +434,12 @@ impl HlsManager {
         if let Some(seg) = seg_opt {
             let desc = self.build_media_descriptor(&seg)?;
             self.next_segment_index += 1;
-            return Ok(NextSegmentDescResult::Segment(desc));
+            return Ok(NextSegmentResult::Segment(desc));
         }
 
         // 3) No segment at current index
         if end_list {
-            return Ok(NextSegmentDescResult::EndOfStream);
+            return Ok(NextSegmentResult::EndOfStream);
         }
 
         // 4) LIVE - refresh playlist and check for new segments
@@ -561,14 +461,14 @@ impl HlsManager {
             let desc = self.build_media_descriptor(&seg)?;
             // Mirror the byte-based flow where the index is advanced after yield
             self.next_segment_index = idx + 1;
-            return Ok(NextSegmentDescResult::Segment(desc));
+            return Ok(NextSegmentResult::Segment(desc));
         }
 
         if new_end_list {
-            return Ok(NextSegmentDescResult::EndOfStream);
+            return Ok(NextSegmentResult::EndOfStream);
         }
 
-        Ok(NextSegmentDescResult::NeedsRefresh { wait: interval })
+        Ok(NextSegmentResult::NeedsRefresh { wait: interval })
     }
 
     fn build_init_descriptor(
@@ -689,7 +589,7 @@ impl HlsManager {
         ))
     }
 
-    /// Repositions internal state so `next_segment_descriptor_nonblocking` yields `desc` next.
+    /// Repositions internal state so `next_segment_descriptor` yields `desc` next.
     pub fn seek_to_descriptor(&mut self, desc: &SegmentDescriptor) -> HlsResult<()> {
         let pl = self.current_media_playlist.as_ref().ok_or_else(|| {
             HlsError::Message("no media playlist loaded; call select_variant first".to_string())
@@ -778,102 +678,8 @@ impl MediaStream for HlsManager {
     }
 
     #[instrument(skip(self), fields(variant_index = ?self.current_variant_index, next_segment_index = self.next_segment_index))]
-    async fn next_segment(&mut self) -> HlsResult<Option<crate::manager::SegmentType>> {
-        // Blocking version: loop until we get a segment or end of stream
-        loop {
-            match self.next_segment_nonblocking().await? {
-                NextSegmentResult::Segment(seg) => return Ok(Some(seg)),
-                NextSegmentResult::EndOfStream => return Ok(None),
-                NextSegmentResult::NeedsRefresh { wait } => {
-                    tracing::trace!(
-                        "HlsManager: LIVE no new segments yet, sleeping for {:?}",
-                        wait
-                    );
-                    tokio::time::sleep(wait).await;
-                }
-            }
-        }
-    }
-
-    #[instrument(skip(self), fields(variant_index = ?self.current_variant_index, next_segment_index = self.next_segment_index))]
-    async fn next_segment_nonblocking(&mut self) -> HlsResult<NextSegmentResult> {
-        // --- Phase 0: ensure we have a playlist selected ---
-        let PlaylistSnapshot {
-            end_list,
-            last_seq,
-            target_duration,
-            current_segment: seg_opt,
-        } = self.playlist_snapshot()?;
-
-        // --- Phase 1: init segment (at most once per variant selection) ---
-        if !self.init_segment_sent {
-            if let Some(init_seg) = self.try_emit_init_segment().await? {
-                // Mark even if absent to avoid re-checking on subsequent calls
-                self.init_segment_sent = true;
-                return Ok(NextSegmentResult::Segment(init_seg));
-            }
-        }
-
-        // --- Phase 2: media segment available right now ---
-        if let Some(seg) = seg_opt {
-            let segment = self.emit_media_segment(seg).await?;
-            return Ok(NextSegmentResult::Segment(segment));
-        }
-
-        // --- Phase 3: no segment at current index ---
-        if end_list {
-            tracing::trace!(
-                "HlsManager: returning EndOfStream. end_list=true last_seq={} next_segment_index={}",
-                last_seq,
-                self.next_segment_index
-            );
-            return Ok(NextSegmentResult::EndOfStream);
-        }
-
-        // --- Phase 4: LIVE - refresh playlist and check for new segments ---
-        let (found_new_idx, new_total, new_end_list, interval) =
-            self.live_refresh_cycle(last_seq, target_duration).await?;
-
-        if let Some(idx) = found_new_idx {
-            tracing::trace!(
-                "HlsManager: LIVE refresh produced new segment: last_seq={} first_new_idx={}",
-                last_seq,
-                idx
-            );
-            self.next_segment_index = idx;
-
-            // Now we have a new segment, fetch it
-            let seg = self
-                .current_media_playlist
-                .as_ref()
-                .and_then(|pl| pl.segments.get(idx))
-                .cloned()
-                .ok_or_else(|| {
-                    HlsError::Message("segment index out of bounds after refresh".to_string())
-                })?;
-
-            let segment = self.emit_media_segment(seg).await?;
-            return Ok(NextSegmentResult::Segment(segment));
-        }
-
-        // If the stream ended between refreshes
-        if new_end_list {
-            tracing::trace!(
-                "HlsManager: LIVE refresh indicates end_list=true. last_seq={} total_segments={}",
-                last_seq,
-                new_total
-            );
-            return Ok(NextSegmentResult::EndOfStream);
-        }
-
-        // No new segments yet, tell caller to wait
-        tracing::trace!(
-            "HlsManager: LIVE no new segments yet. last_seq={} total_segments={} suggested_wait={:?}",
-            last_seq,
-            new_total,
-            interval
-        );
-
-        Ok(NextSegmentResult::NeedsRefresh { wait: interval })
+    async fn next_segment(&mut self) -> HlsResult<NextSegmentResult<SegmentDescriptor>> {
+        // Delegate to the existing implementation
+        self.next_segment_descriptor().await
     }
 }

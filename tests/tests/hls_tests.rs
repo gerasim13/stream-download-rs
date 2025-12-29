@@ -9,8 +9,7 @@ use futures_util::StreamExt;
 use rstest::rstest;
 use stream_download::source::{ChunkKind, StreamControl, StreamMsg};
 use stream_download_hls::{
-    AbrDecision, HlsManager, HlsSettings, MediaStream, NextSegmentDescResult, StreamEvent,
-    VariantId,
+    AbrDecision, HlsManager, HlsSettings, MediaStream, NextSegmentResult, StreamEvent, VariantId,
 };
 use tokio::sync::mpsc;
 
@@ -1228,12 +1227,12 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
 
         // Get next segment descriptor
         let desc = manager
-            .next_segment_descriptor_nonblocking()
+            .next_segment()
             .await
             .expect("descriptor after throughput drop");
 
         let seg = match desc {
-            NextSegmentDescResult::Segment(s) => s,
+            NextSegmentResult::Segment(s) => s,
             other => panic!(
                 "expected Segment descriptor after throughput drop, got {:?}",
                 other
@@ -1663,16 +1662,16 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
 
         // Drain init + first media segment on variant 0.
         let first_init = manager
-            .next_segment_descriptor_nonblocking()
+            .next_segment()
             .await
             .expect("descriptor for first init");
         let first_seg = manager
-            .next_segment_descriptor_nonblocking()
+            .next_segment()
             .await
             .expect("descriptor for first segment");
 
         let first_seg = match first_seg {
-            NextSegmentDescResult::Segment(s) => s,
+            NextSegmentResult::Segment(s) => s,
             other => panic!("expected first segment descriptor, got {:?}", other),
         };
 
@@ -1683,7 +1682,7 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
         );
         assert!(matches!(
             first_init,
-            NextSegmentDescResult::Segment(ref d) if d.variant_id == VariantId(0) && d.is_init
+            NextSegmentResult::Segment(ref d) if d.variant_id == VariantId(0) && d.is_init
         ));
         assert_eq!(
             first_seg.variant_id,
@@ -1710,20 +1709,20 @@ fn hls_abr_upswitch_continues_from_current_segment_index(#[case] variant_count: 
         }
 
         let switched_init = manager
-            .next_segment_descriptor_nonblocking()
+            .next_segment()
             .await
             .expect("descriptor after throughput boost");
         let switched_seg = manager
-            .next_segment_descriptor_nonblocking()
+            .next_segment()
             .await
             .expect("second descriptor after throughput boost");
 
         let switched_init = match switched_init {
-            NextSegmentDescResult::Segment(s) => s,
+            NextSegmentResult::Segment(s) => s,
             other => panic!("expected init descriptor after switch, got {:?}", other),
         };
         let switched_seg = match switched_seg {
-            NextSegmentDescResult::Segment(s) => s,
+            NextSegmentResult::Segment(s) => s,
             other => panic!("expected media descriptor after switch, got {:?}", other),
         };
 
@@ -1918,8 +1917,8 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             // Keep pulling descriptors until we find the first MEDIA segment for the selected variant.
             // This test asserts that selection affects which segment URI we fetch.
             let desc = loop {
-                match manager.next_segment_descriptor_nonblocking().await {
-                    Ok(NextSegmentDescResult::Segment(d)) => {
+                match manager.next_segment().await {
+                    Ok(NextSegmentResult::Segment(d)) => {
                         if d.is_init {
                             continue;
                         }
