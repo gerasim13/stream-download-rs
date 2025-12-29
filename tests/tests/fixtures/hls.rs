@@ -32,8 +32,7 @@ use aes::cipher::BlockEncryptMut;
 use cbc::Encryptor;
 use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
 
-/// Fixture can either serve fully in-memory blobs (mock mode) or serve real files from a directory
-/// (real-media mode).
+// Mock or real file serving
 #[derive(Clone, Debug)]
 enum FixtureContent {
     Mock {
@@ -45,23 +44,7 @@ enum FixtureContent {
     },
 }
 
-/// Boxed storage provider adapter for tests.
-///
-/// Motivation
-/// ----------
-/// `StreamDownload<P>` is generic over the concrete `StorageProvider` `P`. That makes it awkward to
-/// parameterize integration tests over multiple storage backends (persistent file-tree, temp,
-/// memory) because you can't easily return a single `StreamDownload<...>` type from helper
-/// functions.
-///
-/// This module provides `BoxedStorageProvider`, a type-erasing adapter that turns any
-/// `StorageProvider` into a single uniform provider where:
-/// - `Reader = Box<dyn StorageReader>`
-/// - `Writer = DynStorageWriter` (a newtype around `Box<dyn StorageWriter>`)
-///
-/// We need the `DynStorageWriter` wrapper because `StorageWriter` is not implemented for
-/// `Box<dyn StorageWriter>` automatically, and `StorageProvider::Writer` must implement
-/// `StorageWriter`.
+// Boxed storage provider for testing multiple backends
 pub struct BoxedStorageProvider {
     inner: BoxedStorageProviderInner,
     capacity: Option<usize>,
@@ -78,7 +61,7 @@ enum BoxedStorageProviderInner {
     ),
 }
 
-/// Newtype wrapper so we can implement `StorageWriter` for a boxed trait object.
+// Wrapper for boxed StorageWriter
 pub struct DynStorageWriter(Box<dyn StorageWriter>);
 
 impl DynStorageWriter {
@@ -117,7 +100,7 @@ impl StorageWriter for DynStorageWriter {
 }
 
 impl BoxedStorageProvider {
-    /// Wrap any concrete storage provider into a boxed provider.
+    // Wrap concrete provider into boxed provider
     pub fn new<P>(provider: P) -> Self
     where
         P: StorageProvider + Send + 'static,
@@ -177,51 +160,24 @@ pub struct HlsFixture {
     segments_per_variant: usize,
     content: FixtureContent,
 
-    /// Global per-segment delay used by the fixture server (legacy).
-    ///
-    /// NOTE: This delay applies only to `seg/v0_*` responses (see `serve_path` below).
+    // Global per-segment delay (legacy, applies to seg/v0_*)
     segment_delay: Duration,
 
-    /// Optional per-variant segment delay overrides (delay per segment response).
-    ///
-    /// Keys are variant indices (0-based) and values are artificial latency to add
-    /// for that variant's media segment responses (e.g. `seg/v1_*`).
-    ///
-    /// This is used to create deterministic ABR scenarios (downswitch/upswitch/oscillation)
-    /// without modifying production code.
+    // Per-variant delays for ABR testing
     per_variant_segment_delay: Arc<HashMap<usize, Duration>>,
 
     request_counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     hls_settings: HlsSettings,
 
-    /// Optional base URL override (full URL, not just a prefix string).
-    ///
-    /// When set, the fixture will derive a *path prefix* from this URL and serve most resources
-    /// only under that prefix, to validate that the code under test resolves URLs via `base_url`.
+    // Base URL override for URL resolution testing
     base_url_override: Option<reqwest::Url>,
     ///
-    /// Example:
-    /// - base_url = `http://127.0.0.1:1234/a/b/`
-    /// - derived prefix = `a/b` (everything after host)
-    ///
-    /// Serving policy when enabled:
-    /// - `/master.m3u8` is always served at root (bootstrap never changes)
-    /// - `/<prefix>/...` is served depending on the chosen content mode
-    /// - default non-prefixed paths (except `/master.m3u8`) intentionally return 404
-    // Optional AES-128 CBC segment encryption ("DRM") for fixture-generated media segments.
-    //
-    // NOTE: This is only supported in Mock mode (because encryption is applied to generated blobs).
+    // Example: base_url = http://127.0.0.1:1234/a/b/ → prefix = a/b
+    // AES-128 CBC encryption (Mock mode only)
     aes128: Option<HlsFixtureAes128Config>,
 }
 
-/// Which storage backend to use for tests.
-///
-/// Notes:
-/// - `Persistent` uses the HLS segmented file-tree provider (the "real" persistent cache layout).
-/// - `Temp` uses the same persistent provider but places data under a per-test temp directory.
-///   This is still file-based, but not intended to be reused across runs.
-/// - `Memory` uses in-memory storage for the main stream bytes, while still using a file-tree
-///   `StorageHandle` for HLS resource caching (playlists/keys/resources).
+// Storage backend types for tests
 #[derive(Clone, Debug)]
 pub enum HlsFixtureStorageKind {
     /// Persistent segmented file-tree storage rooted at the provided directory.
@@ -235,14 +191,7 @@ pub enum HlsFixtureStorageKind {
     },
 }
 
-/// Storage bundle returned by the fixture for a chosen backend.
-///
-/// This exists because HLS uses two distinct storage concepts:
-/// - `StreamDownload` needs a `StorageProvider` for the main byte stream.
-/// - `HlsManager`/`HlsStreamWorker` need a keyed `StorageHandle` for read-before-fetch caching
-///   (playlists/keys/etc).
-///
-/// We keep this as a simple enum with concrete provider types (no generic `impl Trait` escapes).
+// Storage bundle for HLS tests
 pub enum HlsFixtureStorage {
     Persistent {
         provider: HlsPersistentStorageProvider,
@@ -305,7 +254,11 @@ impl HlsFixtureAes128Config {
 
 impl Default for HlsFixture {
     fn default() -> Self {
-        Self::new_default()
+        Self::new(
+            Self::VARIANT_COUNT,
+            Self::SEGMENTS_PER_VARIANT,
+            Self::SEGMENT_DELAY,
+        )
     }
 }
 
@@ -862,7 +815,7 @@ impl HlsFixture {
             .variants
             .clone();
 
-        let mut controller = AbrController::new(
+        let controller = AbrController::new(
             variants.clone(),
             abr_cfg,
             manual_variant_id,
@@ -1657,5 +1610,576 @@ impl HlsFixture {
                 k
             })
             .collect()
+    }
+
+    // Create test storage with cleanup
+    pub async fn create_test_storage(&self, kind: HlsFixtureStorageKind) -> HlsFixtureStorage {
+        self.build_storage(kind)
+    }
+
+    // Validate fixture configuration
+    pub fn validate_or_panic(&self) {
+        // Validate variant count
+        if self.variant_count == 0 {
+            panic!("HlsFixture: variant_count must be greater than 0");
+        }
+
+        // Validate segments per variant
+        if self.segments_per_variant == 0 {
+            panic!("HlsFixture: segments_per_variant must be greater than 0");
+        }
+
+        // Validate AES-128 configuration if present
+        if let Some(aes128_config) = &self.aes128 {
+            // Check that we have keys for all variants
+            if aes128_config.keys_by_variant.len() < self.variant_count {
+                panic!(
+                    "HlsFixture: AES-128 configuration has keys for {} variants, but fixture has {} variants",
+                    aes128_config.keys_by_variant.len(),
+                    self.variant_count
+                );
+            }
+
+            // Validate that all keys are 16 bytes
+            for (i, key) in aes128_config.keys_by_variant.iter().enumerate() {
+                if key.len() != 16 {
+                    panic!(
+                        "HlsFixture: AES-128 key for variant {} is {} bytes, expected 16 bytes",
+                        i,
+                        key.len()
+                    );
+                }
+            }
+        }
+
+        // Validate real directory exists if using RealDir mode
+        if let FixtureContent::RealDir { root } = &self.content {
+            if !root.exists() {
+                panic!(
+                    "HlsFixture: RealDir root does not exist: {}",
+                    root.display()
+                );
+            }
+            if !root.is_dir() {
+                panic!(
+                    "HlsFixture: RealDir root is not a directory: {}",
+                    root.display()
+                );
+            }
+        }
+
+        // Validate base URL override if present
+        if let Some(base_url) = &self.base_url_override {
+            if base_url.cannot_be_a_base() {
+                panic!(
+                    "HlsFixture: base_url_override cannot be a base URL: {}",
+                    base_url
+                );
+            }
+        }
+
+        // Validate per-variant segment delays
+        for (variant, delay) in self.per_variant_segment_delay.iter() {
+            if *variant >= self.variant_count {
+                panic!(
+                    "HlsFixture: per_variant_segment_delay for variant {} is out of range (max variant index: {})",
+                    variant,
+                    self.variant_count - 1
+                );
+            }
+            if *delay > Duration::from_secs(60) {
+                panic!(
+                    "HlsFixture: per_variant_segment_delay for variant {} is too large: {:?} (max: 60s)",
+                    variant, delay
+                );
+            }
+        }
+    }
+}
+
+// Common operations for storage backends
+pub trait StorageTestHelpers {
+    /// Get the storage provider for stream download.
+    fn storage_provider(
+        &self,
+    ) -> Box<dyn StorageProvider<Reader = Box<dyn StorageReader>, Writer = DynStorageWriter>>;
+
+    /// Get the storage handle for HLS resource caching.
+    fn storage_handle(&self) -> &stream_download::storage::StorageHandle;
+
+    /// Clean up any temporary resources created by this storage.
+    fn cleanup(&self);
+}
+
+impl StorageTestHelpers for HlsFixtureStorage {
+    fn storage_provider(
+        &self,
+    ) -> Box<dyn StorageProvider<Reader = Box<dyn StorageReader>, Writer = DynStorageWriter>> {
+        match self {
+            HlsFixtureStorage::Persistent { provider, .. } => {
+                Box::new(BoxedStorageProvider::new(provider.clone()))
+            }
+            HlsFixtureStorage::Temp { provider, .. } => {
+                Box::new(BoxedStorageProvider::new(provider.clone()))
+            }
+            HlsFixtureStorage::Memory { provider, .. } => {
+                Box::new(BoxedStorageProvider::new(provider.clone()))
+            }
+        }
+    }
+
+    fn storage_handle(&self) -> &stream_download::storage::StorageHandle {
+        match self {
+            HlsFixtureStorage::Persistent { storage_handle, .. } => storage_handle,
+            HlsFixtureStorage::Temp { storage_handle, .. } => storage_handle,
+            HlsFixtureStorage::Memory { storage_handle, .. } => storage_handle,
+        }
+    }
+
+    fn cleanup(&self) {
+        match self {
+            HlsFixtureStorage::Persistent { .. } => {
+                // Persistent storage is not cleaned up automatically
+            }
+            HlsFixtureStorage::Temp { .. } => {
+                // Temp storage is cleaned up automatically when dropped
+            }
+            HlsFixtureStorage::Memory { .. } => {
+                // Memory storage is cleaned up automatically when dropped
+            }
+        }
+    }
+}
+
+// Macro for testing all storage backends
+#[macro_export]
+macro_rules! test_all_storages {
+    ($test_name:ident, $test_body:block) => {
+        paste::item! {
+            #[rstest]
+            #[case("persistent")]
+            #[case("temp")]
+            #[case("memory")]
+            fn [<$test_name _all_storages>](#[case] storage: &str) {
+                SERVER_RT.block_on(async {
+                    $test_body
+                })
+            }
+        }
+    };
+}
+
+// Macro for testing specific storage backends
+#[macro_export]
+macro_rules! test_storages {
+    ($test_name:ident, $storages:expr, $test_body:block) => {
+        paste::item! {
+            #[rstest]
+            $(
+                #[case($storages)]
+            )*
+            fn [<$test_name>](#[case] storage: &str) {
+                SERVER_RT.block_on(async {
+                    $test_body
+                })
+            }
+        }
+    };
+}
+
+// Create DRM fixture
+pub fn create_drm_fixture(variant_count: usize) -> HlsFixture {
+    HlsFixture::with_variant_count(variant_count)
+        .with_segment_delay(Duration::ZERO)
+        .with_aes128_drm()
+        .with_aes128_fixed_zero_iv(true)
+}
+
+// Create ABR fixture
+pub fn create_abr_fixture(variant_count: usize) -> HlsFixture {
+    HlsFixture::with_variant_count(variant_count)
+        .with_segment_delay(Duration::ZERO)
+        .with_abr_config(|cfg| {
+            cfg.abr_min_switch_interval = Duration::ZERO;
+            cfg.abr_down_switch_buffer = 5.0;
+        })
+}
+
+// Create basic fixture
+pub fn create_basic_fixture(variant_count: usize) -> HlsFixture {
+    let fixture = HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
+    fixture.validate_or_panic();
+    fixture
+}
+
+// Create fixture with real media assets
+pub fn create_real_media_fixture() -> HlsFixture {
+    let assets_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("failed to get parent directory")
+        .join("assets")
+        .join("hls");
+
+    if !assets_dir.exists() {
+        panic!("Assets directory does not exist: {}", assets_dir.display());
+    }
+
+    if !assets_dir.is_dir() {
+        panic!("Assets path is not a directory: {}", assets_dir.display());
+    }
+
+    let fixture = HlsFixture::new(
+        HlsFixture::VARIANT_COUNT,
+        HlsFixture::SEGMENTS_PER_VARIANT,
+        HlsFixture::SEGMENT_DELAY,
+    )
+    .with_real_dir(assets_dir);
+    fixture.validate_or_panic();
+    fixture
+}
+
+// Create mock fixture with custom payload
+pub fn create_mock_fixture_with_custom_payload(
+    variant_count: usize,
+    segments_per_variant: usize,
+    payload_generator: impl Fn(usize, usize) -> String,
+) -> HlsFixture {
+    let mut fixture =
+        HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
+
+    // Generate custom payloads for each segment
+    let mut blobs = std::collections::HashMap::new();
+    for v in 0..variant_count {
+        for s in 0..segments_per_variant {
+            let payload = payload_generator(v, s);
+            let key = format!("seg/v{v}_{s}.bin");
+            blobs.insert(key, bytes::Bytes::from(payload));
+        }
+    }
+
+    fixture.content = FixtureContent::Mock {
+        blobs: std::sync::Arc::new(blobs),
+        media_payload_bytes: None,
+    };
+
+    fixture.validate_or_panic();
+    fixture
+}
+
+// Helper to create HlsManager for tests
+pub async fn create_test_manager(
+    master_url: reqwest::Url,
+    storage_handle: &stream_download::storage::StorageHandle,
+    settings: HlsSettings,
+) -> stream_download_hls::HlsManager {
+    use stream_download_hls::ResourceDownloader;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let (control_sender, _) = mpsc::channel(16);
+    let downloader = ResourceDownloader::new(
+        std::time::Duration::from_secs(10),
+        3,
+        std::time::Duration::from_millis(100),
+        std::time::Duration::from_secs(5),
+        CancellationToken::new(),
+    );
+
+    stream_download_hls::HlsManager::new(
+        master_url,
+        std::sync::Arc::new(settings),
+        downloader,
+        storage_handle.clone(),
+        control_sender,
+    )
+}
+
+// ============================================================================
+// Test utilities module
+// ============================================================================
+
+/// Test utilities for stream-download-rs integration tests.
+///
+/// Common utilities for assertions, file operations, and test setup.
+pub mod utils {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use stream_download::source::{StreamControl, StreamMsg};
+    use tokio::sync::mpsc;
+
+    /// Assert directory is not empty
+    pub fn assert_dir_not_empty(root: &Path) {
+        assert!(
+            dir_nonempty_recursive(root),
+            "Expected directory {} to not be empty",
+            root.display()
+        );
+    }
+
+    /// Check if directory is non-empty
+    pub fn dir_nonempty_recursive(root: &Path) -> bool {
+        count_files_recursive(root) > 0
+    }
+
+    /// Count files recursively
+    pub fn count_files_recursive(root: &Path) -> usize {
+        fn walk(p: &Path, acc: &mut usize) {
+            let Ok(rd) = std::fs::read_dir(p) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_file() {
+                    *acc += 1;
+                } else if ft.is_dir() {
+                    walk(&path, acc);
+                }
+            }
+        }
+
+        if !root.exists() {
+            return 0;
+        }
+
+        let mut n = 0usize;
+        walk(root, &mut n);
+        n
+    }
+
+    /// Clean directory and contents
+    pub fn clean_dir(root: &Path) {
+        if let Err(e) = std::fs::remove_dir_all(root) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                panic!("failed to clean directory {}: {e}", root.display());
+            }
+        }
+    }
+
+    /// Check if stream key matches variant
+    pub fn is_variant_stream_key(
+        stream_key: &stream_download::source::ResourceKey,
+        variant_id: u64,
+    ) -> bool {
+        stream_key.0.ends_with(&format!("/{}", variant_id))
+    }
+
+    /// Wait for first chunk start
+    pub async fn wait_first_chunkstart(mut data_rx: mpsc::Receiver<StreamMsg>) -> StreamControl {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await {
+                Ok(Some(StreamMsg::Control(ctrl))) => {
+                    if matches!(ctrl, StreamControl::ChunkStart { .. }) {
+                        return ctrl;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        panic!("did not observe any ChunkStart in time");
+    }
+
+    /// Build fixture storage kind
+    pub fn build_fixture_storage_kind(
+        base_name: &str,
+        variant_count: usize,
+        storage: &str,
+    ) -> crate::fixtures::hls::HlsFixtureStorageKind {
+        match storage {
+            "persistent" => crate::fixtures::hls::HlsFixtureStorageKind::Persistent {
+                storage_root: std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(format!("{base_name}-v{variant_count}-persistent")),
+            },
+            "temp" => crate::fixtures::hls::HlsFixtureStorageKind::Temp {
+                subdir: format!("{base_name}-v{variant_count}-temp"),
+            },
+            "memory" => crate::fixtures::hls::HlsFixtureStorageKind::Memory {
+                resource_cache_root: std::env::temp_dir()
+                    .join("stream-download-tests")
+                    .join(format!("{base_name}-v{variant_count}-memory-resources")),
+            },
+            other => panic!("unknown storage kind '{other}'"),
+        }
+    }
+
+    /// Test configuration
+    #[derive(Clone, Debug)]
+    pub struct TestConfig {
+        pub variant_count: usize,
+        pub storage_kind: String,
+        pub segment_delay: Duration,
+        pub use_drm: bool,
+        pub use_abr: bool,
+    }
+
+    impl Default for TestConfig {
+        fn default() -> Self {
+            Self {
+                variant_count: 2,
+                storage_kind: "memory".to_string(),
+                segment_delay: Duration::ZERO,
+                use_drm: false,
+                use_abr: false,
+            }
+        }
+    }
+
+    /// Create test config
+    pub fn test_config() -> TestConfig {
+        TestConfig::default()
+    }
+
+    impl TestConfig {
+        /// Set variant count
+        pub fn variant_count(mut self, count: usize) -> Self {
+            self.variant_count = count;
+            self
+        }
+
+        /// Set storage kind
+        pub fn storage_kind(mut self, kind: &str) -> Self {
+            self.storage_kind = kind.to_string();
+            self
+        }
+
+        /// Set segment delay
+        pub fn segment_delay(mut self, delay: Duration) -> Self {
+            self.segment_delay = delay;
+            self
+        }
+
+        /// Enable ABR
+        pub fn with_abr(mut self) -> Self {
+            self.use_abr = true;
+            self
+        }
+    }
+
+    /// Create fixture from config
+    pub fn create_fixture_from_config(config: TestConfig) -> crate::fixtures::hls::HlsFixture {
+        let mut fixture = if config.use_drm {
+            crate::fixtures::hls::create_drm_fixture(config.variant_count)
+        } else {
+            crate::fixtures::hls::create_basic_fixture(config.variant_count)
+        };
+
+        if config.segment_delay > Duration::ZERO {
+            fixture = fixture.with_segment_delay(config.segment_delay);
+        }
+
+        if config.use_abr {
+            fixture = fixture.with_abr_config(|cfg| {
+                cfg.abr_min_switch_interval = Duration::ZERO;
+                cfg.abr_down_switch_buffer = 5.0;
+            });
+        }
+
+        fixture.validate_or_panic();
+        fixture
+    }
+
+    /// Advanced test utilities for complex scenarios.
+    pub mod advanced {
+        use std::time::Duration;
+
+        /// Helper for ABR switching tests
+        #[allow(dead_code)]
+        pub struct AbrTestHelper {
+            variant_delays: Vec<Duration>,
+            current_variant: usize,
+        }
+
+        impl AbrTestHelper {
+            /// Create ABR test helper
+            pub fn new(variant_delays: Vec<Duration>, initial_variant: usize) -> Self {
+                Self {
+                    variant_delays,
+                    current_variant: initial_variant,
+                }
+            }
+        }
+
+        /// Macro for testing all variant/storage combinations
+        #[macro_export]
+        macro_rules! test_all_combinations {
+            ($test_name:ident, $variant_counts:expr, $test_body:block) => {
+                ::paste::paste! {
+                    $(
+                        #[::rstest::rstest]
+                        #[case("persistent")]
+                        #[case("temp")]
+                        #[case("memory")]
+                        fn [<$test_name _ $variant_counts _variants>](#[case] storage: &str) {
+                            let variant_count = $variant_counts;
+                            $crate::fixtures::setup::SERVER_RT.block_on(async {
+                                $test_body
+                            })
+                        }
+                    )*
+                }
+            };
+        }
+
+        /// Track resource usage in tests
+        pub struct ResourceTracker {
+            initial_file_counts: std::collections::HashMap<std::path::PathBuf, usize>,
+            tracked_dirs: Vec<std::path::PathBuf>,
+        }
+
+        impl ResourceTracker {
+            /// Create resource tracker
+            pub fn new() -> Self {
+                Self {
+                    initial_file_counts: std::collections::HashMap::new(),
+                    tracked_dirs: Vec::new(),
+                }
+            }
+
+            /// Start tracking directory
+            pub fn track_dir(&mut self, path: std::path::PathBuf) {
+                let initial_count = crate::fixtures::hls::utils::count_files_recursive(&path);
+                self.initial_file_counts.insert(path.clone(), initial_count);
+                self.tracked_dirs.push(path);
+            }
+
+            /// Assert at least N new files created
+            pub fn assert_min_new_files(&self, min_new_files: usize) {
+                let mut total_new = 0;
+                for (path, initial_count) in &self.initial_file_counts {
+                    let current_count = crate::fixtures::hls::utils::count_files_recursive(path);
+                    total_new += current_count.saturating_sub(*initial_count);
+                }
+
+                assert!(
+                    total_new >= min_new_files,
+                    "Expected at least {} new files, but got {}",
+                    min_new_files,
+                    total_new
+                );
+            }
+
+            /// Get total new files
+            pub fn total_new_files(&self) -> usize {
+                let mut total = 0;
+                for (path, initial_count) in &self.initial_file_counts {
+                    let current_count = crate::fixtures::hls::utils::count_files_recursive(path);
+                    total += current_count.saturating_sub(*initial_count);
+                }
+                total
+            }
+        }
+
+        impl Default for ResourceTracker {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
     }
 }

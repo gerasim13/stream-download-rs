@@ -32,6 +32,7 @@ use crate::Aes128CbcMiddleware;
 #[cfg(feature = "aes-decrypt")]
 use crate::StreamMiddleware;
 use crate::abr::AbrDecision;
+use crate::manager::SegmentDescriptor;
 use crate::parser::VariantId;
 use crate::{AbrConfig, AbrController, HlsManager, MediaStream, ResourceDownloader};
 
@@ -56,7 +57,7 @@ struct SegmentRouting {
 
 struct SegmentContext {
     plan: SegmentPlan,
-    desc: crate::manager::SegmentDescriptor,
+    desc: SegmentDescriptor,
     seg_size: Option<u64>,
     #[cfg(feature = "aes-decrypt")]
     drm_params_opt: Option<([u8; 16], [u8; 16])>,

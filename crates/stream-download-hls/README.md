@@ -26,6 +26,7 @@ Most of the high-level design/behavior documentation lives in this README to kee
 - [Segmented storage](#segmented-storage)
 - [Seeking & content length](#seeking--content-length)
 - [Encryption / decryption (`aes-decrypt` feature)](#encryption--decryption-aes-decrypt-feature)
+- [Testing](#testing)
 - [Operational notes & constraints](#operational-notes--constraints)
 - [Documentation policy](#documentation-policy)
 
@@ -375,12 +376,69 @@ Important implementation note:
 
 ---
 
+## Testing
+
+The crate includes comprehensive integration tests in the `tests/` directory. Tests cover:
+
+- **Basic streaming**: VOD completion, segment fetching, stream closure
+- **Storage backends**: Persistent, temp, and memory storage
+- **DRM/AES-128**: Encryption/decryption, key fetching, caching
+- **ABR**: Adaptive bitrate switching, variant selection
+- **URL resolution**: Base URL handling, prefix remapping
+- **Seeking**: Byte offset resolution, segment boundary crossing
+
+### Test Utilities
+
+Key test utilities in `tests/tests/utils/`:
+
+- **File operations**: `create_temp_dir`, `clean_dir`, `assert_file_count`
+- **Stream testing**: `wait_first_chunkstart`, `wait_n_chunkstarts`
+- **Assertions**: `assert_bytes_eq`, `assert_condition_within`
+- **Configuration**: `TestConfig` builder pattern
+
+### HLS Fixtures
+
+The `HlsFixture` struct provides configurable test servers:
+
+```rust
+use fixtures::hls::{HlsFixture, create_basic_fixture};
+
+// Create a basic fixture
+let fixture = create_basic_fixture(2); // 2 variants
+
+// Configure with DRM
+let drm_fixture = HlsFixture::with_variant_count(2)
+    .with_aes128_drm()
+    .with_aes128_fixed_zero_iv(true);
+
+// Configure with ABR
+let abr_fixture = HlsFixture::with_variant_count(3)
+    .with_abr_config(|cfg| {
+        cfg.abr_min_switch_interval = Duration::ZERO;
+    });
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+cargo test
+
+# Run specific test
+cargo test test_name
+
+# Run with logging
+RUST_LOG=debug cargo test -- --nocapture
+```
+
+Tests use `rstest` for parameterization and support all storage backends (persistent, temp, memory).
+
 ## Documentation policy
 
 - Keep rustdoc in `src/` concise:
   - 1–3 lines for public items unless field-level docs are involved.
   - field-level docs are retained (good IDE hover/tooltips and API clarity).
-- Put “wall of text” design notes in this README.
+- Put "wall of text" design notes in this README.
 - If you add new behavior:
   - update the relevant section here,
   - keep code comments focused on local invariants and sharp edges.

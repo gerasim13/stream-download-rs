@@ -16,91 +16,11 @@ use tokio::sync::mpsc;
 
 mod fixtures;
 
-fn dir_nonempty_recursive(root: &std::path::Path) -> bool {
-    count_files_recursive(root) > 0
-}
-
-fn count_files_recursive(root: &std::path::Path) -> usize {
-    fn walk(p: &std::path::Path, acc: &mut usize) {
-        let Ok(rd) = std::fs::read_dir(p) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_file() {
-                *acc += 1;
-            } else if ft.is_dir() {
-                walk(&path, acc);
-            }
-        }
-    }
-
-    if !root.exists() {
-        return 0;
-    }
-
-    let mut n = 0usize;
-    walk(root, &mut n);
-    n
-}
-
-fn clean_dir(root: &std::path::Path) {
-    if let Err(e) = std::fs::remove_dir_all(root) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            panic!("failed to clean directory {}: {e}", root.display());
-        }
-    }
-}
-
-fn is_variant_stream_key(
-    stream_key: &stream_download::source::ResourceKey,
-    variant_id: u64,
-) -> bool {
-    stream_key.0.ends_with(&format!("/{}", variant_id))
-}
-
-fn build_fixture_storage_kind(
-    base_name: &str,
-    variant_count: usize,
-    storage: &str,
-) -> HlsFixtureStorageKind {
-    match storage {
-        "persistent" => HlsFixtureStorageKind::Persistent {
-            storage_root: std::env::temp_dir()
-                .join("stream-download-tests")
-                .join(format!("{base_name}-v{variant_count}-persistent")),
-        },
-        "temp" => HlsFixtureStorageKind::Temp {
-            subdir: format!("{base_name}-v{variant_count}-temp"),
-        },
-        "memory" => HlsFixtureStorageKind::Memory {
-            resource_cache_root: std::env::temp_dir()
-                .join("stream-download-tests")
-                .join(format!("{base_name}-v{variant_count}-memory-resources")),
-        },
-        other => panic!("unknown storage kind '{other}'"),
-    }
-}
-
-async fn wait_first_chunkstart(mut data_rx: mpsc::Receiver<StreamMsg>) -> StreamControl {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(250), data_rx.recv()).await {
-            Ok(Some(StreamMsg::Control(ctrl))) => {
-                if matches!(ctrl, StreamControl::ChunkStart { .. }) {
-                    return ctrl;
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => {}
-        }
-    }
-    panic!("did not observe any ChunkStart in time");
-}
+use fixtures::hls::utils::{
+    assert_dir_not_empty, build_fixture_storage_kind, clean_dir, count_files_recursive,
+    create_fixture_from_config, dir_nonempty_recursive, is_variant_stream_key, test_config,
+    wait_first_chunkstart,
+};
 
 async fn collect_first_n_chunkstarts(
     mut data_rx: mpsc::Receiver<StreamMsg>,
@@ -167,7 +87,7 @@ fn hls_aes128_drm_decrypts_media_segments_for_all_storage_backends(#[case] stora
 
         let storage_kind = build_fixture_storage_kind("hls-aes128-drm", variant_count, storage);
 
-        // Start from clean roots so we don't accidentally read cached plaintext/old data.
+        // Clean storage roots
         match &storage_kind {
             HlsFixtureStorageKind::Persistent { storage_root } => clean_dir(storage_root),
             HlsFixtureStorageKind::Temp { subdir } => {
@@ -258,12 +178,7 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
-        // We verify two knobs end-to-end:
-        // 1) key_query_params: client must append these to the key URL, otherwise the fixture returns 400.
-        // 2) key_processor_cb: fixture serves a *wrapped* key; callback must unwrap it, otherwise decryption fails.
-        //
-        // We keep fixed-zero-IV to avoid sequence/IV mismatches and focus this test on key fetch customization.
-
+        // Test key query params and processor callback
         let mut qp = HashMap::new();
         qp.insert("token".to_string(), "abc123".to_string());
         qp.insert("tenant".to_string(), "tests".to_string());
@@ -333,8 +248,7 @@ fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
-        // Plain AES-128 (no key processor callback). We read enough bytes to span multiple segments,
-        // then assert the key endpoint was not hit once-per-segment.
+        // Test key caching across segments
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
             .with_aes128_drm()
@@ -518,13 +432,7 @@ fn hls_base_url_default_segment_urls_404_when_segments_are_remapped(#[case] stor
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
-        // When the fixture serves variant playlists / init / keys / segments ONLY under a derived prefix,
-        // the code under test must use `HlsSettings::base_url` for URL resolution.
-        //
-        // IMPORTANT:
-        // - We want the fixture routing override (prefix) to be enabled,
-        // - but we must NOT configure the client `base_url` to an external host (that would cause a network error
-        //   instead of an in-fixture 404 and make this test flaky / environment-dependent).
+        // Test that segments return 404 without base_url override
         //
         // So: derive prefix from a URL on the *same* host as the fixture server, then clear client base_url again.
         let fixture_base =
@@ -604,11 +512,7 @@ fn hls_base_url_override_makes_segment_remap_work(#[case] storage: &str, #[case]
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
-        // We want to validate that:
-        // - the fixture derives a prefix from `base_url` path (everything after host)
-        // - the code under test uses `HlsSettings::base_url` during URL resolution
-        //
-        // We parameterize the prefix string (depth 1..=3) to ensure there is no hardcoding for specific paths.
+        // Test base_url override with different prefix depths
         let depth = prefix.split('/').filter(|s| !s.is_empty()).count();
 
         // Start the prefixed-only fixture server first, then take its *actual* server base URL and
@@ -689,14 +593,12 @@ fn hls_aes128_drm_succeeds_when_key_headers_not_required_and_not_sent(#[case] st
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
 
-        // Server does NOT require headers (None), and client does NOT send any.
-        // Stream should still decrypt and produce expected plaintext.
+        // Test DRM without required headers
         let fixture = HlsFixture::with_variant_count(variant_count)
             .with_segment_delay(Duration::ZERO)
             .with_aes128_drm()
             .with_aes128_fixed_zero_iv(true)
             .with_key_required_request_headers(None)
-            // Ensure client also has no headers configured.
             .with_hls_config(HlsSettings::default());
 
         let storage_kind = build_fixture_storage_kind(
@@ -1142,14 +1044,7 @@ fn hls_vod_completes_and_fetches_all_segments_slq_a1(#[case] storage: &str) {
 #[case("memory")]
 fn hls_vod_real_assets_fetches_all_segments_and_stream_closes(#[case] storage: &str) {
     SERVER_RT.block_on(async {
-        // Real-assets VOD completion test (uses the repo `assets/hls` directory).
-        //
-        // Goal:
-        // - Ensure the HLS worker can iterate an ENDLIST VOD playlist to completion against the real files.
-        // - Ensure the ordered output channel closes (so `HlsStream::poll_next` can yield `None`).
-        // - Ensure all expected segment files for the selected variant were requested.
-        //
-        // This test exists to distinguish "HLS layer can't complete VOD" from "audio layer stalls".
+        // Test VOD completion with real assets
 
         let assets_root = std::path::PathBuf::from("../assets/hls");
         let variant_count = 4usize;
@@ -1368,12 +1263,7 @@ fn hls_abr_downswitches_after_low_throughput_sample(#[case] variant_count: usize
 #[case(4)]
 fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
-        // Integration-level assertion:
-        // When AUTO mode is enabled (no selector callback), the *worker* should start from
-        // `HlsSettings::abr_initial_variant_index` without locking ABR into manual mode.
-        //
-        // We must test this via the HlsStreamWorker path (not AbrController), because the override
-        // is applied in worker initialization.
+        // Test worker starts with correct variant in AUTO mode
 
         let initial_variant_index = if variant_count > 1 { 1usize } else { 0usize };
 
@@ -1460,11 +1350,7 @@ fn hls_worker_auto_start_uses_abr_initial_variant_index(#[case] variant_count: u
 #[case(4)]
 fn hls_worker_manual_downswitch_applies_via_ordered_controls(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
-        assert!(
-            variant_count >= 2,
-            "this test requires at least 2 variants (got {})",
-            variant_count
-        );
+        assert!(variant_count >= 2, "need at least 2 variants");
 
         let start_variant_index = variant_count - 1;
         let target_variant_index = 0usize;
@@ -1614,11 +1500,7 @@ fn hls_worker_manual_downswitch_applies_via_ordered_controls(#[case] variant_cou
 #[case(4)]
 fn hls_worker_manual_upswitch_applies_via_ordered_controls(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
-        assert!(
-            variant_count >= 2,
-            "this test requires at least 2 variants (got {})",
-            variant_count
-        );
+        assert!(variant_count >= 2, "need at least 2 variants");
 
         let start_variant_index = 0usize;
         let target_variant_index = variant_count - 1;
@@ -2268,16 +2150,10 @@ fn hls_persistent_storage_creates_files_on_disk_after_read(#[case] variant_count
 #[case(4)]
 fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] variant_count: usize) {
     SERVER_RT.block_on(async {
-        let fixture = HlsFixture::with_variant_count(variant_count)
-            .with_segment_delay(Duration::ZERO);
+        let fixture =
+            HlsFixture::with_variant_count(variant_count).with_segment_delay(Duration::ZERO);
 
-        // In memory mode, main stream bytes are stored in memory, but HLS resource caching uses a
-        // disk-backed file-tree handle rooted at `resource_cache_root`.
-        //
-        // This test asserts that we do NOT create segment files under a "segment root" because
-        // there is no segment root for memory storage. As a proxy, we assert that our chosen
-        // resource cache root starts empty and remains either empty or very small (resources only),
-        // and crucially does not explode into a segment tree layout.
+        // Test memory storage doesn't create segment files
         let resource_cache_root = std::env::temp_dir()
             .join("stream-download-tests")
             .join(format!("hls-disk-files-memory-resources-v{variant_count}"));
@@ -2289,9 +2165,7 @@ fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] varia
             resource_cache_root: resource_cache_root.clone(),
         };
 
-        let (_base_url, mut reader) = fixture
-            .stream_download_boxed(storage_kind)
-            .await;
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
 
         // Trigger actual work.
         let mut buf = [0u8; 32];
@@ -2301,13 +2175,194 @@ fn hls_memory_stream_storage_does_not_create_segment_files_on_disk(#[case] varia
         let after_files = count_files_recursive(&resource_cache_root);
 
         // Resource caching may write a handful of small blobs (playlists/keys), but it should not
-        // behave like segment persistence. We assert that the directory does not suddenly become
-        // "populated like a segment cache". Keep this intentionally lenient but meaningful:
-        // - it should not go from 0 to many dozens just from a tiny read.
+        // Should not create many files
         assert!(
             after_files.saturating_sub(before_files) <= variant_count + 6,
-            "memory stream storage should not create many files on disk; got before={before_files}, after={after_files} under {}",
-            resource_cache_root.display()
+            "memory storage created too many files: before={}, after={}",
+            before_files,
+            after_files
         );
+    });
+}
+
+// Example test using new utilities
+#[rstest]
+#[case(2, "persistent")]
+#[case(2, "temp")]
+#[case(2, "memory")]
+#[case(4, "persistent")]
+#[case(4, "temp")]
+#[case(4, "memory")]
+fn hls_improved_test_example_using_utilities(#[case] variant_count: usize, #[case] storage: &str) {
+    SERVER_RT.block_on(async {
+        // Use helper function to create fixture with common configuration
+        let fixture = fixtures::hls::create_basic_fixture(variant_count);
+
+        // Use utility function to build storage kind
+        let storage_kind =
+            build_fixture_storage_kind("hls-improved-example", variant_count, storage);
+
+        // Clean up any existing test data
+        match &storage_kind {
+            fixtures::hls::HlsFixtureStorageKind::Persistent { storage_root } => {
+                clean_dir(&storage_root);
+            }
+            fixtures::hls::HlsFixtureStorageKind::Temp { .. } => {
+                // Temp storage cleans up automatically
+            }
+            fixtures::hls::HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => {
+                clean_dir(&resource_cache_root);
+            }
+        }
+
+        // Use stream_download_boxed like original tests
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
+
+        // Warm up pipeline
+        let mut warm = [0u8; 1];
+        let _ = std::io::Read::read(&mut reader, &mut warm).expect("warmup read failed");
+
+        // Read some bytes
+        let mut bytes_read = vec![0u8; 1024];
+        let n = std::io::Read::read(&mut reader, &mut bytes_read).expect("read failed");
+        bytes_read.truncate(n);
+
+        // Verify we got some bytes
+        assert!(!bytes_read.is_empty(), "Expected to read some bytes");
+
+        // Verify the bytes are not all zeros (unless that's expected)
+        let all_zeros = bytes_read.iter().all(|&b| b == 0);
+        assert!(!all_zeros, "Read bytes are all zeros, which is unexpected");
+
+        // Check request counts
+        let master_requests = fixture.request_count_for("/master.m3u8").unwrap_or(0);
+        let variant_requests = fixture.request_count_for("/v0.m3u8").unwrap_or(0);
+
+        // We should have at least one request for master and variant playlist
+        assert!(
+            master_requests >= 1,
+            "Expected at least 1 master playlist request"
+        );
+        assert!(
+            variant_requests >= 1,
+            "Expected at least 1 variant playlist request"
+        );
+
+        // For persistent storage, verify files were created
+        if storage == "persistent" {
+            if let fixtures::hls::HlsFixtureStorageKind::Persistent { storage_root } =
+                build_fixture_storage_kind("hls-improved-example", variant_count, storage)
+            {
+                assert_dir_not_empty(&storage_root);
+            }
+        }
+
+        // Clean up
+        fixture
+            .reset_request_counts()
+            .expect("failed to reset request counts");
+    });
+}
+
+// Example test using advanced utilities
+#[rstest]
+#[case(3, "memory")]
+#[case(4, "temp")]
+fn hls_advanced_utilities_example(#[case] variant_count: usize, #[case] storage: &str) {
+    SERVER_RT.block_on(async {
+        // Create test configuration using builder pattern
+        let config = test_config()
+            .variant_count(variant_count)
+            .storage_kind(storage)
+            .segment_delay(Duration::from_millis(50))
+            .with_abr();
+
+        // Create fixture from configuration
+        let fixture = create_fixture_from_config(config);
+
+        // Set up per-variant delays to simulate network conditions
+        let mut variant_delays = Vec::new();
+        for i in 0..variant_count {
+            // Simulate: variant 0 is fastest, last variant is slowest
+            let delay = Duration::from_millis(100 * (i as u64 + 1));
+            variant_delays.push(delay);
+        }
+
+        // Create ABR test helper
+        let _abr_helper =
+            fixtures::hls::utils::advanced::AbrTestHelper::new(variant_delays.clone(), 0);
+
+        // Build storage with resource tracking
+        let storage_kind =
+            build_fixture_storage_kind("hls-advanced-example", variant_count, storage);
+
+        // Clean up before test
+        match &storage_kind {
+            fixtures::hls::HlsFixtureStorageKind::Persistent { storage_root } => {
+                clean_dir(&storage_root);
+            }
+            fixtures::hls::HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => {
+                clean_dir(&resource_cache_root);
+            }
+            _ => {}
+        }
+
+        // Create resource tracker
+        let mut resource_tracker = fixtures::hls::utils::advanced::ResourceTracker::new();
+
+        // Track directories based on storage type
+        match &storage_kind {
+            fixtures::hls::HlsFixtureStorageKind::Persistent { storage_root } => {
+                resource_tracker.track_dir(storage_root.clone());
+            }
+            fixtures::hls::HlsFixtureStorageKind::Memory {
+                resource_cache_root,
+            } => {
+                resource_tracker.track_dir(resource_cache_root.clone());
+            }
+            _ => {}
+        }
+
+        // Use stream_download_boxed like original tests
+        let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind).await;
+
+        // Warm up pipeline
+        let mut warm = [0u8; 1];
+        let _ = std::io::Read::read(&mut reader, &mut warm).expect("warmup read failed");
+
+        // Read some data
+        let mut bytes_read = vec![0u8; 2048];
+        let n = std::io::Read::read(&mut reader, &mut bytes_read).expect("read failed");
+        bytes_read.truncate(n);
+        assert!(!bytes_read.is_empty(), "Expected to read some bytes");
+
+        // Verify resource usage
+        if storage == "persistent" {
+            // For persistent storage, we expect some new files
+            resource_tracker.assert_min_new_files(1);
+            let new_files = resource_tracker.total_new_files();
+            println!("Created {} new files during test", new_files);
+        } else if storage == "memory" {
+            // For memory storage, we might have some resource cache files
+            let new_files = resource_tracker.total_new_files();
+            println!("Memory storage created {} resource cache files", new_files);
+        }
+
+        // Verify request counts
+        let master_requests = fixture.request_count_for("/master.m3u8").unwrap_or(0);
+        assert!(
+            master_requests >= 1,
+            "Expected at least 1 master playlist request, got {}",
+            master_requests
+        );
+
+        // Clean up
+        fixture
+            .reset_request_counts()
+            .expect("failed to reset request counts");
     });
 }
