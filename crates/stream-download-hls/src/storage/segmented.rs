@@ -115,15 +115,6 @@ where
             storage_root: self.storage_root.clone(),
         }));
 
-        // // Ensure there is a default stream entry so the reader has a target.
-        // {
-        //     let mut guard = state.write();
-        //     guard
-        //         .streams
-        //         .entry(self.default_stream_key.clone())
-        //         .or_insert_with(StreamState::<F::Provider>::default);
-        // }
-
         let reader = SegmentedReader::<F::Provider> {
             state: state.clone(),
             stream_key: self.default_stream_key.clone(),
@@ -221,9 +212,9 @@ where
         Self {
             reader: Mutex::new(reader),
             writer: Mutex::new(Some(writer)),
-            reported,
             gathered_len: Mutex::new(0),
             finalized: Mutex::new(false),
+            reported,
             start_offset,
         }
     }

@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use bytes::Bytes;
+use reqwest::Url;
 use stream_download::source::{StreamControl, StreamMsg};
 use stream_download::storage::memory::MemoryStorageProvider;
 use stream_download::storage::{
@@ -21,7 +22,7 @@ use stream_download::{Settings, StreamDownload};
 use stream_download_hls::MediaStream;
 use stream_download_hls::{
     AbrConfig, AbrController, HlsManager, HlsPersistentStorageProvider, HlsSettings, HlsStream,
-    HlsStreamParams, HlsStreamWorker, KeyProcessorCallback, ResourceDownloader, VariantId,
+    HlsStreamParams, HlsStreamWorker, KeyProcessorCallback, VariantId, create_default_downloader,
     master_hash_from_url,
 };
 use tokio::sync::{broadcast, mpsc};
@@ -734,23 +735,24 @@ impl HlsFixture {
         &self,
         storage_handle: stream_download::storage::StorageHandle,
         data_tx: mpsc::Sender<stream_download::source::StreamMsg>,
-    ) -> (reqwest::Url, HlsManager) {
+    ) -> (Url, HlsManager) {
         let base_url = self.start().await;
         let url = base_url
             .join("master.m3u8")
             .expect("failed to build master url");
 
         let hls_settings = Arc::new(self.hls_settings.clone());
-        let downloader = ResourceDownloader::new(
+        let downloader = create_default_downloader(
             hls_settings.request_timeout,
             hls_settings.max_retries,
             hls_settings.retry_base_delay,
             hls_settings.max_retry_delay,
             CancellationToken::new(),
-        )
-        .with_key_request_headers(hls_settings.key_request_headers.clone());
+            Some(storage_handle.clone()),
+            hls_settings.key_request_headers.clone(),
+        );
 
-        let manager = HlsManager::new(url, hls_settings, downloader, storage_handle, data_tx);
+        let manager = HlsManager::new(url, hls_settings, downloader, data_tx);
         (base_url, manager)
     }
 
@@ -1869,27 +1871,29 @@ pub fn create_mock_fixture_with_custom_payload(
 // Helper to create HlsManager for tests
 pub async fn create_test_manager(
     master_url: reqwest::Url,
-    storage_handle: &stream_download::storage::StorageHandle,
     settings: HlsSettings,
+    storage_handle: &stream_download::storage::StorageHandle,
 ) -> stream_download_hls::HlsManager {
-    use stream_download_hls::ResourceDownloader;
+    use stream_download_hls::create_default_downloader;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     let (control_sender, _) = mpsc::channel(16);
-    let downloader = ResourceDownloader::new(
+
+    let downloader = create_default_downloader(
         std::time::Duration::from_secs(10),
         3,
         std::time::Duration::from_millis(100),
         std::time::Duration::from_secs(5),
         CancellationToken::new(),
+        None,
+        None,
     );
 
     stream_download_hls::HlsManager::new(
         master_url,
         std::sync::Arc::new(settings),
         downloader,
-        storage_handle.clone(),
         control_sender,
     )
 }

@@ -8,8 +8,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::trace;
 
-use crate::cache::keys::{key_key_from_url, master_hash_from_url};
-use crate::downloader::{CacheSource, CachedResourceDownloader};
+use crate::downloader::{Downloader, DownloaderExt};
 use crate::error::{HlsError, HlsResult};
 use crate::parser::{EncryptionMethod, KeyInfo, SegmentKey};
 use crate::settings::HlsSettings;
@@ -22,8 +21,8 @@ pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
 pub struct AesKeyResolver {
     /// Configuration for HLS streaming
     config: Arc<HlsSettings>,
-    /// Downloader for fetching keys with caching
-    cached_downloader: Arc<CachedResourceDownloader>,
+    /// Downloader for fetching keys (includes caching)
+    downloader: Arc<dyn Downloader + Send + Sync>,
     /// Cache for resolved keys (URL -> key bytes)
     key_cache: HashMap<String, Bytes>,
     /// Callback for processing key bytes
@@ -34,7 +33,7 @@ impl std::fmt::Debug for AesKeyResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AesKeyResolver")
             .field("config", &self.config)
-            .field("cached_downloader", &"Arc<CachedResourceDownloader>")
+            .field("downloader", &"Arc<dyn Downloader>")
             .field("key_cache", &self.key_cache)
             .field(
                 "key_processor_cb",
@@ -51,12 +50,12 @@ impl AesKeyResolver {
     /// Creates a new AesKeyResolver instance.
     pub fn new(
         config: Arc<HlsSettings>,
-        cached_downloader: Arc<CachedResourceDownloader>,
+        downloader: Arc<dyn Downloader + Send + Sync>,
         key_processor_cb: Option<Arc<Box<dyn Fn(Bytes) -> Bytes + Send + Sync>>>,
     ) -> Self {
         Self {
             config,
-            cached_downloader,
+            downloader,
             key_cache: HashMap::new(),
             key_processor_cb,
         }
@@ -182,29 +181,10 @@ impl AesKeyResolver {
             return Ok(cached.clone());
         }
 
-        // Variant-scoped key caching:
-        // key path: `<master_hash>/<variant_id>/<key_basename>`
-        let master_url_obj = url::Url::parse(master_url).map_err(HlsError::base_url_parse)?;
-        let master_hash = master_hash_from_url(&master_url_obj);
+        // Downloader includes caching via CacheDownloader layer if configured
+        let key_bytes = self.downloader.download_key(final_key_url, None).await?;
 
-        let key = key_key_from_url(
-            &master_hash,
-            crate::parser::VariantId(variant_id),
-            final_key_url,
-        )
-        .ok_or_else(|| HlsError::Message("unable to derive key basename".to_string()))?;
-
-        let res = self
-            .cached_downloader
-            .download_key_cached(final_key_url, &key)
-            .await?;
-
-        if res.source == CacheSource::Network {
-            // Note: emit_store_resource is handled by the caller if needed
-            trace!("HLS DRM: fetched key from network: {}", final_key_url);
-        }
-
-        let mut kb = res.bytes;
+        let mut kb = key_bytes;
         if let Some(cb) = &self.key_processor_cb {
             kb = cb.as_ref()(kb);
         }

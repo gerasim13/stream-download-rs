@@ -34,7 +34,7 @@ use crate::StreamMiddleware;
 use crate::abr::AbrDecision;
 use crate::manager::SegmentDescriptor;
 use crate::parser::VariantId;
-use crate::{AbrConfig, AbrController, HlsManager, MediaStream, ResourceDownloader};
+use crate::{AbrConfig, AbrController, HlsManager, MediaStream, create_default_downloader};
 
 enum RaceOutcome<T> {
     Completed(T),
@@ -625,11 +625,11 @@ impl HlsStreamWorker {
             self.bytes_to_skip = 0;
             self.manager
                 .downloader()
-                .stream_segment_range(&desc.uri, start, None)
+                .stream_range(&desc.uri, start, None)
                 .await
         } else {
             // Init is always streamed fully.
-            self.manager.downloader().stream_segment(&desc.uri).await
+            self.manager.downloader().stream(&desc.uri).await
         };
 
         match stream_res {
@@ -907,19 +907,20 @@ impl HlsStreamWorker {
             settings.max_retry_delay,
         );
 
-        let mut manager_downloader = ResourceDownloader::new(
+        #[cfg(feature = "aes-decrypt")]
+        let key_request_headers = settings.key_request_headers.clone();
+        #[cfg(not(feature = "aes-decrypt"))]
+        let key_request_headers = None;
+
+        let manager_downloader = create_default_downloader(
             request_timeout,
             max_retries,
             retry_base_delay,
             max_retry_delay,
             cancel_token.clone(),
+            Some(storage_handle.clone()),
+            key_request_headers,
         );
-
-        #[cfg(feature = "aes-decrypt")]
-        {
-            manager_downloader =
-                manager_downloader.with_key_request_headers(settings.key_request_headers.clone());
-        }
 
         // Read-before-fetch caching for playlists/keys uses the storage handle.
         // Persistence is performed by emitting `StoreResource` via the same ordered stream channel.
@@ -927,7 +928,6 @@ impl HlsStreamWorker {
             url.clone(),
             settings.clone(),
             manager_downloader,
-            storage_handle.clone(),
             data_sender.clone(),
         );
 

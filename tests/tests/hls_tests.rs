@@ -1942,7 +1942,7 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             let uri_s = desc.uri.to_string();
             let mut stream = manager
                 .downloader()
-                .stream_segment(&desc.uri)
+                .stream(&desc.uri)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("failed to stream segment for variant {variant_index} (uri={uri_s}): {e}")

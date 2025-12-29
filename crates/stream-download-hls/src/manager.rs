@@ -1,7 +1,7 @@
 //! HLS stream manager.
 //!
 //! This module provides the player-facing API (`MediaStream`) plus segment iteration types.
-//! Playlist/key caching is handled via `CachedResourceDownloader` and `StreamControl::StoreResource`.
+//! Playlist/key caching is handled via `CacheDownloader` decorator and `StreamControl::StoreResource`.
 //! For higher-level design notes, see `crates/stream-download-hls/README.md`.
 
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use stream_download::source::{ResourceKey, StreamControl, StreamMsg};
-use stream_download::storage::StorageHandle;
+
 use tokio::sync::mpsc;
 use tracing::instrument;
 
@@ -18,8 +18,7 @@ use crate::cache::keys::{master_hash_from_url, playlist_key_from_url};
 #[cfg(feature = "aes-decrypt")]
 use crate::crypto::resolver::AesKeyResolver;
 use crate::downloader::HlsByteStream;
-use crate::downloader::ResourceDownloader;
-use crate::downloader::{CacheSource, CachedResourceDownloader};
+use crate::downloader::{Downloader, DownloaderExt};
 use crate::error::{HlsError, HlsResult};
 use crate::parser::{
     CodecInfo, InitSegment, MasterPlaylist, MediaPlaylist, MediaSegment, SegmentKey, VariantId,
@@ -88,16 +87,13 @@ pub struct SegmentDescriptor {
 }
 
 /// High-level handle for a single HLS stream (no network I/O until async methods are called).
-#[derive(Debug)]
 pub struct HlsManager {
     /// URL of the master playlist.
     master_url: url::Url,
     /// Configuration parameters.
     config: Arc<HlsSettings>,
     /// Downloader used to fetch playlists and segments.
-    downloader: ResourceDownloader,
-    /// Cached wrapper for playlist/key reads (read-before-fetch using `StorageHandle`).
-    cached_downloader: CachedResourceDownloader,
+    downloader: Arc<dyn Downloader + Send + Sync>,
     /// Control sender used to persist fetched resources via `StoreResource`.
     control_sender: mpsc::Sender<StreamMsg>,
     /// Cached master playlist, once loaded.
@@ -119,23 +115,41 @@ pub struct HlsManager {
     segment_sizes: std::collections::HashMap<u64, u64>,
 }
 
+impl std::fmt::Debug for HlsManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug_struct = f.debug_struct("HlsManager");
+        debug_struct
+            .field("master_url", &self.master_url)
+            .field("config", &self.config)
+            .field("downloader", &"Arc<dyn Downloader>")
+            .field("control_sender", &self.control_sender)
+            .field("master", &self.master)
+            .field("current_variant_index", &self.current_variant_index)
+            .field("current_media_playlist", &self.current_media_playlist)
+            .field("media_playlist_url", &self.media_playlist_url)
+            .field("next_segment_index", &self.next_segment_index)
+            .field("init_segment_sent", &self.init_segment_sent);
+
+        #[cfg(feature = "aes-decrypt")]
+        debug_struct.field("aes_key_resolver", &self.aes_key_resolver);
+
+        debug_struct.field("segment_sizes", &self.segment_sizes);
+        debug_struct.finish()
+    }
+}
+
 impl HlsManager {
     /// Creates a new `HlsManager` (no network I/O).
     pub fn new(
         master_url: url::Url,
         config: Arc<HlsSettings>,
-        downloader: ResourceDownloader,
-        storage_handle: StorageHandle,
+        downloader: Arc<dyn Downloader + Send + Sync>,
         control_sender: mpsc::Sender<StreamMsg>,
     ) -> Self {
-        let downloader = downloader;
-        let cached_downloader =
-            CachedResourceDownloader::new(downloader.clone(), Some(storage_handle));
-
         #[cfg(feature = "aes-decrypt")]
         let aes_key_resolver = Some(AesKeyResolver::new(
             Arc::clone(&config),
-            Arc::new(cached_downloader.clone()),
+            downloader.clone(),
             config.key_processor_cb.clone(),
         ));
 
@@ -143,7 +157,6 @@ impl HlsManager {
             master_url,
             config,
             downloader,
-            cached_downloader,
             control_sender,
             #[cfg(feature = "aes-decrypt")]
             aes_key_resolver,
@@ -173,13 +186,8 @@ impl HlsManager {
     }
 
     /// Returns the underlying downloader.
-    pub fn downloader(&self) -> &ResourceDownloader {
+    pub fn downloader(&self) -> &Arc<dyn Downloader + Send + Sync> {
         &self.downloader
-    }
-
-    /// Returns mutable access to the underlying downloader.
-    pub fn downloader_mut(&mut self) -> &mut ResourceDownloader {
-        &mut self.downloader
     }
 
     /// Emits `StoreResource` after a network miss (best-effort).
@@ -331,16 +339,10 @@ impl HlsManager {
                 HlsError::Message("unable to derive master playlist basename".to_string())
             })?;
 
-        let res = self
-            .cached_downloader
-            .download_playlist_cached(self.master_url.as_str(), &key)
-            .await?;
+        let bytes = self.downloader.download(self.master_url.as_str()).await?;
+        self.emit_store_resource(key.clone(), bytes.clone())?;
 
-        if res.source == CacheSource::Network {
-            self.emit_store_resource(key.clone(), res.bytes.clone())?;
-        }
-
-        let master_playlist = parse_master_playlist(&res.bytes)?;
+        let master_playlist = parse_master_playlist(&bytes)?;
         self.master = Some(master_playlist);
         Ok(self.master.as_ref().unwrap())
     }
@@ -367,16 +369,10 @@ impl HlsManager {
             HlsError::Message("unable to derive media playlist basename".to_string())
         })?;
 
-        let res = self
-            .cached_downloader
-            .download_playlist_cached(&media_url, &key)
-            .await?;
+        let bytes = self.downloader.download(&media_url).await?;
+        self.emit_store_resource(key.clone(), bytes.clone())?;
 
-        if res.source == CacheSource::Network {
-            self.emit_store_resource(key.clone(), res.bytes.clone())?;
-        }
-
-        let media_playlist = parse_media_playlist(&res.bytes, variant_id)?;
+        let media_playlist = parse_media_playlist(&bytes, variant_id)?;
         self.current_media_playlist = Some(media_playlist);
 
         Ok(self.current_media_playlist.as_ref().unwrap())
@@ -643,16 +639,13 @@ impl MediaStream for HlsManager {
             HlsError::Message("unable to derive media playlist basename".to_string())
         })?;
 
-        let res = self
-            .cached_downloader
-            .download_playlist_cached(&media_playlist_url, &key)
+        let bytes = self
+            .downloader
+            .download_playlist(&media_playlist_url)
             .await?;
+        self.emit_store_resource(key.clone(), bytes.clone())?;
 
-        if res.source == CacheSource::Network {
-            self.emit_store_resource(key.clone(), res.bytes.clone())?;
-        }
-
-        let media_playlist = parse_media_playlist(&res.bytes, playlist.id)?;
+        let media_playlist = parse_media_playlist(&bytes, playlist.id)?;
 
         // Preserve playback position by keeping the same segment index (assumes time-aligned variants).
         let old_index = self.next_segment_index;

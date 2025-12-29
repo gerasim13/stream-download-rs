@@ -17,7 +17,10 @@ mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, AbrDecision};
 pub use crate::downloader::HlsByteStream;
-pub use crate::downloader::{CachedBytes, CachedResourceDownloader, ResourceDownloader};
+pub use crate::downloader::{
+    CacheDownloader, CachedBytes, Downloader, DownloaderBuilder, DownloaderExt, HttpDownloader,
+    RetryDownloader, RetryPolicy, TimeoutDownloader, create_default_downloader,
+};
 pub use crate::error::{HlsError, HlsResult};
 
 /// Deterministic cache/layout helper.
