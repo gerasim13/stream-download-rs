@@ -1,0 +1,29 @@
+[package]
+name = "stream-download-cache"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+authors = ["Austin Schey <aschey13@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aschey/stream-download-rs"
+homepage = "https://github.com/aschey/stream-download-rs"
+include = ["/src", "/tests", "LICENSE-MIT", "LICENSE-APACHE"]
+categories = ["multimedia", "asynchronous", "caching"]
+keywords = ["audio", "stream", "media", "cache"]
+description = "Storage-backed cache implementations for stream-download"
+
+[dependencies]
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+stream-download = { path = "../stream-download" }
+
+[dev-dependencies]
+stream-download = { path = "../stream-download", features = ["temp-storage"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[features]
+default = []
+temp-storage = ["stream-download/temp-storage"]
+
+[lints]
+workspace = true
