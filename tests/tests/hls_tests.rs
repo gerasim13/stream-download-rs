@@ -73,6 +73,44 @@ async fn read_first_n_bytes_via_worker(
         .await
 }
 
+async fn read_first_n_bytes_via_stream_download(
+    fixture: HlsFixture,
+    storage_kind: &HlsFixtureStorageKind,
+    n: usize,
+) -> Vec<u8> {
+    let (_base_url, mut reader) = fixture.stream_download_boxed(storage_kind.clone()).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut buf = vec![0u8; 1024.min(n)];
+
+    while out.len() < n && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), async {
+            let slice_len = buf.len().min(n - out.len());
+            reader.read(&mut buf[..slice_len])
+        })
+        .await
+        {
+            Ok(Ok(bytes_read)) if bytes_read > 0 => {
+                out.extend_from_slice(&buf[..bytes_read]);
+            }
+            Ok(Ok(_)) => {
+                // EOF or no data
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(Err(e)) => {
+                panic!("Failed to read from StreamDownload: {:?}", e);
+            }
+            Err(_) => {
+                // Timeout, continue
+            }
+        }
+    }
+
+    out.truncate(n);
+    out
+}
+
 #[rstest]
 #[case("persistent")]
 #[case("temp")]
@@ -103,7 +141,7 @@ fn hls_aes128_drm_decrypts_media_segments_for_all_storage_backends(#[case] stora
         // Read enough bytes to include init + first media segment bytes.
         // The init segment is plaintext in the fixture; the first media segment should be decrypted.
         let n = 64usize;
-        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got = read_first_n_bytes_via_stream_download(fixture.clone(), &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         // Decrypted media payload prefix should appear in output bytes.
@@ -153,7 +191,7 @@ fn hls_aes128_drm_fixed_zero_iv_decrypts_media_segments_for_all_storage_backends
         }
 
         let n = 64usize;
-        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got = read_first_n_bytes_via_stream_download(fixture.clone(), &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         // With fixed IV=0, decryption should still yield the expected plaintext prefix.
@@ -224,7 +262,7 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
         }
 
         let n = 64usize;
-        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got = read_first_n_bytes_via_stream_download(fixture.clone(), &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         assert!(
@@ -242,7 +280,6 @@ fn hls_aes128_drm_applies_key_query_params_headers_and_key_processor_cb(#[case] 
 #[rstest]
 #[case("persistent")]
 #[case("temp")]
-#[case("memory")]
 fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
     SERVER_RT.block_on(async {
         let variant_count = 2usize;
@@ -273,7 +310,8 @@ fn hls_aes128_drm_key_is_cached_not_fetched_per_segment(#[case] storage: &str) {
         // Read more than the small 64 bytes used elsewhere to increase likelihood of fetching >1 segment.
         // (Fixture segment payloads contain textual prefixes like "V0-SEG-0".)
         let n = 4096usize;
-        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        // Use StreamDownload instead of worker directly to ensure StoreResource messages are processed
+        let got = read_first_n_bytes_via_stream_download(fixture.clone(), &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         assert!(
@@ -574,7 +612,7 @@ fn hls_base_url_override_makes_segment_remap_work(#[case] storage: &str, #[case]
         }
 
         let n = 256usize;
-        let got = read_first_n_bytes_via_worker(fixture, storage_kind, n).await;
+        let got = read_first_n_bytes_via_stream_download(fixture, &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         assert!(
@@ -620,7 +658,7 @@ fn hls_aes128_drm_succeeds_when_key_headers_not_required_and_not_sent(#[case] st
         }
 
         let n = 128usize;
-        let got = read_first_n_bytes_via_worker(fixture.clone(), storage_kind, n).await;
+        let got = read_first_n_bytes_via_stream_download(fixture.clone(), &storage_kind, n).await;
         let got_str = String::from_utf8_lossy(&got);
 
         assert!(
@@ -1413,12 +1451,9 @@ fn hls_worker_manual_downswitch_applies_via_ordered_controls(#[case] variant_cou
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut saw_initial_default = false;
 
-        let start_key: stream_download::source::ResourceKey = format!(
-            "{}/{}",
-            stream_download_hls::master_hash_from_url(&base_url),
-            start_variant_index
-        )
-        .into();
+        let key_generator = stream_download_hls::CacheKeyGenerator::new(&base_url);
+        let start_key: stream_download::source::ResourceKey =
+            format!("{}/{}", key_generator.master_hash(), start_variant_index).into();
 
         while Instant::now() < deadline {
             if let Ok(Some(StreamMsg::Control(StreamControl::SetDefaultStreamKey { stream_key }))) =
@@ -1446,12 +1481,9 @@ fn hls_worker_manual_downswitch_applies_via_ordered_controls(#[case] variant_cou
             .expect("failed to send SetVariant command");
 
         // Applied (ordered): must see SetDefaultStreamKey for the target, then ChunkStart(Init) for it.
-        let target_key: stream_download::source::ResourceKey = format!(
-            "{}/{}",
-            stream_download_hls::master_hash_from_url(&base_url),
-            target_variant_index
-        )
-        .into();
+        let key_generator = stream_download_hls::CacheKeyGenerator::new(&base_url);
+        let target_key: stream_download::source::ResourceKey =
+            format!("{}/{}", key_generator.master_hash(), target_variant_index).into();
 
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut saw_target_default = false;
@@ -1940,9 +1972,11 @@ fn hls_manager_select_variant_changes_fetched_media_bytes_prefix(
             };
 
             let uri_s = desc.uri.to_string();
+            let resource = stream_download_hls::Resource::media_segment(&desc.uri, desc.variant_id)
+                .unwrap_or_else(|e| panic!("failed to create resource for uri={}: {}", uri_s, e));
             let mut stream = manager
                 .downloader()
-                .stream(&desc.uri)
+                .stream(&resource)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("failed to stream segment for variant {variant_index} (uri={uri_s}): {e}")

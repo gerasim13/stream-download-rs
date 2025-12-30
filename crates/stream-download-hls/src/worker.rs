@@ -22,7 +22,7 @@ use url::Url;
 use stream_download::source::{ChunkKind, ResourceKey, StreamControl, StreamMsg};
 use stream_download::storage::{DynamicLength, SegmentedLength, StorageHandle};
 
-use crate::cache::keys::master_hash_from_url;
+use crate::cache::keys::CacheKeyGenerator;
 use crate::downloader::HlsByteStream;
 use crate::error::HlsError;
 use crate::stream::StreamEvent;
@@ -625,11 +625,24 @@ impl HlsStreamWorker {
             self.bytes_to_skip = 0;
             self.manager
                 .downloader()
-                .stream_range(&desc.uri, start, None)
+                .stream_range(
+                    &crate::downloader::Resource::media_segment(
+                        desc.uri.as_str(),
+                        desc.variant_id,
+                    )?,
+                    start,
+                    None,
+                )
                 .await
         } else {
             // Init is always streamed fully.
-            self.manager.downloader().stream(&desc.uri).await
+            self.manager
+                .downloader()
+                .stream(&crate::downloader::Resource::media_segment(
+                    desc.uri.as_str(),
+                    desc.variant_id,
+                )?)
+                .await
         };
 
         match stream_res {
@@ -898,7 +911,8 @@ impl HlsStreamWorker {
     ) -> Result<Self, HlsError> {
         // Identifier used for persistent cache layout:
         // `<storage_root>/<master_hash>/<variant_id>/<segment_basename>`
-        let master_hash = master_hash_from_url(&url);
+        let key_generator = CacheKeyGenerator::new(&url);
+        let master_hash = key_generator.master_hash().to_string();
         // Build downloader from flattened settings (for manager)
         let (request_timeout, max_retries, retry_base_delay, max_retry_delay) = (
             settings.request_timeout,
@@ -912,13 +926,19 @@ impl HlsStreamWorker {
         #[cfg(not(feature = "aes-decrypt"))]
         let key_request_headers = None;
 
+        // Create cache key generator
+        let key_generator = crate::cache::keys::CacheKeyGenerator::new(&url);
+        let key_callback = crate::cache::keys::create_key_callback(key_generator);
+
         let manager_downloader = create_default_downloader(
             request_timeout,
             max_retries,
             retry_base_delay,
             max_retry_delay,
             cancel_token.clone(),
-            Some(storage_handle.clone()),
+            storage_handle.clone(),
+            key_callback,
+            data_sender.clone(),
             key_request_headers,
         );
 

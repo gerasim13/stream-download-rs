@@ -2,14 +2,16 @@
 //!
 //! Provides functionality to resolve AES-128-CBC encryption keys and IVs for HLS segments.
 
-use std::collections::HashMap;
+use std::fmt::{Debug, Formatter, Result};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use tracing::trace;
 
+use crate::SegmentDescriptor;
 use crate::downloader::{Downloader, DownloaderExt};
 use crate::error::{HlsError, HlsResult};
+use crate::parser::VariantId;
 use crate::parser::{EncryptionMethod, KeyInfo, SegmentKey};
 use crate::settings::HlsSettings;
 
@@ -19,46 +21,25 @@ pub type KeyProcessorCallback = dyn Fn(Bytes) -> Bytes + Send + Sync;
 /// Resolves AES-128-CBC encryption parameters for HLS segments.
 #[derive(Clone)]
 pub struct AesKeyResolver {
-    /// Configuration for HLS streaming
+    /// Configuration settings for HLS stream download
     config: Arc<HlsSettings>,
     /// Downloader for fetching keys (includes caching)
     downloader: Arc<dyn Downloader + Send + Sync>,
-    /// Cache for resolved keys (URL -> key bytes)
-    key_cache: HashMap<String, Bytes>,
-    /// Callback for processing key bytes
-    key_processor_cb: Option<Arc<Box<dyn Fn(Bytes) -> Bytes + Send + Sync>>>,
 }
 
-impl std::fmt::Debug for AesKeyResolver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AesKeyResolver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("AesKeyResolver")
-            .field("config", &self.config)
+            .field("config", &"Arc<HlsSettings>")
             .field("downloader", &"Arc<dyn Downloader>")
-            .field("key_cache", &self.key_cache)
-            .field(
-                "key_processor_cb",
-                &self
-                    .key_processor_cb
-                    .as_ref()
-                    .map(|_| "Some(KeyProcessorCallback)"),
-            )
             .finish()
     }
 }
 
 impl AesKeyResolver {
     /// Creates a new AesKeyResolver instance.
-    pub fn new(
-        config: Arc<HlsSettings>,
-        downloader: Arc<dyn Downloader + Send + Sync>,
-        key_processor_cb: Option<Arc<Box<dyn Fn(Bytes) -> Bytes + Send + Sync>>>,
-    ) -> Self {
-        Self {
-            config,
-            downloader,
-            key_cache: HashMap::new(),
-            key_processor_cb,
-        }
+    pub fn new(config: Arc<HlsSettings>, downloader: Arc<dyn Downloader + Send + Sync>) -> Self {
+        Self { config, downloader }
     }
 
     /// Resolves AES-128-CBC parameters (key and IV) for a segment.
@@ -69,8 +50,8 @@ impl AesKeyResolver {
     pub async fn resolve_aes128_cbc_params(
         &mut self,
         master_url: &str,
-        variant_id: crate::parser::VariantId,
         key: Option<&SegmentKey>,
+        variant_id: VariantId,
         sequence: Option<u64>,
     ) -> HlsResult<Option<([u8; 16], [u8; 16])>> {
         // Use pattern matching to extract all required information in one go
@@ -89,9 +70,7 @@ impl AesKeyResolver {
         // Fetch and validate key
         let abs_key_url = self.resolve_url(master_url, key_uri)?;
         let final_key_url = self.finalize_key_url(&abs_key_url)?;
-        let key_bytes = self
-            .fetch_key_bytes(master_url, variant_id.0, &final_key_url)
-            .await?;
+        let key_bytes = self.fetch_key_bytes(&final_key_url, variant_id).await?;
 
         let mut key_arr = [0u8; 16];
         key_arr.copy_from_slice(&key_bytes);
@@ -108,8 +87,8 @@ impl AesKeyResolver {
     pub async fn resolve_drm_params_for_desc(
         &mut self,
         master_url: &str,
-        variant_id: crate::parser::VariantId,
-        desc: &crate::SegmentDescriptor,
+        variant_id: VariantId,
+        desc: &SegmentDescriptor,
     ) -> HlsResult<Option<([u8; 16], [u8; 16])>> {
         use tracing::trace;
 
@@ -124,8 +103,8 @@ impl AesKeyResolver {
         let resolved_result = self
             .resolve_aes128_cbc_params(
                 master_url,
-                variant_id,
                 desc.key.as_ref(),
+                variant_id,
                 if desc.is_init {
                     None
                 } else {
@@ -173,27 +152,21 @@ impl AesKeyResolver {
     /// Fetches key bytes, using cache if available.
     async fn fetch_key_bytes(
         &mut self,
-        master_url: &str,
-        variant_id: usize,
         final_key_url: &str,
+        variant_id: VariantId,
     ) -> HlsResult<Bytes> {
-        if let Some(cached) = self.key_cache.get(final_key_url) {
-            return Ok(cached.clone());
-        }
-
         // Downloader includes caching via CacheDownloader layer if configured
-        let key_bytes = self.downloader.download_key(final_key_url, None).await?;
+        let resource = crate::downloader::Resource::key(final_key_url, variant_id)?;
+        let key_bytes = self.downloader.download_key(&resource, None).await?;
 
         let mut kb = key_bytes;
-        if let Some(cb) = &self.key_processor_cb {
+        if let Some(cb) = &self.config.key_processor_cb {
             kb = cb.as_ref()(kb);
         }
 
         if kb.len() != 16 {
             return Err(HlsError::invalid_aes128_key_len(kb.len()));
         }
-
-        self.key_cache.insert(final_key_url.to_string(), kb.clone());
 
         Ok(kb)
     }
@@ -239,15 +212,5 @@ impl AesKeyResolver {
             .map_err(|e| HlsError::Message(format!("failed to join URL: {}", e)))?;
 
         Ok(joined.to_string())
-    }
-
-    /// Clears the internal key cache.
-    pub fn clear_cache(&mut self) {
-        self.key_cache.clear();
-    }
-
-    /// Returns the number of cached keys.
-    pub fn cache_size(&self) -> usize {
-        self.key_cache.len()
     }
 }

@@ -122,8 +122,6 @@ pub struct MediaPlaylist {
     pub media_sequence: u64,
     /// Whether the playlist is finished (VOD or live that ended).
     pub end_list: bool,
-    /// Informational: the first key found in the playlist (if any).
-    ///
     /// Per-segment effective keys are stored on each [`MediaSegment`] via [`MediaSegment::key`].
     pub current_key: Option<KeyInfo>,
 }

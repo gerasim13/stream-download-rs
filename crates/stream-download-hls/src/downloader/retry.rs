@@ -8,6 +8,7 @@ use tracing::debug;
 use crate::error::{HlsError, HlsResult};
 
 use super::traits::{ByteStream, Downloader, Headers};
+use super::types::Resource;
 
 /// Retry policy configuration.
 #[derive(Debug, Clone)]
@@ -68,7 +69,7 @@ impl<D> RetryDownloader<D> {
     async fn execute_with_retry<T, F, Fut>(
         &self,
         cancel: &CancellationToken,
-        url: &str,
+        resource: &Resource,
         operation_name: &str,
         mut operation: F,
     ) -> HlsResult<T>
@@ -88,7 +89,7 @@ impl<D> RetryDownloader<D> {
                 Ok(v) => {
                     if attempt > 0 {
                         debug!(
-                            url = url,
+                            url = resource.url().as_str(),
                             attempts = attempt + 1,
                             operation = operation_name,
                             "download succeeded after retry"
@@ -98,7 +99,7 @@ impl<D> RetryDownloader<D> {
                 }
                 Err(e) => {
                     debug!(
-                        url = url,
+                        url = resource.url().as_str(),
                         attempt = attempt + 1,
                         max_attempts = self.policy.max_retries + 1,
                         operation = operation_name,
@@ -120,7 +121,7 @@ impl<D> RetryDownloader<D> {
         }
 
         debug!(
-            url = url,
+            url = resource.url().as_str(),
             attempts = self.policy.max_retries + 1,
             operation = operation_name,
             "download giving up after retries"
@@ -135,40 +136,39 @@ impl<D> Downloader for RetryDownloader<D>
 where
     D: Downloader + Send + Sync,
 {
-    async fn download(&self, url: &str) -> HlsResult<bytes::Bytes> {
-        let cancel = self.inner.cancel_token();
-        self.execute_with_retry(cancel, url, "download", || self.inner.download(url))
-            .await
-    }
-
     async fn download_with_headers(
         &self,
-        url: &str,
+        resource: &Resource,
         headers: Option<Headers>,
     ) -> HlsResult<bytes::Bytes> {
         let cancel = self.inner.cancel_token();
-        self.execute_with_retry(cancel, url, "download_with_headers", || {
-            self.inner.download_with_headers(url, headers.clone())
+        self.execute_with_retry(cancel, resource, "download_with_headers", || {
+            self.inner.download_with_headers(resource, headers.clone())
         })
         .await
     }
 
-    async fn stream(&self, url: &str) -> HlsResult<ByteStream> {
+    async fn stream(&self, resource: &Resource) -> HlsResult<ByteStream> {
         // Streaming operations typically shouldn't be retried at this level
         // as they involve long-lived connections. The inner downloader should
         // handle reconnection if needed.
-        self.inner.stream(url).await
+        self.inner.stream(resource).await
     }
 
-    async fn stream_range(&self, url: &str, start: u64, end: Option<u64>) -> HlsResult<ByteStream> {
+    async fn stream_range(
+        &self,
+        resource: &Resource,
+        start: u64,
+        end: Option<u64>,
+    ) -> HlsResult<ByteStream> {
         // Same as stream - retry logic is handled at a different layer
-        self.inner.stream_range(url, start, end).await
+        self.inner.stream_range(resource, start, end).await
     }
 
-    async fn probe_content_length(&self, url: &str) -> HlsResult<Option<u64>> {
+    async fn probe_content_length(&self, resource: &Resource) -> HlsResult<Option<u64>> {
         let cancel = self.inner.cancel_token();
-        self.execute_with_retry(cancel, url, "probe_content_length", || {
-            self.inner.probe_content_length(url)
+        self.execute_with_retry(cancel, resource, "probe_content_length", || {
+            self.inner.probe_content_length(resource)
         })
         .await
     }

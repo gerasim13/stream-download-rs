@@ -742,13 +742,22 @@ impl HlsFixture {
             .expect("failed to build master url");
 
         let hls_settings = Arc::new(self.hls_settings.clone());
+
+        // Create real cache key generator for testing
+        let key_generator = stream_download_hls::CacheKeyGenerator::new(&url);
+        let key_callback = stream_download_hls::create_key_callback(key_generator);
+
+        let (data_sender, _) = mpsc::channel(16);
+
         let downloader = create_default_downloader(
             hls_settings.request_timeout,
             hls_settings.max_retries,
             hls_settings.retry_base_delay,
             hls_settings.max_retry_delay,
             CancellationToken::new(),
-            Some(storage_handle.clone()),
+            storage_handle.clone(),
+            key_callback,
+            data_sender,
             hls_settings.key_request_headers.clone(),
         );
 
@@ -1880,13 +1889,21 @@ pub async fn create_test_manager(
 
     let (control_sender, _) = mpsc::channel(16);
 
+    // Create real cache key generator for testing
+    let key_generator = stream_download_hls::CacheKeyGenerator::new(&master_url);
+    let key_callback = stream_download_hls::create_key_callback(key_generator);
+
+    let (data_sender, _) = mpsc::channel(16);
+
     let downloader = create_default_downloader(
         std::time::Duration::from_secs(10),
         3,
         std::time::Duration::from_millis(100),
         std::time::Duration::from_secs(5),
         CancellationToken::new(),
-        None,
+        storage_handle.clone(),
+        key_callback,
+        data_sender,
         None,
     );
 

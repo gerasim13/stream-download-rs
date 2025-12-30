@@ -16,15 +16,16 @@ mod stream;
 mod worker;
 
 pub use crate::abr::{AbrConfig, AbrController, AbrDecision};
+pub use crate::cache::keys::create_key_callback;
 pub use crate::downloader::HlsByteStream;
 pub use crate::downloader::{
     CacheDownloader, CachedBytes, Downloader, DownloaderBuilder, DownloaderExt, HttpDownloader,
-    RetryDownloader, RetryPolicy, TimeoutDownloader, create_default_downloader,
+    Resource, RetryDownloader, RetryPolicy, TimeoutDownloader, create_default_downloader,
 };
 pub use crate::error::{HlsError, HlsResult};
 
 /// Deterministic cache/layout helper.
-pub use crate::cache::keys::master_hash_from_url;
+pub use crate::cache::keys::{CacheKeyGenerator, master_hash_from_url};
 pub use crate::manager::{HlsManager, NextSegmentResult, SegmentDescriptor};
 pub use crate::parser::{
     CodecInfo, ContainerFormat, EncryptionMethod, InitSegment, KeyInfo, MasterPlaylist,

@@ -12,6 +12,7 @@ mod cache;
 mod retry;
 mod timeout;
 mod traits;
+mod types;
 
 /// A boxed stream of HLS byte chunks produced by the downloader/manager pipeline.
 pub type HlsByteStream = BoxStream<'static, Result<Bytes, crate::error::HlsError>>;
@@ -23,3 +24,4 @@ pub use cache::{CacheDownloader, CachedBytes};
 pub use retry::{RetryDownloader, RetryPolicy};
 pub use timeout::TimeoutDownloader;
 pub use traits::{Downloader, DownloaderExt};
+pub use types::Resource;

@@ -8,17 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use stream_download::source::{ResourceKey, StreamControl, StreamMsg};
+use stream_download::source::StreamMsg;
 
 use tokio::sync::mpsc;
 use tracing::instrument;
 
-use crate::cache::keys::{master_hash_from_url, playlist_key_from_url};
 #[cfg(feature = "aes-decrypt")]
 use crate::crypto::resolver::AesKeyResolver;
 use crate::downloader::HlsByteStream;
-use crate::downloader::{Downloader, DownloaderExt};
+use crate::downloader::{Downloader, DownloaderExt, Resource};
 use crate::error::{HlsError, HlsResult};
 use crate::parser::{
     CodecInfo, InitSegment, MasterPlaylist, MediaPlaylist, MediaSegment, SegmentKey, VariantId,
@@ -147,11 +145,7 @@ impl HlsManager {
         control_sender: mpsc::Sender<StreamMsg>,
     ) -> Self {
         #[cfg(feature = "aes-decrypt")]
-        let aes_key_resolver = Some(AesKeyResolver::new(
-            Arc::clone(&config),
-            downloader.clone(),
-            config.key_processor_cb.clone(),
-        ));
+        let aes_key_resolver = Some(AesKeyResolver::new(Arc::clone(&config), downloader.clone()));
 
         Self {
             master_url,
@@ -188,14 +182,6 @@ impl HlsManager {
     /// Returns the underlying downloader.
     pub fn downloader(&self) -> &Arc<dyn Downloader + Send + Sync> {
         &self.downloader
-    }
-
-    /// Emits `StoreResource` after a network miss (best-effort).
-    fn emit_store_resource(&self, key: ResourceKey, data: Bytes) -> HlsResult<()> {
-        let msg = StreamMsg::Control(StreamControl::StoreResource { key, data });
-        self.control_sender
-            .try_send(msg)
-            .map_err(|e| HlsError::msg(format!("Failed to send control message: {:?}", e)))
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {
@@ -324,7 +310,11 @@ impl HlsManager {
         uri: &str,
     ) -> HlsResult<Option<u64>> {
         let resolved_url = self.resolve_url(uri)?;
-        let size_opt = self.downloader.probe_content_length(&resolved_url).await?;
+        // TODO: Need variant_id to create proper Resource
+        // For now, create a MediaSegment resource with placeholder variant_id
+        let (variant_id, _) = self.current_variant_info()?;
+        let resource = Resource::media_segment(resolved_url.as_str(), variant_id)?;
+        let size_opt = self.downloader.probe_content_length(&resource).await?;
         if let Some(size) = size_opt {
             self.segment_sizes.insert(sequence, size);
         }
@@ -333,14 +323,8 @@ impl HlsManager {
 
     /// Loads and parses the master playlist, caching it in `self.master`.
     pub async fn load_master(&mut self) -> HlsResult<&MasterPlaylist> {
-        let master_hash = master_hash_from_url(&self.master_url);
-        let key =
-            playlist_key_from_url(&master_hash, self.master_url.as_str()).ok_or_else(|| {
-                HlsError::Message("unable to derive master playlist basename".to_string())
-            })?;
-
-        let bytes = self.downloader.download(self.master_url.as_str()).await?;
-        self.emit_store_resource(key.clone(), bytes.clone())?;
+        let resource = Resource::master(self.master_url.as_str())?;
+        let bytes = self.downloader.download(&resource).await?;
 
         let master_playlist = parse_master_playlist(&bytes)?;
         self.master = Some(master_playlist);
@@ -364,13 +348,8 @@ impl HlsManager {
             .ok_or_else(|| HlsError::Message("no variant selected".to_string()))?;
 
         // Download and parse the latest media playlist
-        let master_hash = master_hash_from_url(&self.master_url);
-        let key = playlist_key_from_url(&master_hash, &media_url).ok_or_else(|| {
-            HlsError::Message("unable to derive media playlist basename".to_string())
-        })?;
-
-        let bytes = self.downloader.download(&media_url).await?;
-        self.emit_store_resource(key.clone(), bytes.clone())?;
+        let resource = Resource::media_playlist(media_url.as_str(), variant_id)?;
+        let bytes = self.downloader.download(&resource).await?;
 
         let media_playlist = parse_media_playlist(&bytes, variant_id)?;
         self.current_media_playlist = Some(media_playlist);
@@ -627,23 +606,13 @@ impl MediaStream for HlsManager {
         let playlist = self
             .master
             .as_ref()
-            .and_then(|m| m.variants.get(variant.0))
-            .ok_or_else(|| {
-                HlsError::Message("variant index out of bounds or master not loaded".to_string())
-            })?
+            .and_then(|m| m.variants.iter().find(|v| v.id == variant))
+            .ok_or_else(|| HlsError::Message("variant not found".to_string()))?
             .clone(); // Clone to avoid borrowing issues
 
         let media_playlist_url = self.resolve_url(&playlist.uri)?;
-        let master_hash = master_hash_from_url(&self.master_url);
-        let key = playlist_key_from_url(&master_hash, &media_playlist_url).ok_or_else(|| {
-            HlsError::Message("unable to derive media playlist basename".to_string())
-        })?;
-
-        let bytes = self
-            .downloader
-            .download_playlist(&media_playlist_url)
-            .await?;
-        self.emit_store_resource(key.clone(), bytes.clone())?;
+        let resource = Resource::media_playlist(media_playlist_url.as_str(), playlist.id)?;
+        let bytes = self.downloader.download_playlist(&resource).await?;
 
         let media_playlist = parse_media_playlist(&bytes, playlist.id)?;
 

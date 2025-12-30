@@ -18,6 +18,7 @@ use stream_download::source::{DecodeError, SourceStream, StreamMsg};
 use crate::error::{HlsError, HlsResult};
 
 use super::traits::{ByteStream, Downloader, Headers};
+use super::types::Resource;
 
 /// Base HTTP downloader using HttpStream.
 ///
@@ -47,11 +48,6 @@ impl HttpDownloader {
         }
     }
 
-    /// Parse a URL string into a Url object.
-    fn parse_url(&self, url: &str) -> HlsResult<Url> {
-        Url::parse(url).map_err(HlsError::url_parse)
-    }
-
     /// Build headers for key requests.
     fn build_key_headers(&self) -> HlsResult<HeaderMap> {
         let mut headers = HeaderMap::new();
@@ -78,7 +74,7 @@ impl HttpDownloader {
     }
 
     /// Create an HttpStream for a URL.
-    async fn create_stream(&self, url: Url) -> HlsResult<HttpStream<ReqwestClient>> {
+    async fn create_stream(&self, url: &Url) -> HlsResult<HttpStream<ReqwestClient>> {
         let create_fut = timeout(
             self.request_timeout,
             HttpStream::<ReqwestClient>::create(url.clone()),
@@ -103,7 +99,7 @@ impl HttpDownloader {
     /// Create an HttpStream with custom headers.
     async fn create_stream_with_headers(
         &self,
-        url: Url,
+        url: &Url,
         headers: HeaderMap,
     ) -> HlsResult<HttpStream<ReqwestClient>> {
         let create_fut = timeout(
@@ -128,8 +124,9 @@ impl HttpDownloader {
     }
 
     /// Map stream errors to HlsError.
-    fn map_stream_errors(&self, url: String, stream: HttpStream<ReqwestClient>) -> ByteStream {
-        let url: Arc<str> = Arc::from(url);
+    fn map_stream_errors(&self, url: &Url, stream: HttpStream<ReqwestClient>) -> ByteStream {
+        let url_str = url.to_string();
+        let url: Arc<str> = Arc::from(url_str);
         stream
             .filter_map(move |res| {
                 let url = Arc::clone(&url);
@@ -151,7 +148,7 @@ impl HttpDownloader {
     async fn collect_stream_to_bytes(
         &self,
         mut stream: HttpStream<ReqwestClient>,
-        url: &str,
+        url: &Url,
     ) -> HlsResult<Bytes> {
         let mut buf = BytesMut::with_capacity(16 * 1024);
 
@@ -204,16 +201,12 @@ impl HttpDownloader {
 
 #[async_trait::async_trait]
 impl Downloader for HttpDownloader {
-    async fn download(&self, url: &str) -> HlsResult<Bytes> {
-        let url_parsed = self.parse_url(url)?;
-        let url_str = url_parsed.to_string();
-        let http = self.create_stream(url_parsed).await?;
-        self.collect_stream_to_bytes(http, &url_str).await
-    }
-
-    async fn download_with_headers(&self, url: &str, headers: Option<Headers>) -> HlsResult<Bytes> {
-        let url_parsed = self.parse_url(url)?;
-        let url_str = url_parsed.to_string();
+    async fn download_with_headers(
+        &self,
+        resource: &Resource,
+        headers: Option<Headers>,
+    ) -> HlsResult<Bytes> {
+        let url = resource.url();
 
         let mut header_map = if let Some(headers) = headers {
             let mut map = HeaderMap::new();
@@ -246,43 +239,39 @@ impl Downloader for HttpDownloader {
             }
         }
 
-        let http = self
-            .create_stream_with_headers(url_parsed, header_map)
-            .await?;
-        self.collect_stream_to_bytes(http, &url_str).await
+        let http = self.create_stream_with_headers(url, header_map).await?;
+        self.collect_stream_to_bytes(http, url).await
     }
 
-    async fn stream(&self, url: &str) -> HlsResult<ByteStream> {
-        let url_parsed = self.parse_url(url)?;
-        let url_str = url_parsed.to_string();
-        let http = self.create_stream(url_parsed).await?;
-        Ok(self.map_stream_errors(url_str, http))
+    async fn stream(&self, resource: &Resource) -> HlsResult<ByteStream> {
+        let url = resource.url();
+        let http = self.create_stream(url).await?;
+        Ok(self.map_stream_errors(url, http))
     }
 
-    async fn stream_range(&self, url: &str, start: u64, end: Option<u64>) -> HlsResult<ByteStream> {
-        let url_parsed = self.parse_url(url)?;
-        let url_str = url_parsed.to_string();
-        let mut http = self.create_stream(url_parsed).await?;
+    async fn stream_range(
+        &self,
+        resource: &Resource,
+        start: u64,
+        end: Option<u64>,
+    ) -> HlsResult<ByteStream> {
+        let url = resource.url();
+        let mut http = self.create_stream(url).await?;
 
         http.seek_range(start, end)
             .await
             .map_err(|e| HlsError::Io(e))?;
 
-        Ok(self.map_stream_errors(url_str, http))
+        Ok(self.map_stream_errors(url, http))
     }
 
-    async fn probe_content_length(&self, url: &str) -> HlsResult<Option<u64>> {
-        let url_parsed = self.parse_url(url)?;
-        let url_str = url_parsed.to_string();
+    async fn probe_content_length(&self, resource: &Resource) -> HlsResult<Option<u64>> {
+        let url = resource.url();
 
         // Try a 0-0 range request first
         let client = <ReqwestClient as stream_download::http::Client>::create();
-        let range_fut = <ReqwestClient as stream_download::http::Client>::get_range(
-            &client,
-            &url_parsed,
-            0,
-            Some(0),
-        );
+        let range_fut =
+            <ReqwestClient as stream_download::http::Client>::get_range(&client, url, 0, Some(0));
 
         let response_res = tokio::select! {
             biased;
@@ -296,7 +285,7 @@ impl Downloader for HttpDownloader {
                 if !status.is_success() {
                     return Err(HlsError::HttpError {
                         status: status.as_u16(),
-                        url: url_str,
+                        url: url.to_string(),
                     });
                 }
 
@@ -323,7 +312,7 @@ impl Downloader for HttpDownloader {
                 // Last resort: create HttpStream and read metadata
                 let create_fut = tokio::time::timeout(
                     self.request_timeout,
-                    HttpStream::<ReqwestClient>::create(url_parsed.clone()),
+                    HttpStream::<ReqwestClient>::create(url.clone()),
                 );
 
                 let create_res = tokio::select! {
@@ -338,14 +327,14 @@ impl Downloader for HttpDownloader {
                         let msg = e.decode_error().await;
                         return Err(HlsError::http_stream_create_failed_during_probe(msg));
                     }
-                    Err(_) => return Err(HlsError::timeout(url_str)),
+                    Err(_) => return Err(HlsError::timeout(url.to_string())),
                 };
 
                 let cl_opt: Option<u64> = http.content_length().into();
                 Ok(cl_opt)
             }
             Ok(Err(e)) => Err(HlsError::io(e.to_string())),
-            Err(_) => Err(HlsError::timeout(url_str)),
+            Err(_) => Err(HlsError::timeout(url.to_string())),
         }
     }
 

@@ -3,8 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use stream_download::source::StreamMsg;
 use stream_download::storage::StorageHandle;
+use tokio::sync::mpsc;
 
+use super::cache::CacheKeyCallback;
 use super::traits::{Downloader, Headers};
 use super::{CacheDownloader, HttpDownloader, RetryDownloader, RetryPolicy, TimeoutDownloader};
 
@@ -51,10 +54,12 @@ where
     /// Add caching functionality.
     pub fn with_cache(
         self,
-        handle: Option<StorageHandle>,
+        handle: StorageHandle,
+        key_callback: Arc<CacheKeyCallback>,
+        data_sender: mpsc::Sender<StreamMsg>,
     ) -> DownloaderBuilder<CacheDownloader<D>> {
         DownloaderBuilder {
-            inner: CacheDownloader::new(self.inner, handle),
+            inner: CacheDownloader::new(self.inner, handle, key_callback, data_sender),
         }
     }
 
@@ -71,7 +76,9 @@ pub fn create_default_downloader(
     retry_base_delay: Duration,
     max_retry_delay: Duration,
     cancel: tokio_util::sync::CancellationToken,
-    storage_handle: Option<StorageHandle>,
+    storage_handle: StorageHandle,
+    key_callback: Arc<CacheKeyCallback>,
+    data_sender: mpsc::Sender<StreamMsg>,
     key_request_headers: Option<Headers>,
 ) -> Arc<dyn Downloader + Send + Sync> {
     let base_downloader = HttpDownloader::new(request_timeout, cancel, key_request_headers);
@@ -85,7 +92,7 @@ pub fn create_default_downloader(
     let downloader = DownloaderBuilder::from_http(base_downloader)
         .with_timeout(request_timeout)
         .with_retry(retry_policy)
-        .with_cache(storage_handle)
+        .with_cache(storage_handle, key_callback, data_sender)
         .build();
 
     Arc::new(downloader)
