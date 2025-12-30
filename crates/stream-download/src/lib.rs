@@ -11,9 +11,9 @@ use educe::Educe;
 pub use settings::*;
 use source::handle::SourceHandle;
 use source::{DecodeError, Source, SourceStream};
-use storage::{ContentLength, StorageProvider};
+use storage::StorageProvider;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, instrument, trace};
 
 #[cfg(feature = "async-read")]
 pub mod async_read;
@@ -66,7 +66,7 @@ pub struct StreamDownload<P: StorageProvider> {
     handle: SourceHandle,
     download_task_cancellation_token: CancellationToken,
     cancel_on_drop: bool,
-    content_length: ContentLength,
+    content_length: Option<u64>,
     storage_capacity: Option<usize>,
 }
 
@@ -378,8 +378,8 @@ impl<P: StorageProvider> StreamDownload<P> {
     }
 
     /// Returns the content length of the stream, if available.
-    pub fn content_length(&self) -> ContentLength {
-        self.content_length.clone()
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
     }
 
     async fn from_create_stream<S, F, Fut>(
@@ -398,16 +398,11 @@ impl<P: StorageProvider> StreamDownload<P> {
         let content_length = stream.content_length();
         let storage_capacity = storage_provider.max_capacity();
         let (reader, writer) = storage_provider
-            .into_reader_writer(content_length.clone())
+            .into_reader_writer(content_length)
             .map_err(StreamInitializationError::StorageCreationFailure)?;
         let cancellation_token = CancellationToken::new();
         let cancel_on_drop = settings.cancel_on_drop;
-        let mut source = Source::new(
-            writer,
-            content_length.clone(),
-            settings,
-            cancellation_token.clone(),
-        );
+        let mut source = Source::new(writer, content_length, settings, cancellation_token.clone());
         let handle = source.source_handle();
 
         tokio::spawn({
@@ -441,8 +436,7 @@ impl<P: StorageProvider> StreamDownload<P> {
             }
             SeekFrom::End(position) => {
                 debug!(seek_position = position, "seeking from end");
-                let content_length = self.handle.content_length().current_value();
-                if let Some(length) = content_length {
+                if let Some(length) = self.handle.content_length() {
                     (length as i64 + position) as u64
                 } else {
                     return Err(io::Error::new(
@@ -463,8 +457,7 @@ impl<P: StorageProvider> StreamDownload<P> {
     }
 
     fn normalize_requested_position(&self, requested_position: u64) -> u64 {
-        let content_length = self.content_length.current_value();
-        if let Some(content_length) = content_length {
+        if let Some(content_length) = self.content_length {
             // ensure we don't request a position beyond the end of the stream
             requested_position.min(content_length)
         } else {

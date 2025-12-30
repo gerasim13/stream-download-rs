@@ -9,12 +9,12 @@ use std::io::{self};
 use std::num::NonZeroUsize;
 use std::task::Poll;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, ready};
 use opendal::{FuturesAsyncReader, Operator, Reader};
 use pin_project_lite::pin_project;
-use stream_download::source::{DecodeError, SourceStream, StreamMsg};
-use stream_download::storage::{ContentLength, StorageProvider};
+use stream_download::source::{DecodeError, SourceStream};
+use stream_download::storage::StorageProvider;
 use stream_download::{Settings, StreamDownload, StreamInitializationError};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 use tokio_util::io::poll_read_buf;
@@ -120,7 +120,7 @@ pin_project! {
         reader: Reader,
         buf: BytesMut,
         capacity: usize,
-        content_length: ContentLength,
+        content_length: Option<u64>,
         content_type: Option<String>,
     }
 }
@@ -151,23 +151,24 @@ impl OpendalStream {
     #[instrument]
     pub async fn new(params: OpendalStreamParams) -> Result<Self, Error> {
         let stat = params.operator.stat(&params.path).await?;
-        let content_type = stat.content_type().map(ToString::to_string);
-        let reader = params.operator.reader(&params.path).await?;
-        let async_reader = reader.clone().into_futures_async_read(..).await?.compat();
 
         let content_length = stat.content_length();
-        let content_length = if content_length > 0 {
-            ContentLength::Static(content_length)
-        } else {
-            ContentLength::Unknown
-        };
+        let content_type = stat.content_type().map(ToString::to_string);
+
+        let reader = params.operator.reader(&params.path).await?;
+
+        let async_reader = reader.clone().into_futures_async_read(..).await?.compat();
 
         Ok(Self {
             async_reader,
             reader,
             buf: BytesMut::with_capacity(params.chunk_size),
             capacity: params.chunk_size,
-            content_length,
+            content_length: if content_length > 0 {
+                Some(content_length)
+            } else {
+                None
+            },
             content_type,
         })
     }
@@ -187,8 +188,8 @@ impl SourceStream for OpendalStream {
         Self::new(params).await
     }
 
-    fn content_length(&self) -> ContentLength {
-        self.content_length.clone()
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
     }
 
     async fn seek_range(&mut self, start: u64, end: Option<u64>) -> io::Result<()> {
@@ -215,7 +216,7 @@ impl SourceStream for OpendalStream {
 }
 
 impl Stream for OpendalStream {
-    type Item = io::Result<StreamMsg>;
+    type Item = io::Result<Bytes>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -232,7 +233,7 @@ impl Stream for OpendalStream {
             Ok(0) => Poll::Ready(None),
             Ok(_) => {
                 let chunk = this.buf.split();
-                Poll::Ready(Some(Ok(StreamMsg::Data(chunk.freeze()))))
+                Poll::Ready(Some(Ok(chunk.freeze())))
             }
         }
     }

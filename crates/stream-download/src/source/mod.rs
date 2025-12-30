@@ -6,7 +6,6 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::future;
 use std::io::{self, SeekFrom};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -20,133 +19,10 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 
-use crate::storage::{ContentLength, StorageWriter};
+use crate::storage::StorageWriter;
 use crate::{ProgressFn, ReconnectFn, Settings, StreamPhase, StreamState};
 
 pub(crate) mod handle;
-
-/// Key for addressing per-stream or per-resource objects (segments, init segments, playlists, keys).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceKey(pub Arc<str>);
-
-impl From<&str> for ResourceKey {
-    fn from(value: &str) -> Self {
-        Self(Arc::<str>::from(value))
-    }
-}
-
-impl From<String> for ResourceKey {
-    fn from(value: String) -> Self {
-        Self(Arc::<str>::from(value))
-    }
-}
-
-impl From<Arc<str>> for ResourceKey {
-    fn from(value: Arc<str>) -> Self {
-        Self(value)
-    }
-}
-
-/// Chunk kind for segmented streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChunkKind {
-    /// Init segment (e.g. fMP4 init).
-    Init,
-    /// Media segment.
-    Media,
-}
-
-/// Control messages that describe segmented boundaries and auxiliary resources.
-#[derive(Debug, Clone)]
-pub enum StreamControl {
-    /// Start a new chunk under `stream_key`.
-    ChunkStart {
-        /// Logical stream identifier (e.g. `master/<variant>`). Used to keep segments for different
-        /// streams/codecs isolated in storage.
-        stream_key: ResourceKey,
-        /// The kind of chunk being started (init vs media).
-        kind: ChunkKind,
-
-        /// Optional neutral "variant" identifier for segmented streams.
-        ///
-        /// This is intentionally stream-agnostic (not HLS-specific). For example:
-        /// - HLS can set this to the variant index in the master playlist order.
-        /// - Other segmented sources can use it as a stream/quality index.
-        ///
-        /// When absent, consumers may derive identity from `stream_key` or other metadata.
-        variant: Option<u64>,
-
-        /// Optional neutral sequential index for this chunk within the logical stream.
-        ///
-        /// This is intentionally stream-agnostic (not HLS-specific). For example:
-        /// - HLS can set this to the media sequence number.
-        /// - Other segmented sources can use it as a monotonically increasing segment index.
-        ///
-        /// When present, this enables strict, ordered tests like "no gaps, no repeats".
-        sequence: Option<u64>,
-
-        /// Optional reported length in bytes (e.g. HTTP `Content-Length`) for the chunk.
-        reported_len: Option<u64>,
-        /// Optional filename hint (e.g. playlist basename) for deterministic caching.
-        filename_hint: Option<Arc<str>>,
-        /// Per-chunk start offset in bytes for segmented range reads.
-        ///
-        /// This allows segmented storage readers to expose only a suffix of a cached chunk
-        /// (e.g. after a seek that lands in the middle of a segment) without re-downloading.
-        ///
-        /// Default is 0 (no offset).
-        start_offset: u64,
-    },
-
-    /// Finish the current chunk.
-    ChunkEnd {
-        /// Logical stream identifier that this chunk belongs to.
-        stream_key: ResourceKey,
-        /// The kind of chunk being finalized (init vs media).
-        kind: ChunkKind,
-
-        /// Optional neutral "variant" identifier for segmented streams (see `ChunkStart::variant`).
-        variant: Option<u64>,
-
-        /// Optional neutral sequential index for this chunk (see `ChunkStart::index`).
-        sequence: Option<u64>,
-
-        /// Actual bytes gathered/written for this chunk.
-        gathered_len: u64,
-    },
-
-    /// Store a keyed resource blob (init segment, playlist, key, etc.).
-    StoreResource {
-        /// Resource identifier for later retrieval (e.g. init segment key).
-        key: ResourceKey,
-        /// Resource payload bytes.
-        data: Bytes,
-    },
-
-    /// Switch the default logical stream key used by segmented readers.
-    ///
-    /// This is useful for segmented sources (e.g. HLS) that need to switch between logical streams
-    /// (variants/codecs) while preserving ordered control/data delivery.
-    ///
-    /// Storage providers that don't implement segmented reading can safely ignore this message.
-    SetDefaultStreamKey {
-        /// The new default stream key that readers should follow.
-        stream_key: ResourceKey,
-    },
-}
-
-/// A single ordered message emitted by a [`SourceStream`].
-///
-/// Today, only `Data` is required for basic streaming.
-/// Control messages provide the foundation for segmented storage and caching.
-#[derive(Debug, Clone)]
-pub enum StreamMsg {
-    /// A chunk of payload bytes.
-    Data(Bytes),
-
-    /// Ordered out-of-band control message.
-    Control(StreamControl),
-}
 
 /// Enum representing the final outcome of the stream.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -164,7 +40,7 @@ pub enum StreamOutcome {
 /// The implementation must also implement the
 /// [Stream](https://docs.rs/futures/latest/futures/stream/trait.Stream.html) trait.
 pub trait SourceStream:
-    TryStream<Ok = StreamMsg>
+    TryStream<Ok = Bytes>
     + Stream<Item = Result<Self::Ok, Self::Error>>
     + Unpin
     + Send
@@ -185,7 +61,7 @@ pub trait SourceStream:
 
     /// Returns the size of the remote resource in bytes. The result should be `None`
     /// if the stream is infinite or doesn't have a known length.
-    fn content_length(&self) -> ContentLength;
+    fn content_length(&self) -> Option<u64>;
 
     /// Seeks to a specific position in the stream. This method is only called if the
     /// requested range has not been downloaded, so this method should jump to the
@@ -243,7 +119,7 @@ pub(crate) struct Source<S: SourceStream, W: StorageWriter> {
     requested_position: RequestedPosition,
     position_reached: PositionReached,
     notify_read: NotifyRead,
-    content_length: ContentLength,
+    content_length: Option<u64>,
     seek_tx: mpsc::Sender<u64>,
     seek_rx: mpsc::Receiver<u64>,
     prefetch_bytes: u64,
@@ -264,7 +140,7 @@ where
 {
     pub(crate) fn new(
         writer: W,
-        content_length: ContentLength,
+        content_length: Option<u64>,
         settings: Settings<S>,
         cancellation_token: CancellationToken,
     ) -> Self {
@@ -361,7 +237,6 @@ where
         if self.should_seek(stream, position)? {
             debug!("seek position not yet downloaded");
             let current_stream_position = self.writer.stream_position()?;
-            let content_length = self.content_length.current_value();
             if self.prefetch_complete {
                 debug!("re-starting prefetch");
                 self.prefetch_start_position = position;
@@ -372,7 +247,7 @@ where
                     .add(self.prefetch_start_position..current_stream_position);
                 self.prefetch_complete = true;
             }
-            if let Some(content_length) = content_length {
+            if let Some(content_length) = self.content_length {
                 // Get the minimum possible start position to ensure we capture the entire range
                 let min_start_position = current_stream_position.min(position);
                 debug!(
@@ -381,8 +256,8 @@ where
                     "checking for seek range",
                 );
                 if let Some(gap) = self.downloaded.next_gap(min_start_position..content_length) {
-                    // Gap start may be too low if we're seeking forward, so check it against
-                    // the position
+                    // Gap start may be too low if we're seeking forward, so check it against the
+                    // position
                     let seek_start = gap.start.max(position);
                     debug!(seek_start, seek_end = gap.end, "requesting seek range");
                     self.seek(stream, seek_start, Some(gap.end)).await?;
@@ -419,10 +294,6 @@ where
         start_position: u64,
         download_start: Instant,
     ) -> io::Result<DownloadAction> {
-        // Update the content length to reflect the fetched data
-        if !matches!(self.content_length, ContentLength::Static(_)) {
-            self.content_length = stream.content_length();
-        }
         let Some(bytes) = bytes else {
             self.prefetch_complete = true;
             debug!("file shorter than prefetch length, download finished");
@@ -458,9 +329,8 @@ where
     }
 
     async fn finish_or_find_next_gap(&mut self, stream: &mut S) -> io::Result<DownloadAction> {
-        let content_length = self.content_length.current_value();
         if stream.supports_seek()
-            && let Some(content_length) = content_length
+            && let Some(content_length) = self.content_length
         {
             let gap = self.downloaded.next_gap(0..content_length);
             if let Some(gap) = gap {
@@ -495,50 +365,15 @@ where
     async fn handle_bytes(
         &mut self,
         stream: &mut S,
-        msg: Option<Result<StreamMsg, S::Error>>,
+        bytes: Option<Result<Bytes, S::Error>>,
         download_start: Instant,
     ) -> io::Result<DownloadAction> {
-        let msg = match msg.transpose() {
-            Ok(msg) => msg,
+        let bytes = match bytes.transpose() {
+            Ok(bytes) => bytes,
             Err(e) => {
                 error!("Error fetching chunk from stream: {e:?}");
                 return Ok(DownloadAction::Continue);
             }
-        };
-
-        let bytes = match msg {
-            Some(StreamMsg::Data(bytes)) => Some(bytes),
-            Some(StreamMsg::Control(ctrl)) => {
-                // Control messages are ordered relative to `Data`.
-                //
-                // While they do not *directly* advance the contiguous byte stream, they can
-                // advance the writer's *logical* position (e.g. segmented writers may finalize a
-                // cached chunk on `ChunkEnd`, making bytes immediately available for readers).
-                //
-                // If the writer position advances due to a control message, we must:
-                // - update `downloaded` ranges,
-                // - satisfy any pending `requested_position` and notify `position_reached`.
-                //
-                // This unblocks reads/seeks for cache hits where we emit only control messages.
-                //
-                // IMPORTANT:
-                // Some storage writers (e.g. segmented) may error on `stream_position()` until the
-                // first logical stream/segment is initialized. In that case we treat the position
-                // probe as best-effort and just apply the control message.
-                let pos_before = self.writer.stream_position().ok();
-                self.writer.control(ctrl)?;
-                let pos_after = self.writer.stream_position().ok();
-
-                if let (Some(pos_before), Some(pos_after)) = (pos_before, pos_after) {
-                    if pos_after > pos_before {
-                        self.downloaded.add(pos_before..pos_after);
-                        self.notify_position_reached_if_needed(pos_after);
-                    }
-                }
-
-                return Ok(DownloadAction::Continue);
-            }
-            None => None,
         };
 
         if !self.prefetch_complete {
@@ -587,7 +422,19 @@ where
                 self.downloaded.add(position..new_position);
             }
 
-            self.notify_position_reached_if_needed(new_position);
+            if let Some(requested) = self.requested_position.get() {
+                debug!(
+                    requested_position = requested,
+                    current_position = new_position,
+                    "received requested position"
+                );
+
+                if new_position >= requested {
+                    debug!("notifying position reached");
+                    self.requested_position.clear();
+                    self.position_reached.notify_position_reached();
+                }
+            }
             if new_written == 0 {
                 // We're not able to write any data, so we need to wait for space to be available
                 debug!("waiting for next read");
@@ -603,22 +450,6 @@ where
             );
         }
         Ok(new_position)
-    }
-
-    #[inline]
-    fn notify_position_reached_if_needed(&mut self, current_position: u64) {
-        if let Some(requested) = self.requested_position.get() {
-            debug!(
-                requested_position = requested,
-                current_position, "received requested position"
-            );
-
-            if current_position >= requested {
-                debug!("notifying position reached");
-                self.requested_position.clear();
-                self.position_reached.notify_position_reached();
-            }
-        }
     }
 
     fn should_seek(&mut self, stream: &S, position: u64) -> io::Result<bool> {
@@ -716,7 +547,7 @@ where
             notify_read: self.notify_read.clone(),
             position_reached: self.position_reached.clone(),
             seek_tx: self.seek_tx.clone(),
-            content_length: self.content_length.clone(),
+            content_length: self.content_length,
         }
     }
 }

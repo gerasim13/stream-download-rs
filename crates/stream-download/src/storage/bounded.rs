@@ -28,7 +28,7 @@ use educe::Educe;
 use parking_lot::Mutex;
 use tracing::{debug, instrument, trace, warn};
 
-use super::{ContentLength, StorageProvider, StorageReader, StorageWriter};
+use super::{StorageProvider, StorageReader, StorageWriter};
 use crate::WrapIoResult;
 
 /// Creates a [`BoundedStorageReader`] with a fixed size.
@@ -71,24 +71,16 @@ where
 
     fn into_reader_writer(
         self,
-        content_length: ContentLength,
+        content_length: Option<u64>,
     ) -> io::Result<(Self::Reader, Self::Writer)> {
         // We need to take the smaller of the two sizes here to prevent excess memory allocation
-        let buffer_size = match content_length {
-            ContentLength::Static(content_length) => content_length.min(self.buffer_size as u64),
-            ContentLength::Dynamic(dynamic_length) => {
-                dynamic_length.reported.min(self.buffer_size as u64)
-            }
-            ContentLength::Segmented(segmented) => segmented
-                .segments
-                .iter()
-                .map(|d| d.gathered.unwrap_or(d.reported))
-                .sum::<u64>()
-                .min(self.buffer_size as u64),
-            ContentLength::Unknown => self.buffer_size as u64,
+        let buffer_size = if let Some(content_length) = content_length {
+            content_length.min(self.buffer_size as u64)
+        } else {
+            self.buffer_size as u64
         };
 
-        let (reader, writer) = self.inner.into_reader_writer(buffer_size.into())?;
+        let (reader, writer) = self.inner.into_reader_writer(Some(buffer_size))?;
 
         let buffer_size: usize = buffer_size
             .try_into()
@@ -278,8 +270,6 @@ where
     inner: T,
     shared_info: Arc<AssertUnwindSafe<Mutex<SharedInfo>>>,
 }
-
-impl<T> StorageWriter for BoundedStorageWriter<T> where T: StorageWriter {}
 
 impl<T> Write for BoundedStorageWriter<T>
 where

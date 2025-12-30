@@ -22,6 +22,7 @@ use std::pin::Pin;
 use std::process::{ChildStdout, Stdio};
 use std::task::Poll;
 
+use bytes::Bytes;
 pub use command_builder::*;
 pub use ffmpeg::*;
 use futures_util::Stream;
@@ -31,8 +32,7 @@ pub use yt_dlp::*;
 
 use crate::WrapIoResult;
 use crate::async_read::AsyncReadStream;
-use crate::source::{SourceStream, StreamMsg, StreamOutcome};
-use crate::storage::ContentLength;
+use crate::source::{SourceStream, StreamOutcome};
 
 mod command_builder;
 mod ffmpeg;
@@ -174,7 +174,7 @@ fn stdio_to_tmp_file() -> io::Result<(Stdio, NamedTempFile)> {
 /// Parameters for creating a [`ProcessStream`].
 #[derive(Debug)]
 pub struct ProcessStreamParams {
-    content_length: ContentLength,
+    content_length: Option<u64>,
     command: SpawnedCommand,
 }
 
@@ -186,7 +186,7 @@ impl ProcessStreamParams {
     {
         Ok(Self {
             command: command.spawn()?,
-            content_length: ContentLength::Unknown,
+            content_length: None,
         })
     }
 
@@ -194,7 +194,7 @@ impl ProcessStreamParams {
     #[must_use]
     pub fn content_length<L>(self, content_length: L) -> Self
     where
-        L: Into<ContentLength>,
+        L: Into<Option<u64>>,
     {
         Self {
             content_length: content_length.into(),
@@ -262,7 +262,7 @@ impl SourceStream for ProcessStream {
         })
     }
 
-    fn content_length(&self) -> ContentLength {
+    fn content_length(&self) -> Option<u64> {
         self.stream.content_length()
     }
 
@@ -308,13 +308,12 @@ impl SourceStream for ProcessStream {
 }
 
 impl Stream for ProcessStream {
-    type Item = io::Result<StreamMsg>;
+    type Item = io::Result<Bytes>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        // `AsyncReadStream` now yields `StreamMsg`, so just forward it.
         Pin::new(&mut self.stream).poll_next(cx)
     }
 }

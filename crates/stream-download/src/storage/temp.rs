@@ -13,12 +13,10 @@ use educe::Educe;
 pub use tempfile;
 use tempfile::NamedTempFile;
 
-use super::{ContentLength, StorageProvider, StorageWriter};
+use super::StorageProvider;
 use crate::WrapIoResult;
 
 type TempfileFnType = Arc<dyn Fn() -> io::Result<NamedTempFile> + Send + Sync + 'static>;
-
-impl StorageWriter for File {}
 
 #[derive(Clone, Educe)]
 #[educe(Debug)]
@@ -108,7 +106,7 @@ impl StorageProvider for TempStorageProvider {
 
     fn into_reader_writer(
         self,
-        _content_length: ContentLength,
+        _content_length: Option<u64>,
     ) -> io::Result<(Self::Reader, Self::Writer)> {
         let tempfile = if let Some(tempfile_fn) = self.tempfile_fn {
             (tempfile_fn.0)()

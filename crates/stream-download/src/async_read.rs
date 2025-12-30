@@ -4,20 +4,18 @@ use std::convert::Infallible;
 use std::io;
 use std::pin::Pin;
 
-use crate::source::StreamMsg;
-
+use bytes::Bytes;
 use futures_util::Stream;
 use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 
 use crate::source::SourceStream;
-use crate::storage::ContentLength;
 
 /// Parameters for creating an [`AsyncReadStream`].
 #[derive(Debug)]
 pub struct AsyncReadStreamParams<T> {
     stream: T,
-    content_length: ContentLength,
+    content_length: Option<u64>,
 }
 
 impl<T> AsyncReadStreamParams<T> {
@@ -25,7 +23,7 @@ impl<T> AsyncReadStreamParams<T> {
     pub fn new(stream: T) -> Self {
         Self {
             stream,
-            content_length: ContentLength::Unknown,
+            content_length: None,
         }
     }
 
@@ -35,7 +33,7 @@ impl<T> AsyncReadStreamParams<T> {
     #[must_use]
     pub fn content_length<L>(self, content_length: L) -> Self
     where
-        L: Into<ContentLength>,
+        L: Into<Option<u64>>,
     {
         Self {
             content_length: content_length.into(),
@@ -48,7 +46,7 @@ impl<T> AsyncReadStreamParams<T> {
 #[derive(Debug)]
 pub struct AsyncReadStream<T> {
     stream: ReaderStream<T>,
-    content_length: ContentLength,
+    content_length: Option<u64>,
 }
 
 impl<T> AsyncReadStream<T>
@@ -58,7 +56,7 @@ where
     /// Creates a new [`AsyncReadStream`].
     pub fn new<L>(stream: T, content_length: L) -> Self
     where
-        L: Into<ContentLength>,
+        L: Into<Option<u64>>,
     {
         Self {
             stream: ReaderStream::new(stream),
@@ -79,8 +77,8 @@ where
         Ok(Self::new(params.stream, params.content_length))
     }
 
-    fn content_length(&self) -> ContentLength {
-        self.content_length.clone()
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
     }
 
     fn supports_seek(&self) -> bool {
@@ -106,19 +104,12 @@ impl<T> Stream for AsyncReadStream<T>
 where
     T: AsyncRead + Unpin,
 {
-    type Item = io::Result<StreamMsg>;
+    type Item = io::Result<Bytes>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.stream).poll_next(cx) {
-            std::task::Poll::Ready(Some(Ok(bytes))) => {
-                std::task::Poll::Ready(Some(Ok(StreamMsg::Data(bytes))))
-            }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        Pin::new(&mut self.stream).poll_next(cx)
     }
 }
