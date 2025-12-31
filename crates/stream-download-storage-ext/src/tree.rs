@@ -1,16 +1,17 @@
 use std::any::Any;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::marker::PhantomData;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use bytes::Bytes;
 use educe::Educe;
-use reqwest::Url;
 
-use super::blob::{BlobCache, StorageBackedBlobCache};
+use super::blob::StorageBackedBlobCache;
 use stream_download::storage::StorageProvider;
+
+/// Type alias for factory functions that create cache nodes from keys.
+pub type CacheFactory<P, K> =
+    dyn Fn(&K) -> io::Result<Option<StorageBackedBlobCache<P>>> + Sync + Send;
 
 /// Trait for a storage tree.
 pub trait Tree {
@@ -18,7 +19,8 @@ pub trait Tree {
     type Key: Any;
     type Factory: Fn(&Self::Key) -> io::Result<Option<StorageBackedBlobCache<Self::Provider>>>
         + Sync
-        + Send;
+        + Send
+        + ?Sized;
 
     /// Returns a factory function that creates a new node in the storage tree.
     fn factory(&self) -> &Arc<Box<Self::Factory>>;
@@ -33,25 +35,26 @@ pub trait Tree {
 /// A cache tree backed by a filesystem.
 #[derive(Educe)]
 #[educe(Debug)]
-pub struct TreeStorageFactory<P, K, F>
+pub struct TreeStorageFactory<P, K>
 where
-    P: StorageProvider,
+    P: StorageProvider + Sync,
     K: Any,
-    F: Fn(&K) -> io::Result<Option<StorageBackedBlobCache<P>>> + Sync + Send,
 {
     #[educe(Debug = false)]
-    factory: Arc<Box<F>>,
+    factory: Arc<Box<CacheFactory<P, K>>>,
     storage_root: PathBuf,
     _phantom: PhantomData<(P, K)>,
 }
 
-impl<P, K, F> TreeStorageFactory<P, K, F>
+impl<P, K> TreeStorageFactory<P, K>
 where
-    P: StorageProvider,
+    P: StorageProvider + Sync,
     K: Any,
-    F: Fn(&K) -> io::Result<Option<StorageBackedBlobCache<P>>> + Sync + Send,
 {
-    pub fn new(factory: F, storage_root: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        factory: impl Fn(&K) -> io::Result<Option<StorageBackedBlobCache<P>>> + Sync + Send + 'static,
+        storage_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             factory: Arc::new(Box::new(factory)),
             storage_root: storage_root.into(),
@@ -60,15 +63,14 @@ where
     }
 }
 
-impl<P, K, F> Tree for TreeStorageFactory<P, K, F>
+impl<P, K> Tree for TreeStorageFactory<P, K>
 where
-    P: StorageProvider,
+    P: StorageProvider + Sync,
     K: Any,
-    F: Fn(&K) -> io::Result<Option<StorageBackedBlobCache<P>>> + Sync + Send,
 {
     type Provider = P;
     type Key = K;
-    type Factory = F;
+    type Factory = CacheFactory<P, K>;
 
     fn factory(&self) -> &Arc<Box<Self::Factory>> {
         &self.factory

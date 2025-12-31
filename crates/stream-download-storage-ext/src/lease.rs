@@ -4,7 +4,6 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use super::file::FileStorageProvider;
 use stream_download::storage::StorageProvider;
 use tracing::error;
 
@@ -88,41 +87,3 @@ impl Drop for LeaseFile {
         }
     }
 }
-
-// #[derive(Debug)]
-// pub struct LeaseAwareFileStorageProvider<P, L>
-// where
-//     P: StorageProvider + Debug,
-//     L: Lease + Debug,
-// {
-//     inner: P,
-//     lease: L,
-// }
-
-// impl LeaseAwareFileStorageProvider<FileStorageProvider, LeaseFile> {
-//     pub fn new(inner: FileStorageProvider, lease: LeaseFile) -> Self {
-//         Self { inner, lease }
-//     }
-// }
-
-// impl Lease for LeaseAwareFileStorageProvider<FileStorageProvider, LeaseFile> {
-//     fn touch(&self) -> io::Result<()> {
-//         self.lease.touch()
-//     }
-
-//     fn remove(&self) -> io::Result<()> {
-//         if self.exists() {
-//             fs::remove_file(&self.inner.path())
-//         } else {
-//             Ok(())
-//         }
-//     }
-
-//     fn exists(&self) -> bool {
-//         self.inner.path().exists()
-//     }
-
-//     fn age(&self) -> Duration {
-//         get_file_age(&self.inner.path())
-//     }
-// }

@@ -1,18 +1,10 @@
 use std::any::Any;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::marker::PhantomData;
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use reqwest::Url;
-
-use super::blob::{BlobCache, StorageBackedBlobCache};
-use super::file::FileStorageProvider;
-use super::lease::LeaseAwareStorageProvider;
+use super::blob::BlobCache;
 use super::tree::{Tree, TreeStorageFactory};
-use stream_download::storage::{StorageProvider, StorageReader, StorageWriter};
+use stream_download::storage::StorageProvider;
 
 /// Trait for a key-value store.
 pub trait KVStore {
@@ -22,18 +14,18 @@ pub trait KVStore {
     fn factory(&self) -> &Self::Factory;
 
     /// Get the cached blob, if present.
-    fn get(&self, key: &<Self::Factory as Tree>::Key) -> io::Result<Option<Bytes>> {
+    fn get(&self, key: &<Self::Factory as Tree>::Key) -> io::Result<Option<bytes::Bytes>> {
         if let Some(node) = self.factory().node(key)? {
-            node.get()
+            BlobCache::get(&node)
         } else {
             Ok(None)
         }
     }
 
     /// Store a blob in the cache, overwriting any existing data.
-    fn put(&self, key: &<Self::Factory as Tree>::Key, data: Bytes) -> io::Result<()> {
+    fn put(&self, key: &<Self::Factory as Tree>::Key, data: bytes::Bytes) -> io::Result<()> {
         if let Some(node) = self.factory().node(key)? {
-            node.put(data)
+            BlobCache::put(&node, data)
         } else {
             Ok(())
         }
@@ -42,7 +34,7 @@ pub trait KVStore {
     /// Get the length of the cached blob, if present.
     fn len(&self, key: &<Self::Factory as Tree>::Key) -> io::Result<Option<u64>> {
         if let Some(node) = self.factory().node(key)? {
-            node.len()
+            BlobCache::len(&node)
         } else {
             Ok(None)
         }
@@ -51,7 +43,7 @@ pub trait KVStore {
     /// Check if the cache contains a blob.
     fn exists(&self, key: &<Self::Factory as Tree>::Key) -> io::Result<bool> {
         if let Some(node) = self.factory().node(key)? {
-            node.exists()
+            BlobCache::exists(&node)
         } else {
             Ok(false)
         }
@@ -61,17 +53,30 @@ pub trait KVStore {
 /// Storage-backed key-value store
 pub struct TreeStructuredKVStore<P, K>
 where
-    P: StorageProvider,
-    K: Any,
+    P: StorageProvider + Send + Sync,
+    K: Any + Send + Sync,
 {
     factory: TreeStorageFactory<P, K>,
     _phantom: PhantomData<(P, K)>,
 }
 
+impl<P, K> TreeStructuredKVStore<P, K>
+where
+    P: StorageProvider + Send + Sync,
+    K: Any + Send + Sync,
+{
+    pub fn new(factory: TreeStorageFactory<P, K>) -> Self {
+        Self {
+            factory,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<P, K> KVStore for TreeStructuredKVStore<P, K>
 where
-    P: StorageProvider,
-    K: Any,
+    P: StorageProvider + Send + Sync,
+    K: Any + Send + Sync,
 {
     type Factory = TreeStorageFactory<P, K>;
 
