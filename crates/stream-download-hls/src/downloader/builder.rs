@@ -3,13 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use stream_download::source::StreamMsg;
-use stream_download::storage::StorageHandle;
-use tokio::sync::mpsc;
-
 use super::cache::CacheKeyCallback;
 use super::traits::{Downloader, Headers};
 use super::{CacheDownloader, HttpDownloader, RetryDownloader, RetryPolicy, TimeoutDownloader};
+use crate::storage_new::HlsStorageProvider;
 
 /// Builder for creating composed downloaders.
 pub struct DownloaderBuilder<D> {
@@ -54,12 +51,11 @@ where
     /// Add caching functionality.
     pub fn with_cache(
         self,
-        handle: StorageHandle,
+        cache_provider: Arc<HlsStorageProvider>,
         key_callback: Arc<CacheKeyCallback>,
-        data_sender: mpsc::Sender<StreamMsg>,
     ) -> DownloaderBuilder<CacheDownloader<D>> {
         DownloaderBuilder {
-            inner: CacheDownloader::new(self.inner, handle, key_callback, data_sender),
+            inner: CacheDownloader::new(self.inner, cache_provider, key_callback),
         }
     }
 
@@ -76,9 +72,8 @@ pub fn create_default_downloader(
     retry_base_delay: Duration,
     max_retry_delay: Duration,
     cancel: tokio_util::sync::CancellationToken,
-    storage_handle: StorageHandle,
+    cache_provider: Option<Arc<HlsStorageProvider>>,
     key_callback: Arc<CacheKeyCallback>,
-    data_sender: mpsc::Sender<StreamMsg>,
     key_request_headers: Option<Headers>,
 ) -> Arc<dyn Downloader + Send + Sync> {
     let base_downloader = HttpDownloader::new(request_timeout, cancel, key_request_headers);
@@ -89,11 +84,22 @@ pub fn create_default_downloader(
         max_delay: max_retry_delay,
     };
 
-    let downloader = DownloaderBuilder::from_http(base_downloader)
+    // Start with base downloader
+    let downloader_builder = DownloaderBuilder::from_http(base_downloader)
         .with_timeout(request_timeout)
-        .with_retry(retry_policy)
-        .with_cache(storage_handle, key_callback, data_sender)
-        .build();
+        .with_retry(retry_policy);
 
-    Arc::new(downloader)
+    // Add cache if provider is available
+    let downloader: Arc<dyn Downloader + Send + Sync> = if let Some(cache_provider) = cache_provider
+    {
+        Arc::new(
+            downloader_builder
+                .with_cache(cache_provider, key_callback)
+                .build(),
+        )
+    } else {
+        Arc::new(downloader_builder.build())
+    };
+
+    downloader
 }

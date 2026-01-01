@@ -13,6 +13,7 @@ mod tree;
 
 pub use blob::{BlobCache, BlobCacheReader, BlobCacheWriter, StorageBackedBlobCache};
 pub use cache::LeaseAwareCacheTree;
+pub use file::FileStorageProvider;
 pub use kv::{KVStore, TreeStructuredKVStore};
 pub use lease::{Lease, LeaseAwareStorageProvider};
 pub use tree::{Tree, TreeStorageFactory};

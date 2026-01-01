@@ -5,13 +5,11 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
-use stream_download::source::{ResourceKey, StreamControl, StreamMsg};
-use stream_download::storage::StorageHandle;
-use tokio::sync::mpsc;
-
 use super::traits::{ByteStream, Downloader, Headers};
 use super::types::Resource;
-use crate::error::HlsResult;
+use crate::cache::keys::HlsCacheKey;
+use crate::error::{HlsError, HlsResult};
+use crate::storage_new::HlsStorageProvider;
 
 /// Where returned bytes came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,16 +30,14 @@ pub struct CachedBytes {
 }
 
 /// Callback function type for generating cache keys from resources.
-pub type CacheKeyCallback = dyn Fn(&Resource) -> Option<ResourceKey> + Send + Sync;
+pub type CacheKeyCallback = dyn Fn(&Resource) -> Option<HlsCacheKey> + Send + Sync;
 
 /// Downloader decorator that adds caching.
 pub struct CacheDownloader<D> {
     inner: D,
-    handle: StorageHandle,
+    cache_provider: Arc<HlsStorageProvider>,
     /// Callback to generate cache key from resource
     key_callback: Arc<CacheKeyCallback>,
-    /// Sender for StoreResource control messages
-    data_sender: mpsc::Sender<StreamMsg>,
 }
 
 impl<D> CacheDownloader<D>
@@ -51,21 +47,19 @@ where
     /// Create a new cache decorator.
     pub fn new(
         inner: D,
-        handle: StorageHandle,
+        cache_provider: Arc<HlsStorageProvider>,
         key_callback: Arc<CacheKeyCallback>,
-        data_sender: mpsc::Sender<StreamMsg>,
     ) -> Self {
         Self {
             inner,
-            handle,
+            cache_provider,
             key_callback,
-            data_sender,
         }
     }
 
-    /// Replace the storage handle.
-    pub fn with_storage_handle(mut self, handle: StorageHandle) -> Self {
-        self.handle = handle;
+    /// Replace the cache provider.
+    pub fn with_cache_provider(mut self, cache_provider: Arc<HlsStorageProvider>) -> Self {
+        self.cache_provider = cache_provider;
         self
     }
 
@@ -75,60 +69,78 @@ where
         self
     }
 
-    /// Set the data sender for StoreResource messages.
-    pub fn with_data_sender(mut self, data_sender: mpsc::Sender<StreamMsg>) -> Self {
-        self.data_sender = data_sender;
-        self
-    }
-
     /// Read from cache.
-    fn read_cache(&self, key: &ResourceKey) -> HlsResult<Option<Bytes>> {
-        match self.handle.read(key) {
+    fn read_cache(&self, key: &HlsCacheKey) -> HlsResult<Option<Bytes>> {
+        match self.cache_provider.get(key) {
             Ok(Some(bytes)) => Ok(Some(bytes)),
-            Err(_) | Ok(None) => Ok(None),
+            Err(e) => {
+                trace!("cache: read error for key='{}': {:?}", key.as_str(), e);
+                Ok(None)
+            }
+            Ok(None) => Ok(None),
         }
     }
 
-    /// Download with caching using a resource key.
+    /// Write to cache.
+    fn write_cache(&self, key: &HlsCacheKey, data: Bytes) -> HlsResult<()> {
+        self.cache_provider.put(key, data).map_err(|e| {
+            HlsError::io(format!(
+                "cache: write error for key='{}': {}",
+                key.as_str(),
+                e
+            ))
+        })
+    }
+
+    /// Download with caching using a cache key.
     pub async fn download_cached(
         &self,
         resource: &Resource,
-        key: &ResourceKey,
+        key: &HlsCacheKey,
     ) -> HlsResult<CachedBytes> {
-        trace!("cache: request url='{}' key='{}'", resource.url(), key.0);
+        trace!(
+            "cache: request url='{}' key='{}'",
+            resource.url(),
+            key.as_str()
+        );
+
+        // Try to read from cache first
         if let Some(bytes) = self.read_cache(key)? {
-            trace!("cache: serving from cache key='{}'", key.0);
+            trace!("cache: serving from cache key='{}'", key.as_str());
             return Ok(CachedBytes {
                 bytes,
                 source: CacheSource::Cache,
             });
         }
 
+        // Download from network
         trace!(
             "cache: downloading from network url='{}' key='{}'",
             resource.url(),
-            key.0
+            key.as_str()
         );
         let bytes = self.inner.download_with_headers(resource, None).await?;
 
-        // Send StoreResource message
-        let msg = StreamMsg::Control(StreamControl::StoreResource {
-            key: key.clone(),
-            data: bytes.clone(),
-        });
-        if let Err(e) = self.data_sender.try_send(msg) {
+        // Write to cache
+        if let Err(e) = self.write_cache(key, bytes.clone()) {
             trace!(
-                "cache: failed to send StoreResource message key='{}' error='{:?}'",
-                key.0, e
+                "cache: failed to write to cache key='{}': {:?}",
+                key.as_str(),
+                e
             );
+            // Don't fail the download if cache write fails
         } else {
-            trace!("cache: sent StoreResource message key='{}'", key.0);
+            trace!(
+                "cache: wrote to cache key='{}' ({} bytes)",
+                key.as_str(),
+                bytes.len()
+            );
         }
 
         trace!(
             "cache: downloaded from network url='{}' key='{}' ({} bytes)",
             resource.url(),
-            key.0,
+            key.as_str(),
             bytes.len()
         );
         Ok(CachedBytes {
@@ -137,51 +149,56 @@ where
         })
     }
 
-    /// Download with caching using a resource key and custom headers.
+    /// Download with caching using a cache key and custom headers.
     pub async fn download_cached_with_headers(
         &self,
         resource: &Resource,
-        key: &ResourceKey,
+        key: &HlsCacheKey,
         headers: Option<Headers>,
     ) -> HlsResult<CachedBytes> {
         trace!(
             "cache: request with headers url='{}' key='{}'",
             resource.url(),
-            key.0
+            key.as_str()
         );
+
+        // Try to read from cache first
         if let Some(bytes) = self.read_cache(key)? {
-            trace!("cache: serving from cache key='{}'", key.0);
+            trace!("cache: serving from cache key='{}'", key.as_str());
             return Ok(CachedBytes {
                 bytes,
                 source: CacheSource::Cache,
             });
         }
 
+        // Download from network with headers
         trace!(
             "cache: downloading from network with headers url='{}' key='{}'",
             resource.url(),
-            key.0
+            key.as_str()
         );
         let bytes = self.inner.download_with_headers(resource, headers).await?;
 
-        // Send StoreResource message
-        let msg = StreamMsg::Control(StreamControl::StoreResource {
-            key: key.clone(),
-            data: bytes.clone(),
-        });
-        if let Err(e) = self.data_sender.try_send(msg) {
+        // Write to cache
+        if let Err(e) = self.write_cache(key, bytes.clone()) {
             trace!(
-                "cache: failed to send StoreResource message key='{}' error='{:?}'",
-                key.0, e
+                "cache: failed to write to cache key='{}': {:?}",
+                key.as_str(),
+                e
             );
+            // Don't fail the download if cache write fails
         } else {
-            trace!("cache: sent StoreResource message key='{}'", key.0);
+            trace!(
+                "cache: wrote to cache key='{}' ({} bytes)",
+                key.as_str(),
+                bytes.len()
+            );
         }
 
         trace!(
             "cache: downloaded from network url='{}' key='{}' ({} bytes)",
             resource.url(),
-            key.0,
+            key.as_str(),
             bytes.len()
         );
         Ok(CachedBytes {
@@ -211,7 +228,7 @@ where
                 .await?;
             Ok(cached.bytes)
         } else {
-            // Without a resource key, we can't cache - just pass through
+            // Without a cache key, we can't cache - just pass through
             self.inner.download_with_headers(resource, headers).await
         }
     }
@@ -245,9 +262,8 @@ impl<D: std::fmt::Debug> std::fmt::Debug for CacheDownloader<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheDownloader")
             .field("inner", &self.inner)
-            .field("handle", &self.handle)
+            .field("cache_provider", &"Arc<HlsStorageProvider>")
             .field("key_callback", &"Arc<CacheKeyCallback>")
-            .field("data_sender", &"mpsc::Sender<StreamMsg>")
             .finish()
     }
 }
@@ -256,9 +272,8 @@ impl<D: Clone> Clone for CacheDownloader<D> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
-            handle: self.handle.clone(),
+            cache_provider: Arc::clone(&self.cache_provider),
             key_callback: Arc::clone(&self.key_callback),
-            data_sender: self.data_sender.clone(),
         }
     }
 }

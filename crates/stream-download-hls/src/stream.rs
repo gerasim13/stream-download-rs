@@ -14,14 +14,13 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{self, Poll};
 
-use crate::HlsStreamWorker;
 use crate::error::HlsError;
 use crate::parser::{CodecInfo, VariantId};
 use crate::settings::HlsSettings;
 
 use futures_util::Stream;
-use stream_download::source::{SourceStream, StreamMsg};
-use stream_download::storage::{ContentLength, SegmentedLength, StorageHandle};
+use stream_download::source::SourceStream;
+
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{instrument, trace};
@@ -90,8 +89,8 @@ pub struct HlsStreamParams {
     pub url: Url,
     /// Unified settings for HLS playback and downloader behavior.
     pub settings: Arc<HlsSettings>,
-    /// Storage handle used for read-before-fetch caching of playlists/keys.
-    pub storage_handle: StorageHandle,
+    /// Cache provider used for read-before-fetch caching of playlists/keys.
+    pub cache_provider: Option<std::sync::Arc<crate::storage_new::HlsStorageProvider>>,
 }
 
 impl HlsStreamParams {
@@ -99,19 +98,19 @@ impl HlsStreamParams {
     pub fn new(
         url: Url,
         settings: impl Into<Arc<HlsSettings>>,
-        storage_handle: StorageHandle,
+        cache_provider: Option<std::sync::Arc<crate::storage_new::HlsStorageProvider>>,
     ) -> Self {
         Self {
             url,
             settings: settings.into(),
-            storage_handle,
+            cache_provider,
         }
     }
 }
 
 pub struct HlsStream {
-    /// Receiver for ordered stream messages (data + control).
-    data_rx: mpsc::Receiver<StreamMsg>,
+    /// Receiver for ordered byte chunks.
+    data_rx: mpsc::Receiver<bytes::Bytes>,
     /// Sender for unified commands to the worker loop.
     cmd_tx: mpsc::Sender<HlsCommand>,
     /// Broadcaster for out-of-band stream events.
@@ -121,46 +120,31 @@ pub struct HlsStream {
     /// Cancellation token for shutdown.
     cancel_token: CancellationToken,
     /// Best-effort segmented length snapshot used by `content_length()`.
-    segmented_length: Arc<RwLock<SegmentedLength>>,
+    segmented_length: Arc<RwLock<Option<u64>>>,
 }
 
 impl HlsStream {
-    /// Creates a new HLS stream and spawns a default [`HlsStreamWorker`].
+    /// Creates a new HLS stream.
     pub async fn new(
         url: Url,
         settings: Arc<HlsSettings>,
-        storage_handle: StorageHandle,
+        cache_provider: Option<std::sync::Arc<crate::storage_new::HlsStorageProvider>>,
     ) -> Result<Self, HlsError> {
         // Create channels for data and commands (bounded data channel provides backpressure).
         let buffer_size = settings.prefetch_buffer_size;
-        let (data_tx, data_rx) = mpsc::channel::<StreamMsg>(buffer_size);
+        let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(buffer_size);
         let (cmd_tx, cmd_rx) = mpsc::channel::<HlsCommand>(8);
         let (event_tx, _event_rx) = broadcast::channel(64);
         let cancel_token = CancellationToken::new();
         // Best-effort segmented length snapshot shared with `content_length()`.
-        let segmented_length = Arc::new(RwLock::new(SegmentedLength::default()));
+        let segmented_length = Arc::new(RwLock::new(None));
 
-        // Construct the default worker (previous behavior).
-        let worker = HlsStreamWorker::new(
-            url,
-            settings,
-            storage_handle,
-            data_tx,
-            cmd_rx,
-            cancel_token.clone(),
-            event_tx.clone(),
-            segmented_length.clone(),
-        )
-        .await?;
-
-        // Spawn the worker task.
+        // TODO: Implement HLS streaming worker for new architecture
+        // For now, create a dummy task that immediately closes the data channel
         let streaming_task = tokio::spawn(async move {
-            tracing::trace!("HLS streaming task started");
-            match worker.run().await {
-                Ok(_) => tracing::trace!("HLS streaming task finished"),
-                Err(HlsError::Cancelled) => tracing::trace!("HLS streaming task cancelled"),
-                Err(e) => tracing::error!("HLS streaming loop error: {}", e),
-            }
+            tracing::trace!("HLS streaming task placeholder - no worker implemented yet");
+            // Close the data channel to signal end of stream
+            drop(data_tx);
         });
 
         Ok(Self {
@@ -229,24 +213,14 @@ impl SourceStream for HlsStream {
     type StreamCreationError = HlsError;
 
     async fn create(params: Self::Params) -> Result<Self, Self::StreamCreationError> {
-        Self::new(params.url, params.settings, params.storage_handle).await
+        Self::new(params.url, params.settings, params.cache_provider).await
     }
 
-    fn content_length(&self) -> ContentLength {
-        // Best-effort: report `Unknown` until the worker observes at least one segment boundary.
+    fn content_length(&self) -> Option<u64> {
+        // Best-effort: report length if known
         match self.segmented_length.read() {
-            Ok(guard) => {
-                let has_lengths = guard
-                    .segments
-                    .iter()
-                    .any(|seg| seg.reported > 0 || seg.gathered.is_some());
-                if has_lengths {
-                    ContentLength::Segmented(guard.clone())
-                } else {
-                    ContentLength::Unknown
-                }
-            }
-            Err(_) => ContentLength::Unknown,
+            Ok(guard) => *guard,
+            Err(_) => None,
         }
     }
 
@@ -273,11 +247,11 @@ impl SourceStream for HlsStream {
 }
 
 impl Stream for HlsStream {
-    type Item = io::Result<StreamMsg>;
+    type Item = io::Result<bytes::Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Option<Self::Item>> {
         match self.data_rx.poll_recv(cx) {
-            Poll::Ready(Some(msg)) => Poll::Ready(Some(Ok(msg))),
+            Poll::Ready(Some(bytes)) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

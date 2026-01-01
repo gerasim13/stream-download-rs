@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use url::Url;
 
-#[cfg(feature = "aes-decrypt")]
-use crate::crypto::resolver::KeyProcessorCallback;
+// Temporarily disabled for new architecture
+// #[cfg(feature = "aes-decrypt")]
+// use crate::crypto::resolver::KeyProcessorCallback;
 use crate::parser::{MasterPlaylist, VariantId};
 
 /// Variant selection callback (return `Some(id)` for manual selection, or `None` for ABR).
@@ -69,7 +70,7 @@ pub struct HlsSettings {
 
     /// Optional callback to post-process fetched AES keys before use (e.g., unwrap DRM).
     #[cfg(feature = "aes-decrypt")]
-    pub key_processor_cb: Option<Arc<Box<KeyProcessorCallback>>>,
+    pub key_processor_cb: Option<Arc<Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>>>,
 
     /// Optional query parameters appended to key fetch requests.
     #[cfg(feature = "aes-decrypt")]
@@ -263,7 +264,10 @@ impl HlsSettings {
     }
 
     #[cfg(feature = "aes-decrypt")]
-    pub fn key_processor_cb(mut self, cb: Option<Arc<Box<KeyProcessorCallback>>>) -> Self {
+    pub fn key_processor_cb(
+        mut self,
+        cb: Option<Arc<Box<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>>>,
+    ) -> Self {
         self.key_processor_cb = cb;
         self
     }

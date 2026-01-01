@@ -51,6 +51,7 @@ pub trait KVStore {
 }
 
 /// Storage-backed key-value store
+#[derive(Debug)]
 pub struct TreeStructuredKVStore<P, K>
 where
     P: StorageProvider + Send + Sync,

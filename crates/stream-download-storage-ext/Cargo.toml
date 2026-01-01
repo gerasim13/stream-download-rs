@@ -23,6 +23,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 stream-download = { path = "../stream-download", features = ["temp-storage"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = { workspace = true }
 
 [features]
 default = []

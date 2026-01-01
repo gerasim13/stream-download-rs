@@ -1,7 +1,6 @@
 //! HLS cache key helpers.
 //!
-//! This module constructs [`ResourceKey`](stream_download::source::ResourceKey) values for caching
-//! small resources (playlists and encryption keys).
+//! This module constructs cache keys for HLS resources.
 //!
 //! It does not perform I/O; it only derives deterministic keys from:
 //! - a master identifier (`master_hash_from_url`),
@@ -15,14 +14,71 @@
 //! - media segments: `"<master_hash>/<variant_id>/seg_<basename>"`
 
 use std::collections::hash_map::DefaultHasher;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use stream_download::source::ResourceKey;
 use tracing::trace;
 
 use crate::downloader::Resource;
 use crate::parser::VariantId;
+
+/// Cache key for HLS resources.
+///
+/// This key is used with `LeaseAwareCacheTree` from `stream-download-storage-ext`.
+/// It contains the full path relative to the storage root.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct HlsCacheKey {
+    /// The key string in format:
+    /// - Playlists: `<master_hash>/<playlist_basename>`
+    /// - Keys: `<master_hash>/<variant_id>/<key_basename>`
+    /// - Init segments: `<master_hash>/<variant_id>/init_<basename>`
+    /// - Media segments: `<master_hash>/<variant_id>/seg_<basename>`
+    pub key: String,
+}
+
+impl HlsCacheKey {
+    /// Create a new HLS cache key from a string.
+    pub fn new(key: String) -> Self {
+        Self { key }
+    }
+
+    /// Get the key as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.key
+    }
+
+    /// Convert the key to a filesystem path relative to storage root.
+    pub fn to_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.key)
+    }
+
+    /// Extract master hash from the key.
+    pub fn master_hash(&self) -> Option<&str> {
+        self.key.split('/').next()
+    }
+}
+
+// HlsCacheKey automatically implements Any because it contains no non-'static references
+// and can be used with LeaseAwareCacheTree which requires K: Any
+
+impl fmt::Display for HlsCacheKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.key)
+    }
+}
+
+impl From<String> for HlsCacheKey {
+    fn from(key: String) -> Self {
+        Self::new(key)
+    }
+}
+
+impl From<&str> for HlsCacheKey {
+    fn from(key: &str) -> Self {
+        Self::new(key.to_string())
+    }
+}
 
 /// Computes a deterministic identifier for a stream from the master playlist URL.
 ///
@@ -71,24 +127,24 @@ impl CacheKeyGenerator {
     /// Constructs a playlist cache key from a URL: `"<master_hash>/<playlist_basename>"`.
     ///
     /// Returns `None` if no basename can be derived.
-    pub fn playlist_key_from_url(&self, playlist_url: &str) -> Option<ResourceKey> {
+    pub fn playlist_key_from_url(&self, playlist_url: &str) -> Option<HlsCacheKey> {
         let basename = Self::uri_basename_no_query(playlist_url)?;
         let key = self.playlist_key_from_basename(basename);
         trace!(
             "cache_key: playlist key derived master_hash='{}' url='{}' key='{}'",
-            self.master_hash, playlist_url, key.0
+            self.master_hash, playlist_url, key.key
         );
         Some(key)
     }
 
     /// Constructs a playlist cache key from a basename: `"<master_hash>/<playlist_basename>"`.
     #[inline]
-    pub fn playlist_key_from_basename(&self, playlist_basename: &str) -> ResourceKey {
+    pub fn playlist_key_from_basename(&self, playlist_basename: &str) -> HlsCacheKey {
         // Keep it allocation-friendly: allocate one String once.
-        let key = ResourceKey(format!("{}/{}", self.master_hash, playlist_basename).into());
+        let key = HlsCacheKey::new(format!("{}/{}", self.master_hash, playlist_basename));
         trace!(
             "cache_key: playlist key from basename master_hash='{}' basename='{}' key='{}'",
-            self.master_hash, playlist_basename, key.0
+            self.master_hash, playlist_basename, key.key
         );
         key
     }
@@ -96,30 +152,32 @@ impl CacheKeyGenerator {
     /// Constructs a variant-scoped key cache key from a URL: `"<master_hash>/<variant_id>/<key_basename>"`.
     ///
     /// Returns `None` if no basename can be derived.
-    pub fn key_key_from_url(&self, variant_id: VariantId, key_url: &str) -> Option<ResourceKey> {
+    pub fn key_key_from_url(&self, variant_id: VariantId, key_url: &str) -> Option<HlsCacheKey> {
         let basename = Self::uri_basename_no_query(key_url)?;
         let key = self.key_key_from_basename(variant_id, basename);
         trace!(
             "cache_key: key key derived master_hash='{}' variant_id={} url='{}' key='{}'",
-            self.master_hash, variant_id.0, key_url, key.0
+            self.master_hash, variant_id.0, key_url, key.key
         );
         Some(key)
     }
 
     /// Constructs a variant-scoped key cache key from a basename: `"<master_hash>/<variant_id>/<key_basename>"`.
     #[inline]
-    pub fn key_key_from_basename(&self, variant_id: VariantId, key_basename: &str) -> ResourceKey {
-        let key =
-            ResourceKey(format!("{}/{}/{}", self.master_hash, variant_id.0, key_basename).into());
+    pub fn key_key_from_basename(&self, variant_id: VariantId, key_basename: &str) -> HlsCacheKey {
+        let key = HlsCacheKey::new(format!(
+            "{}/{}/{}",
+            self.master_hash, variant_id.0, key_basename
+        ));
         trace!(
             "cache_key: key key from basename master_hash='{}' variant_id={} basename='{}' key='{}'",
-            self.master_hash, variant_id.0, key_basename, key.0
+            self.master_hash, variant_id.0, key_basename, key.key
         );
         key
     }
 
     /// Generate a cache key for a resource.
-    pub fn generate_key(&self, resource: &Resource) -> Option<ResourceKey> {
+    pub fn generate_key(&self, resource: &Resource) -> Option<HlsCacheKey> {
         match resource {
             Resource::Master(url) => self.playlist_key_from_url(url.as_str()),
             Resource::MediaPlaylist(url, _variant_id) => {
@@ -129,23 +187,25 @@ impl CacheKeyGenerator {
             Resource::Key(url, variant_id) => self.key_key_from_url(*variant_id, url.as_str()),
             Resource::InitSegment(url, variant_id) => {
                 let basename = Self::uri_basename_no_query(url.as_str())?;
-                let key = ResourceKey(
-                    format!("{}/{}/init_{}", self.master_hash, variant_id.0, basename).into(),
-                );
+                let key = HlsCacheKey::new(format!(
+                    "{}/{}/init_{}",
+                    self.master_hash, variant_id.0, basename
+                ));
                 trace!(
                     "cache_key: init segment key derived master_hash='{}' variant_id={} url='{}' key='{}'",
-                    self.master_hash, variant_id.0, url, key.0
+                    self.master_hash, variant_id.0, url, key.key
                 );
                 Some(key)
             }
             Resource::MediaSegment(url, variant_id) => {
                 let basename = Self::uri_basename_no_query(url.as_str())?;
-                let key = ResourceKey(
-                    format!("{}/{}/seg_{}", self.master_hash, variant_id.0, basename).into(),
-                );
+                let key = HlsCacheKey::new(format!(
+                    "{}/{}/seg_{}",
+                    self.master_hash, variant_id.0, basename
+                ));
                 trace!(
                     "cache_key: media segment key derived master_hash='{}' variant_id={} url='{}' key='{}'",
-                    self.master_hash, variant_id.0, url, key.0
+                    self.master_hash, variant_id.0, url, key.key
                 );
                 Some(key)
             }
@@ -156,7 +216,7 @@ impl CacheKeyGenerator {
 /// Create a cache key callback from a CacheKeyGenerator.
 pub fn create_key_callback(
     generator: CacheKeyGenerator,
-) -> Arc<dyn Fn(&Resource) -> Option<ResourceKey> + Send + Sync> {
+) -> Arc<dyn Fn(&Resource) -> Option<HlsCacheKey> + Send + Sync> {
     Arc::new(move |resource| generator.generate_key(resource))
 }
 
@@ -174,8 +234,7 @@ mod tests {
             generator
                 .playlist_key_from_url("https://a/b/master.m3u8?token=1")
                 .unwrap()
-                .0
-                .as_ref(),
+                .key,
             format!("{}/master.m3u8", generator.master_hash())
         );
 
@@ -183,7 +242,7 @@ mod tests {
         let key = generator
             .key_key_from_url(VariantId(0), "seg-001.ts")
             .unwrap();
-        assert!(key.0.ends_with("seg-001.ts"));
+        assert!(key.key.ends_with("seg-001.ts"));
 
         // Test edge cases through public API
         assert!(generator.playlist_key_from_url("https://a/b/").is_none());
@@ -198,7 +257,7 @@ mod tests {
         let k = generator
             .playlist_key_from_url("https://x/y/index.m3u8?z=1")
             .unwrap();
-        assert_eq!(&*k.0, "deadbeef/index.m3u8");
+        assert_eq!(k.key, "deadbeef/index.m3u8");
     }
 
     #[test]
@@ -209,7 +268,7 @@ mod tests {
         let k = generator
             .key_key_from_url(VariantId(3), "https://x/y/key.bin?z=1")
             .unwrap();
-        assert_eq!(&*k.0, "deadbeef/3/key.bin");
+        assert_eq!(k.key, "deadbeef/3/key.bin");
     }
 
     #[test]
@@ -222,8 +281,8 @@ mod tests {
         let master_resource =
             Resource::Master(Url::parse("https://example.com/master.m3u8?token=1").unwrap());
         let key = generator.generate_key(&master_resource).unwrap();
-        assert!(key.0.starts_with(&format!("{}/", master_hash)));
-        assert!(key.0.ends_with("master.m3u8"));
+        assert!(key.key.starts_with(&format!("{}/", master_hash)));
+        assert!(key.key.ends_with("master.m3u8"));
 
         // Test media playlist
         let media_resource = Resource::MediaPlaylist(
@@ -231,8 +290,8 @@ mod tests {
             VariantId(1),
         );
         let key = generator.generate_key(&media_resource).unwrap();
-        assert!(key.0.starts_with(&format!("{}/", master_hash)));
-        assert!(key.0.ends_with("variant.m3u8"));
+        assert!(key.key.starts_with(&format!("{}/", master_hash)));
+        assert!(key.key.ends_with("variant.m3u8"));
 
         // Test key
         let key_resource = Resource::Key(
@@ -240,7 +299,7 @@ mod tests {
             VariantId(1),
         );
         let key = generator.generate_key(&key_resource).unwrap();
-        assert_eq!(&*key.0, &format!("{}/1/key.bin", master_hash));
+        assert_eq!(key.key, format!("{}/1/key.bin", master_hash));
 
         // Test init segment
         let init_resource = Resource::InitSegment(
@@ -248,7 +307,7 @@ mod tests {
             VariantId(1),
         );
         let key = generator.generate_key(&init_resource).unwrap();
-        assert_eq!(&*key.0, &format!("{}/1/init_init.mp4", master_hash));
+        assert_eq!(key.key, format!("{}/1/init_init.mp4", master_hash));
 
         // Test media segment
         let media_seg_resource = Resource::MediaSegment(
@@ -256,6 +315,18 @@ mod tests {
             VariantId(1),
         );
         let key = generator.generate_key(&media_seg_resource).unwrap();
-        assert_eq!(&*key.0, &format!("{}/1/seg_seg-001.ts", master_hash));
+        assert_eq!(key.key, format!("{}/1/seg_seg-001.ts", master_hash));
+    }
+
+    #[test]
+    fn test_hls_cache_key_methods() {
+        let key = HlsCacheKey::new("master_hash/variant_id/filename".to_string());
+        assert_eq!(key.as_str(), "master_hash/variant_id/filename");
+        assert_eq!(key.master_hash(), Some("master_hash"));
+        assert_eq!(
+            key.to_path(),
+            std::path::PathBuf::from("master_hash/variant_id/filename")
+        );
+        assert_eq!(key.to_string(), "master_hash/variant_id/filename");
     }
 }

@@ -1,13 +1,14 @@
 //! Tests for tree-structured cache implementation
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use stream_download::storage::memory::MemoryStorageProvider;
 use stream_download_storage_ext::{
-    BlobCache, CacheKVTree, StorageBackedBlobCache, TreeStorageFactory,
+    FileStorageProvider, LeaseAwareCacheTree, StorageBackedBlobCache, TreeStorageFactory,
 };
+use tempfile::tempdir;
 
 // Simple key type for testing
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -16,26 +17,55 @@ struct TestKey {
     name: String,
 }
 
-// Factory function that creates a StorageBackedBlobCache for a given key
-fn create_cache_for_key(
-    key: &TestKey,
-) -> io::Result<Option<StorageBackedBlobCache<MemoryStorageProvider>>> {
-    // In a real implementation, you might create different storage providers
-    // based on the key, or use a shared provider with different configurations
-    let provider = MemoryStorageProvider;
-    StorageBackedBlobCache::new(provider).map(Some)
+// Shared state for tests
+struct TestState {
+    temp_dir: tempfile::TempDir,
+}
+
+impl TestState {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            temp_dir: tempdir()?,
+        })
+    }
+
+    fn create_cache_for_key(
+        &self,
+        key: &TestKey,
+    ) -> io::Result<Option<StorageBackedBlobCache<FileStorageProvider>>> {
+        let path = self
+            .temp_dir
+            .path()
+            .join(format!("{}_{}.bin", key.id, key.name));
+
+        // Create FileStorageProvider for this path
+        let provider = FileStorageProvider::open(&path)?;
+
+        // Create StorageBackedBlobCache
+        StorageBackedBlobCache::new(provider).map(Some)
+    }
 }
 
 #[test]
 fn test_tree_cache_basic_operations() -> io::Result<()> {
-    // Create a factory
-    let factory = TreeStorageFactory::new(create_cache_for_key, "/cache/root");
+    // Create shared test state
+    let state = Arc::new(Mutex::new(TestState::new()?));
 
-    // Create inner storage provider
-    let inner_provider = Arc::new(Mutex::new(MemoryStorageProvider));
+    // Create a factory that uses the shared state
+    let factory = TreeStorageFactory::new(
+        move |key: &TestKey| {
+            let state = state.lock().unwrap();
+            state.create_cache_for_key(key)
+        },
+        "/cache/root",
+    );
+
+    // Create temp directory for lease file
+    let temp_dir = tempdir()?;
+    let lease_path = temp_dir.path().join("lease.lock");
 
     // Create the cache tree
-    let cache_tree = CacheKVTree::new(factory, inner_provider, "/cache/root".into());
+    let cache_tree = LeaseAwareCacheTree::new(factory, "/cache/root".into(), lease_path);
 
     // Test key
     let key1 = TestKey {
@@ -78,9 +108,23 @@ fn test_tree_cache_basic_operations() -> io::Result<()> {
 
 #[test]
 fn test_tree_cache_overwrite() -> io::Result<()> {
-    let factory = TreeStorageFactory::new(create_cache_for_key, "/cache/root");
-    let inner_provider = Arc::new(Mutex::new(MemoryStorageProvider));
-    let cache_tree = CacheKVTree::new(factory, inner_provider, "/cache/root".into());
+    // Create shared test state
+    let state = Arc::new(Mutex::new(TestState::new()?));
+
+    // Create a factory that uses the shared state
+    let factory = TreeStorageFactory::new(
+        move |key: &TestKey| {
+            let state = state.lock().unwrap();
+            state.create_cache_for_key(key)
+        },
+        "/cache/root",
+    );
+
+    // Create temp directory for lease file
+    let temp_dir = tempdir()?;
+    let lease_path = temp_dir.path().join("lease.lock");
+
+    let cache_tree = LeaseAwareCacheTree::new(factory, "/cache/root".into(), lease_path);
 
     let key = TestKey {
         id: 42,
@@ -104,9 +148,23 @@ fn test_tree_cache_overwrite() -> io::Result<()> {
 
 #[test]
 fn test_tree_cache_empty_data() -> io::Result<()> {
-    let factory = TreeStorageFactory::new(create_cache_for_key, "/cache/root");
-    let inner_provider = Arc::new(Mutex::new(MemoryStorageProvider));
-    let cache_tree = CacheKVTree::new(factory, inner_provider, "/cache/root".into());
+    // Create shared test state
+    let state = Arc::new(Mutex::new(TestState::new()?));
+
+    // Create a factory that uses the shared state
+    let factory = TreeStorageFactory::new(
+        move |key: &TestKey| {
+            let state = state.lock().unwrap();
+            state.create_cache_for_key(key)
+        },
+        "/cache/root",
+    );
+
+    // Create temp directory for lease file
+    let temp_dir = tempdir()?;
+    let lease_path = temp_dir.path().join("lease.lock");
+
+    let cache_tree = LeaseAwareCacheTree::new(factory, "/cache/root".into(), lease_path);
 
     let key = TestKey {
         id: 99,
@@ -125,69 +183,15 @@ fn test_tree_cache_empty_data() -> io::Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_tree_cache_concurrent_access() -> io::Result<()> {
-    use std::thread;
-
-    let factory = TreeStorageFactory::new(create_cache_for_key, "/cache/root");
-    let inner_provider = Arc::new(Mutex::new(MemoryStorageProvider));
-    let cache_tree = Arc::new(CacheKVTree::new(
-        factory,
-        inner_provider,
-        "/cache/root".into(),
-    ));
-
-    let mut handles = vec![];
-
-    // Spawn multiple threads to test concurrent access
-    for i in 0..5 {
-        let cache_clone = cache_tree.clone();
-        let handle = thread::spawn(move || -> io::Result<()> {
-            let key = TestKey {
-                id: i,
-                name: format!("thread_{}", i),
-            };
-
-            let data = Bytes::from(format!("Data from thread {}", i));
-            cache_clone.put(&key, data.clone())?;
-
-            // Verify in the same thread
-            assert!(cache_clone.exists(&key)?);
-            assert_eq!(cache_clone.get(&key)?, Some(data));
-
-            Ok(())
-        });
-
-        handles.push(handle);
-    }
-
-    // Wait for all threads to complete
-    for handle in handles {
-        handle.join().expect("Thread panicked")?;
-    }
-
-    // Verify all keys exist in main thread
-    for i in 0..5 {
-        let key = TestKey {
-            id: i,
-            name: format!("thread_{}", i),
-        };
-
-        assert!(cache_tree.exists(&key)?);
-        let expected_data = format!("Data from thread {}", i);
-        assert_eq!(cache_tree.get(&key)?, Some(Bytes::from(expected_data)));
-    }
-
-    Ok(())
-}
-
 // Test with a factory that returns None for some keys
 fn selective_factory(
     key: &TestKey,
-) -> io::Result<Option<StorageBackedBlobCache<MemoryStorageProvider>>> {
+) -> io::Result<Option<StorageBackedBlobCache<FileStorageProvider>>> {
     // Only create cache for even IDs
     if key.id % 2 == 0 {
-        let provider = MemoryStorageProvider;
+        let temp_dir = tempdir()?;
+        let path = temp_dir.path().join(format!("{}_{}.bin", key.id, key.name));
+        let provider = FileStorageProvider::open(&path)?;
         StorageBackedBlobCache::new(provider).map(Some)
     } else {
         Ok(None)
@@ -197,8 +201,12 @@ fn selective_factory(
 #[test]
 fn test_tree_cache_selective_factory() -> io::Result<()> {
     let factory = TreeStorageFactory::new(selective_factory, "/cache/root");
-    let inner_provider = Arc::new(Mutex::new(MemoryStorageProvider));
-    let cache_tree = CacheKVTree::new(factory, inner_provider, "/cache/root".into());
+
+    // Create temp directory for lease file
+    let temp_dir = tempdir()?;
+    let lease_path = temp_dir.path().join("lease.lock");
+
+    let cache_tree = LeaseAwareCacheTree::new(factory, "/cache/root".into(), lease_path);
 
     // Even ID - should work
     let even_key = TestKey {

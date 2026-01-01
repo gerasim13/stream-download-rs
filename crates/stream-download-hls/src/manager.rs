@@ -1,16 +1,13 @@
 //! HLS stream manager.
 //!
 //! This module provides the player-facing API (`MediaStream`) plus segment iteration types.
-//! Playlist/key caching is handled via `CacheDownloader` decorator and `StreamControl::StoreResource`.
+//! Playlist/key caching is handled via `CacheDownloader` decorator.
 //! For higher-level design notes, see `crates/stream-download-hls/README.md`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use stream_download::source::StreamMsg;
-
-use tokio::sync::mpsc;
 use tracing::instrument;
 
 #[cfg(feature = "aes-decrypt")]
@@ -92,8 +89,8 @@ pub struct HlsManager {
     config: Arc<HlsSettings>,
     /// Downloader used to fetch playlists and segments.
     downloader: Arc<dyn Downloader + Send + Sync>,
-    /// Control sender used to persist fetched resources via `StoreResource`.
-    control_sender: mpsc::Sender<StreamMsg>,
+    /// Cache provider for storing fetched resources.
+    cache_provider: Option<Arc<crate::storage_new::HlsStorageProvider>>,
     /// Cached master playlist, once loaded.
     master: Option<MasterPlaylist>,
     /// Index of the currently selected variant in `master.variants`.
@@ -120,7 +117,7 @@ impl std::fmt::Debug for HlsManager {
             .field("master_url", &self.master_url)
             .field("config", &self.config)
             .field("downloader", &"Arc<dyn Downloader>")
-            .field("control_sender", &self.control_sender)
+            .field("cache_provider", &self.cache_provider)
             .field("master", &self.master)
             .field("current_variant_index", &self.current_variant_index)
             .field("current_media_playlist", &self.current_media_playlist)
@@ -142,7 +139,7 @@ impl HlsManager {
         master_url: url::Url,
         config: Arc<HlsSettings>,
         downloader: Arc<dyn Downloader + Send + Sync>,
-        control_sender: mpsc::Sender<StreamMsg>,
+        cache_provider: Option<Arc<crate::storage_new::HlsStorageProvider>>,
     ) -> Self {
         #[cfg(feature = "aes-decrypt")]
         let aes_key_resolver = Some(AesKeyResolver::new(Arc::clone(&config), downloader.clone()));
@@ -151,7 +148,7 @@ impl HlsManager {
             master_url,
             config,
             downloader,
-            control_sender,
+            cache_provider,
             #[cfg(feature = "aes-decrypt")]
             aes_key_resolver,
             master: None,
@@ -182,6 +179,19 @@ impl HlsManager {
     /// Returns the underlying downloader.
     pub fn downloader(&self) -> &Arc<dyn Downloader + Send + Sync> {
         &self.downloader
+    }
+
+    /// Get the cache provider.
+    pub fn cache_provider(&self) -> Option<&Arc<crate::storage_new::HlsStorageProvider>> {
+        self.cache_provider.as_ref()
+    }
+
+    /// Set the cache provider.
+    pub fn set_cache_provider(
+        &mut self,
+        cache_provider: Option<Arc<crate::storage_new::HlsStorageProvider>>,
+    ) {
+        self.cache_provider = cache_provider;
     }
 
     fn resolve_url(&self, relative_url: &str) -> HlsResult<String> {

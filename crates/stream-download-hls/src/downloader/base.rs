@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use stream_download::http::HttpStream;
 use stream_download::http::reqwest::Client as ReqwestClient;
 use stream_download::http::reqwest::Url;
-use stream_download::source::{DecodeError, SourceStream, StreamMsg};
+use stream_download::source::{DecodeError, SourceStream};
 
 use crate::error::{HlsError, HlsResult};
 
@@ -102,9 +102,15 @@ impl HttpDownloader {
         url: &Url,
         headers: HeaderMap,
     ) -> HlsResult<HttpStream<ReqwestClient>> {
+        // Create a custom reqwest client with headers
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(|e| HlsError::io(format!("failed to build HTTP client: {}", e)))?;
+
         let create_fut = timeout(
             self.request_timeout,
-            HttpStream::<ReqwestClient>::create_with_headers(url.clone(), headers),
+            HttpStream::<ReqwestClient>::new(client, url.clone()),
         );
 
         let res = tokio::select! {
@@ -128,17 +134,14 @@ impl HttpDownloader {
         let url_str = url.to_string();
         let url: Arc<str> = Arc::from(url_str);
         stream
-            .filter_map(move |res| {
+            .map(move |res| {
                 let url = Arc::clone(&url);
-                async move {
-                    match res {
-                        Ok(StreamMsg::Data(bytes)) => Some(Ok(bytes)),
-                        Ok(StreamMsg::Control(_)) => None,
-                        Err(e) => Some(Err(HlsError::io(format!(
-                            "stream read error (url={}): {}",
-                            url, e
-                        )))),
-                    }
+                match res {
+                    Ok(bytes) => Ok(bytes),
+                    Err(e) => Err(HlsError::io(format!(
+                        "stream read error (url={}): {}",
+                        url, e
+                    ))),
                 }
             })
             .boxed()
@@ -170,12 +173,8 @@ impl HttpDownloader {
             };
 
             match next {
-                Some(Ok(StreamMsg::Data(chunk))) => {
+                Some(Ok(chunk)) => {
                     buf.extend_from_slice(&chunk);
-                }
-                Some(Ok(StreamMsg::Control(_))) => {
-                    // Ignore control messages
-                    continue;
                 }
                 Some(Err(e)) => {
                     return Err(HlsError::io(e.to_string()));
@@ -239,7 +238,12 @@ impl Downloader for HttpDownloader {
             }
         }
 
-        let http = self.create_stream_with_headers(url, header_map).await?;
+        // If we have headers, use create_stream_with_headers, otherwise use create_stream
+        let http = if !header_map.is_empty() {
+            self.create_stream_with_headers(url, header_map).await?
+        } else {
+            self.create_stream(url).await?
+        };
         self.collect_stream_to_bytes(http, url).await
     }
 
